@@ -1,0 +1,27 @@
+{
+  "name": "ctsc-harness",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Self-iterating harness that drives a Cursor agent to port tsc into C.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p .",
+    "loop": "tsx src/cli.ts loop",
+    "loop:forever": "tsx src/cli.ts loop --forever --build",
+    "oracle": "tsx src/cli.ts oracle",
+    "diff": "tsx src/cli.ts diff",
+    "status": "tsx src/cli.ts status",
+    "list": "tsx src/cli.ts list",
+    "sample": "tsx src/sample-baselines.ts"
+  },
+  "dependencies": {
+    "typescript": "~5.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.19.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,0 +1,94 @@
+# =====================================================================
+# Upstream reference checkout (read-only, shallow clone, is its own git repo)
+# =====================================================================
+upstream/TypeScript/
+
+# =====================================================================
+# ctsc build artifacts
+# =====================================================================
+ctsc/build/
+ctsc/install/
+ctsc/out/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+
+# Compiled binaries / objects
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.ninja_deps
+*.ninja_log
+build.ninja
+rules.ninja
+
+# =====================================================================
+# Node / TypeScript harness
+# =====================================================================
+node_modules/
+harness/node_modules/
+upstream/TypeScript/node_modules/
+upstream/TypeScript/built/
+*.tsbuildinfo
+.npm/
+.yarn/
+.pnp.*
+.cache/
+
+# =====================================================================
+# Harness runtime state (regenerable)
+# =====================================================================
+harness/state/
+harness/reports/
+
+# =====================================================================
+# Logs / temp
+# =====================================================================
+*.log
+*.tmp
+.tmp-*
+scratch-*.js
+scratch-*.cjs
+scratch-*.mjs
+
+# =====================================================================
+# Editor / IDE
+# =====================================================================
+.vscode/.browse.VC.db*
+.vscode/ipch/
+.idea/
+*.swp
+*.swo
+*~
+.clangd/
+.cache/clangd/
+
+# =====================================================================
+# OS junk
+# =====================================================================
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# =====================================================================
+# Secrets — belt-and-braces
+# =====================================================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.cursor/mcp.json

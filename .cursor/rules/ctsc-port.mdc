@@ -1,0 +1,24 @@
+---
+description: Persistent rules for editing the ctsc (C port of tsc) codebase.
+alwaysApply: true
+---
+
+# ctsc editing rules
+
+- This repo is a C port of TypeScript's compiler, driven by an agent harness.
+  AGENTS.md is the source of truth; read it if you have not already.
+- Only modify files under `ctsc/`. Never touch `harness/`, `upstream/`,
+  `.cursor/`, or `fixtures/` unless the user explicitly asks you to.
+- Behaviour must match `tsc` byte-for-byte. Positions are UTF-16 code units.
+  `ts.SyntaxKind` names are verbatim.
+- Before editing a phase, open the corresponding reference file under
+  `upstream/TypeScript/src/compiler/` (scanner.ts / parser.ts / binder.ts /
+  checker.ts / emitter.ts) and cite line numbers in your commit message.
+- When adding a new `CtscSyntaxKind`, update BOTH `ctsc/include/ctsc/scanner.h`
+  AND the name table in `ctsc/src/scanner/token_names.c` in the same edit.
+- New behaviour needs a unit test under `ctsc/tests/`. Do not delete tests.
+- After edits, the build (`cmake --build ctsc/build/default`) and the unit
+  tests (`ctsc_tests`) must both pass.
+- Keep the `core/` modules dependency-free (no malloc outside arena if
+  avoidable, no third-party libs).
+- Do NOT reformat files you did not otherwise modify.

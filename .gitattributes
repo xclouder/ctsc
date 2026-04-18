@@ -1,0 +1,98 @@
+# =====================================================================
+# Line endings
+# =====================================================================
+# Default: let git normalize to LF on check-in, emit as-is on check-out.
+# Rationale: ctsc must produce byte-identical output to tsc, which uses LF.
+# Fixtures (the tsc input) and oracle cache (the tsc output we diff against)
+# MUST be LF on disk, otherwise hash(src) differs between contributors and
+# `emitter` phase diffs break.
+* text=auto eol=lf
+
+# -------- code --------
+*.c        text eol=lf
+*.h        text eol=lf
+*.cc       text eol=lf
+*.cpp      text eol=lf
+*.hpp      text eol=lf
+
+*.ts       text eol=lf
+*.tsx      text eol=lf
+*.mts      text eol=lf
+*.cts      text eol=lf
+*.js       text eol=lf
+*.mjs      text eol=lf
+*.cjs      text eol=lf
+*.jsx      text eol=lf
+
+# -------- config --------
+*.json     text eol=lf
+*.jsonc    text eol=lf
+*.json5    text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
+*.toml     text eol=lf
+*.ini      text eol=lf
+*.lock     text eol=lf
+
+# -------- docs --------
+*.md       text eol=lf
+*.mdx      text eol=lf
+*.txt      text eol=lf
+
+# -------- build --------
+CMakeLists.txt  text eol=lf
+*.cmake         text eol=lf
+Makefile        text eol=lf
+*.mk            text eol=lf
+
+# -------- shell scripts --------
+*.sh       text eol=lf
+# Windows shell scripts traditionally use CRLF; cmd.exe tolerates LF but
+# some tooling chokes.
+*.ps1      text eol=crlf
+*.psm1     text eol=crlf
+*.psd1     text eol=crlf
+*.cmd      text eol=crlf
+*.bat      text eol=crlf
+
+# =====================================================================
+# Binary files (never diff, never normalize)
+# =====================================================================
+*.png      binary
+*.jpg      binary
+*.jpeg     binary
+*.gif      binary
+*.webp     binary
+*.ico      binary
+*.pdf      binary
+*.zip      binary
+*.gz       binary
+*.tar      binary
+*.7z       binary
+*.exe      binary
+*.dll      binary
+*.lib      binary
+*.a        binary
+*.so       binary
+*.dylib    binary
+*.pdb      binary
+*.obj      binary
+*.o        binary
+
+# =====================================================================
+# Treat fixtures as "fixed content" — never modified by filters/smudge.
+# Any CRLF in a fixture would corrupt the byte-equal diff pipeline.
+# =====================================================================
+fixtures/**        text eol=lf
+# But some samples from upstream are already LF; be strict, don't guess.
+fixtures/**/*.ts   text eol=lf working-tree-encoding=UTF-8
+fixtures/**/*.tsx  text eol=lf working-tree-encoding=UTF-8
+
+# =====================================================================
+# GitHub linguist (so GitHub doesn't call this a "TypeScript project")
+# =====================================================================
+upstream/**              linguist-vendored
+fixtures/**              linguist-vendored
+harness/state/**         linguist-generated
+harness/reports/**       linguist-generated
+ctsc/build/**            linguist-generated
