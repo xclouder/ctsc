@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { readFile, stat } from "node:fs/promises";
 
-import { CTSC_EXE_CANDIDATES } from "./paths.js";
+import { getCtscExeCandidates } from "./paths.js";
 import type { Fixture, RunResult } from "./types.js";
 
 export interface RunnerOptions {
@@ -19,7 +19,7 @@ export async function findCtscExe(override?: string): Promise<string | null> {
   if (override) {
     try { await stat(override); return override; } catch { return null; }
   }
-  for (const p of CTSC_EXE_CANDIDATES) {
+  for (const p of getCtscExeCandidates()) {
     try { await stat(p); return p; } catch { /* try next */ }
   }
   return null;

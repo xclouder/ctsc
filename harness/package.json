@@ -10,9 +10,11 @@
     "loop:forever": "tsx src/cli.ts loop --forever --build",
     "oracle": "tsx src/cli.ts oracle",
     "diff": "tsx src/cli.ts diff",
-    "status": "tsx src/cli.ts status",
+    "status": "tsx src/cli.ts status --all",
+    "status:single": "tsx src/cli.ts status",
     "list": "tsx src/cli.ts list",
-    "sample": "tsx src/sample-baselines.ts"
+    "sample": "tsx src/sample-baselines.ts",
+    "selfhost": "tsx src/cli.ts selfhost"
   },
   "dependencies": {
     "typescript": "~5.6.0"

@@ -9,7 +9,14 @@ import { pickNextFixture } from "./planner.js";
 import { runCtsc, findCtscExe } from "./runner.js";
 import { ensureFixtureStatus, ensureStateDir, loadProgress, saveProgress } from "./state.js";
 import { deferFixture, DEFAULT_WATCHDOG } from "./watchdog.js";
-import { FAILURES_FILE, REPORTS_DIR } from "./paths.js";
+import {
+  FAILURES_FILE,
+  REPORTS_DIR,
+  defaultBuildDirForPhase,
+  defaultProgressFileForPhase,
+  getBuildDir,
+  getProgressFile,
+} from "./paths.js";
 import type { DiffResult, Fixture, OracleArtifacts, Phase, ProgressState } from "./types.js";
 
 /** Pick the expected artifact for a phase; returns undefined only when the
@@ -39,6 +46,13 @@ export interface LoopOptions {
   retryDeferred: boolean;
   /** Print cumulative progress every N iterations. 0 disables. */
   statusEvery: number;
+  /** Escalation: after `fallbackAfter` consecutive no-progress attempts
+   * with the primary model, switch this fixture to `fallbackModel` for
+   * the remaining attempts (before watchdog defers). Lets you burn the
+   * cheap/fast model on easy fixtures and reserve the expensive one for
+   * real dead-ends. */
+  fallbackModel?: string;
+  fallbackAfter: number;
 }
 
 export const DEFAULT_LOOP: LoopOptions = {
@@ -49,12 +63,28 @@ export const DEFAULT_LOOP: LoopOptions = {
   noAgent: false,
   retryDeferred: false,
   statusEvery: 10,
+  fallbackAfter: 2,
 };
 
 export async function runLoop(partial: Partial<LoopOptions> = {}): Promise<void> {
   const opts: LoopOptions = { ...DEFAULT_LOOP, ...partial };
   await ensureStateDir();
   await mkdir(REPORTS_DIR, { recursive: true });
+
+  /* Per-phase parallel mode: auto-derive isolated build dir + progress file
+   * so N loops can run concurrently without clobbering ninja state or
+   * progress.json. Caller can still force explicit paths via env. */
+  if (opts.phase) {
+    if (!process.env.CTSC_PROGRESS_FILE) {
+      process.env.CTSC_PROGRESS_FILE = defaultProgressFileForPhase(opts.phase);
+    }
+    if (!process.env.CTSC_BUILD_DIR) {
+      process.env.CTSC_BUILD_DIR = defaultBuildDirForPhase(opts.phase);
+    }
+    console.log(`[loop] phase=${opts.phase}`);
+    console.log(`[loop] progress-file=${getProgressFile()}`);
+    console.log(`[loop] build-dir=${getBuildDir()}`);
+  }
 
   const state = await loadProgress();
 
@@ -164,8 +194,18 @@ export async function runLoop(partial: Partial<LoopOptions> = {}): Promise<void>
       continue;
     }
 
-    const ar = await invokeAgent(fx, prompt, opts.agent);
-    console.log(`  [agent] exit=${ar.exitCode} dur=${ar.durationMs}ms session=${ar.sessionDir}`);
+    /* Per-fixture model escalation: if the cheap model has already burned
+     * `fallbackAfter` consecutive no-progress attempts on this fixture,
+     * use the expensive fallback for this call. */
+    const escalate = !!opts.fallbackModel && status.noProgressCount >= opts.fallbackAfter;
+    const callAgent: AgentRunOptions = escalate
+      ? { ...opts.agent, model: opts.fallbackModel }
+      : opts.agent;
+    if (escalate) {
+      console.log(`  [escalate] model -> ${opts.fallbackModel} (noProgress=${status.noProgressCount})`);
+    }
+    const ar = await invokeAgent(fx, prompt, callAgent);
+    console.log(`  [agent] model=${callAgent.model ?? "(default)"} exit=${ar.exitCode} dur=${ar.durationMs}ms session=${ar.sessionDir}`);
     if (!ar.invoked) {
       console.warn("  [warn] agent not invoked - no progress will be made; aborting loop");
       break;

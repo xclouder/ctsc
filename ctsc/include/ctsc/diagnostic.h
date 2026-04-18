@@ -28,5 +28,11 @@ typedef struct {
 void ctsc_diag_init(CtscDiagnosticList* l);
 void ctsc_diag_free(CtscDiagnosticList* l);
 void ctsc_diag_push(CtscDiagnosticList* l, CtscDiagCategory cat, int code, int start, int length, const char* fmt, ...);
+/*
+ * Drop all diagnostics after the first `keep`. Used to roll back diagnostics
+ * emitted during a speculative parse (mirrors upstream parser.ts tryParse /
+ * speculationHelper).
+ */
+void ctsc_diag_truncate(CtscDiagnosticList* l, size_t keep);
 
 #endif

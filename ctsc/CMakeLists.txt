@@ -30,6 +30,7 @@ target_include_directories(ctsc_core PUBLIC include)
 add_library(ctsc_scanner STATIC
     src/scanner/scanner.c
     src/scanner/token_names.c
+    src/scanner/unicode_id.c
 )
 target_link_libraries(ctsc_scanner PUBLIC ctsc_core)
 
@@ -64,6 +65,7 @@ add_executable(ctsc_tests
     tests/test_scanner.c
     tests/test_parser.c
     tests/test_binder.c
+    tests/test_emitter.c
 )
 target_link_libraries(ctsc_tests PRIVATE ctsc_emitter ctsc_binder ctsc_parser ctsc_scanner ctsc_core)
 add_test(NAME ctsc_tests COMMAND ctsc_tests)

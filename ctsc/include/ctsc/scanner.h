@@ -86,6 +86,7 @@ typedef enum {
 
     /* Identifiers & keywords */
     CTSC_SK_Identifier,
+    CTSC_SK_PrivateIdentifier,
 
     /* Reserved words (subset; expanded by agent) */
     CTSC_SK_BreakKeyword,
@@ -129,12 +130,16 @@ typedef enum {
     CTSC_SK_AsKeyword,
     CTSC_SK_AsyncKeyword,
     CTSC_SK_AwaitKeyword,
+    CTSC_SK_ConstructorKeyword,
     CTSC_SK_FromKeyword,
+    CTSC_SK_GetKeyword,
     CTSC_SK_LetKeyword,
     CTSC_SK_OfKeyword,
+    CTSC_SK_SetKeyword,
     CTSC_SK_YieldKeyword,
 
     /* TS-specific keywords */
+    CTSC_SK_AbstractKeyword,
     CTSC_SK_AnyKeyword,
     CTSC_SK_BooleanKeyword,
     CTSC_SK_DeclareKeyword,
@@ -148,10 +153,12 @@ typedef enum {
     CTSC_SK_ProtectedKeyword,
     CTSC_SK_PublicKeyword,
     CTSC_SK_ReadonlyKeyword,
+    CTSC_SK_StaticKeyword,
     CTSC_SK_StringKeyword,
     CTSC_SK_SymbolKeyword,
     CTSC_SK_TypeKeyword,
     CTSC_SK_UndefinedKeyword,
+    CTSC_SK_NeverKeyword,
     CTSC_SK_UnknownKeyword,
 
     /* Node kinds (Phase 2+; agent 扩展时按 tsc ts.SyntaxKind 添加更多) */
@@ -165,14 +172,24 @@ typedef enum {
     CTSC_SK_IfStatement,
     CTSC_SK_WhileStatement,
     CTSC_SK_ForStatement,
+    CTSC_SK_ForInStatement,
+    CTSC_SK_ForOfStatement,
     CTSC_SK_DoStatement,
     CTSC_SK_BreakStatement,
     CTSC_SK_ContinueStatement,
     CTSC_SK_DebuggerStatement,
+    CTSC_SK_TryStatement,
+    CTSC_SK_WithStatement,
+    CTSC_SK_SwitchStatement,
+    CTSC_SK_CaseBlock,
+    CTSC_SK_CaseClause,
+    CTSC_SK_DefaultClause,
     CTSC_SK_ParenthesizedExpression,
     CTSC_SK_ConditionalExpression,
     CTSC_SK_ReturnStatement,
+    CTSC_SK_ThrowStatement,
     CTSC_SK_FunctionDeclaration,
+    CTSC_SK_FunctionExpression,
     CTSC_SK_Parameter,
     CTSC_SK_BinaryExpression,
     CTSC_SK_PrefixUnaryExpression,
@@ -185,12 +202,37 @@ typedef enum {
     CTSC_SK_ObjectLiteralExpression,
     CTSC_SK_PropertyAssignment,
     CTSC_SK_ShorthandPropertyAssignment,
+    CTSC_SK_ComputedPropertyName,
+    CTSC_SK_MethodDeclaration,
+    CTSC_SK_GetAccessor,
+    CTSC_SK_SetAccessor,
+    CTSC_SK_PropertyDeclaration,
+    CTSC_SK_SemicolonClassElement,
+    CTSC_SK_ClassDeclaration,
+    CTSC_SK_ClassExpression,
+    CTSC_SK_InterfaceDeclaration,
+    CTSC_SK_HeritageClause,
+    CTSC_SK_ExpressionWithTypeArguments,
+    CTSC_SK_EnumDeclaration,
+    CTSC_SK_EnumMember,
     CTSC_SK_ArrowFunction,
     CTSC_SK_TypeReference,
     CTSC_SK_TypeLiteral,
+    CTSC_SK_TypeParameter,
     CTSC_SK_PropertySignature,
     CTSC_SK_VoidExpression,
+    CTSC_SK_DeleteExpression,
+    CTSC_SK_TypeOfExpression,
     CTSC_SK_YieldExpression,
+    CTSC_SK_OmittedExpression,
+    CTSC_SK_ObjectBindingPattern,
+    CTSC_SK_ArrayBindingPattern,
+    CTSC_SK_BindingElement,
+    CTSC_SK_TemplateExpression,
+    CTSC_SK_TemplateSpan,
+    CTSC_SK_ModuleDeclaration,
+    CTSC_SK_ModuleBlock,
+    CTSC_SK_TypeAssertionExpression,
 
     CTSC_SK__COUNT
 } CtscSyntaxKind;
@@ -255,6 +297,20 @@ CtscSyntaxKind ctsc_scanner_re_scan_slash_token(CtscScanner* s);
  * upstream/TypeScript/src/compiler/scanner.ts reScanGreaterToken (~2438).
  */
 CtscSyntaxKind ctsc_scanner_re_scan_greater_token(CtscScanner* s);
+
+/*
+ * When a CloseBraceToken was lexed inside a template expression's
+ * substitution (e.g. the `}` after `${expr` in `` `abc${0}def` ``), unscan
+ * it and rescan the character sequence as a TemplateMiddle or TemplateTail.
+ * Mirrors upstream/TypeScript/src/compiler/scanner.ts reScanTemplateToken
+ * (~3658): pos = tokenStart; scanTemplateAndSetTokenValue(...).
+ *
+ * Callers (parser.ts parseLiteralOfTemplateSpan ~3713) invoke this only
+ * when the current token is CloseBraceToken; the scanner expects pos to
+ * point at the `}` after unwinding, and scanTemplateAndSetTokenValue then
+ * consumes everything up to the next `` ` `` or `${`.
+ */
+CtscSyntaxKind ctsc_scanner_re_scan_template_token(CtscScanner* s);
 
 /* Dump all tokens (skipping trivia by default) as a JSON document written to `out`. */
 void ctsc_scanner_dump_tokens_json(const char* src, size_t len, CtscBuffer* out, bool pretty);

@@ -1,12 +1,12 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
-import { PROGRESS_FILE, STATE_DIR } from "./paths.js";
+import { getProgressFile, STATE_DIR } from "./paths.js";
 import type { Fixture, FixtureStatus, ProgressState } from "./types.js";
 
 export async function loadProgress(): Promise<ProgressState> {
   try {
-    const raw = await readFile(PROGRESS_FILE, "utf8");
+    const raw = await readFile(getProgressFile(), "utf8");
     return JSON.parse(raw) as ProgressState;
   } catch {
     return {
@@ -20,8 +20,9 @@ export async function loadProgress(): Promise<ProgressState> {
 
 export async function saveProgress(state: ProgressState): Promise<void> {
   state.updatedAt = new Date().toISOString();
-  await mkdir(dirname(PROGRESS_FILE), { recursive: true });
-  await writeFile(PROGRESS_FILE, JSON.stringify(state, null, 2), "utf8");
+  const file = getProgressFile();
+  await mkdir(dirname(file), { recursive: true });
+  await writeFile(file, JSON.stringify(state, null, 2), "utf8");
 }
 
 export function ensureFixtureStatus(state: ProgressState, fx: Fixture): FixtureStatus {

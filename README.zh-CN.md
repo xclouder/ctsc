@@ -67,6 +67,57 @@ cd harness; npm run status
 taskkill /PID (Get-Content harness\reports\loop.pid) /T /F
 ```
 
+## 并行模式：按 phase 分 5 个 worker 同时跑（快 N 倍）
+
+单 loop 完全串行（一次只处理一个 fixture）。因为不同 phase 的代码改动面
+几乎不重叠（`ctsc/src/scanner/`、`ctsc/src/parser/` 等），可以按 phase 开
+多个 worker 并行，每个 worker 用自己独立的 `ctsc/build/phase-<P>/` 和
+`harness/state/progress.<P>.json`，互不踩脚。
+
+```powershell
+# 默认两档：composer-2 先刷，卡住 2 次自动升级到 Opus-4.7，省 token。
+.\scripts\run-loops.ps1
+
+# 只攻 scanner + parser 积压
+.\scripts\run-loops.ps1 -Phases scanner,parser
+
+# 纯 composer-2、不升级（极限省 token）
+.\scripts\run-loops.ps1 -FallbackModel ''
+
+# 老行为：Opus 直接上，不做两档
+.\scripts\run-loops.ps1 -Model claude-opus-4-7-xhigh -FallbackModel ''
+
+# 重试之前 defer 掉的
+.\scripts\run-loops.ps1 -RetryDeferred
+```
+
+**两档模型机制**：每个 fixture 若连续 `-FallbackAfter`（默认 2）次 no-progress，
+这个 fixture 会自动切到 `-FallbackModel`（默认 `claude-opus-4-7-xhigh`）
+继续尝试直到 watchdog 5 次无进展才 defer。简单规则：cheap 模型刷日常，
+Opus 接盘硬骨头。日志里会出现 `[escalate] model -> …`。
+
+并行模式特性：
+- 每个 worker 一个独立 ninja build tree（`ctsc/build/phase-scanner/` …），
+  cmake 互不干扰。
+- 每个 worker 一个独立 progress 文件（`progress.scanner.json` …），避免并
+  发写覆盖。
+- 所有 PID 记在 `harness/reports/loops.pids`，同时自动生成一键 `loops.stop.ps1`。
+- 实时尾随单 phase 日志：
+  `Get-Content -Wait -Tail 40 'harness\reports\loop-<stamp>-<phase>.log'`
+
+聚合查看所有 phase 的总进度：
+
+```powershell
+cd harness
+npx tsx src/cli.ts status --all
+```
+
+⚠ 注意：
+- 单 loop 与并行 loop **不要同时跑**，因为它们可能同时 edit `ctsc/src/*`
+  的共享头文件（agent 之间没有 merge 协议）。开并行前先
+  `taskkill /PID (Get-Content harness\reports\loop.pid) /T /F` 停掉旧的。
+- Cursor 后端对同账号并发调用有速率限制。worker 数建议 ≤ 5，再多可能互相排队。
+
 ## Harness 常用命令
 
 - `npm run list`                           — 按 curriculum 顺序列出所有 fixture
@@ -81,6 +132,23 @@ taskkill /PID (Get-Content harness\reports\loop.pid) /T /F
   拎回来重新挑战
 - `npm run loop   -- --model <name>`       — 指定 agent 模型（如
   `composer-2`、`gpt-5.3-codex-high`、`claude-opus-4-7-xhigh`）
+- `npm run selfhost`                       — M1 冒烟测试：把
+  `harness/selfhost/packages/` 下的每个 mini-package 用 ctsc 转译，
+  与 `ts.transpileModule` 做 byte-for-byte diff，并用 node 跑
+  `runtime.mjs` 验证真的能执行。新包只要放一个 `src/*.ts` 就会被
+  自动发现。
+
+## Self-host 反馈闭环
+
+self-host 的价值是暴露 fixture 覆盖不到的**复合 bug**（一个 .ts 文件里
+同时用 export / class / switch / 泛型 / 字符串转义……）。流程：
+
+1. `npm run selfhost` 跑出一份不匹配报告。
+2. 每个独立 bug 抽成一个最小 fixture，放到
+   `fixtures/emitter/selfhost-derived/NN_<feature>.ts`。planner 会自动
+   发现并把它们纳入 curriculum。
+3. 跑 `npm run loop`（或并行脚本）让 agent 修到过。
+4. 再跑一次 `npm run selfhost`，通常会有新 bug 浮上来 —— 回到第 2 步。
 
 ## Phase 路线图
 

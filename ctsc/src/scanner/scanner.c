@@ -1,6 +1,7 @@
 #include "ctsc/scanner.h"
 #include "ctsc/arena.h"
 #include "ctsc/json_writer.h"
+#include "unicode_id.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -23,8 +24,27 @@ static bool is_line_break(uint16_t c) {
     return c == 0x0A || c == 0x0D || c == 0x2028 || c == 0x2029;
 }
 
+/*
+ * Mirrors upstream/TypeScript/src/compiler/scanner.ts isWhiteSpaceSingleLine
+ * (~557). tsc treats the full ECMAScript WhiteSpace set minus the four
+ * LineTerminators as single-line whitespace, including U+0085 nextLine,
+ * U+1680 ogham, U+2000..U+200B, U+202F, U+205F, U+3000 (ideographic space)
+ * and U+FEFF (BOM). Keep this list exact; regressions here show up as
+ * Invalid character diagnostics on fixtures like parserUnicodeWhitespaceCharacter1.
+ */
 static bool is_whitespace_single_line(uint16_t c) {
-    return c == 0x20 || c == 0x09 || c == 0x0B || c == 0x0C || c == 0xA0 || c == 0xFEFF;
+    return c == 0x0020  /* space */
+        || c == 0x0009  /* tab */
+        || c == 0x000B  /* vertical tab */
+        || c == 0x000C  /* form feed */
+        || c == 0x00A0  /* non-breaking space */
+        || c == 0x0085  /* next line */
+        || c == 0x1680  /* ogham space mark */
+        || (c >= 0x2000 && c <= 0x200B)  /* enQuad..zeroWidthSpace */
+        || c == 0x202F  /* narrow no-break space */
+        || c == 0x205F  /* mathematical space */
+        || c == 0x3000  /* ideographic space */
+        || c == 0xFEFF; /* byte order mark */
 }
 
 static bool is_digit(uint16_t c) { return c >= '0' && c <= '9'; }
@@ -43,6 +63,24 @@ static int hex_digit_value(uint16_t c) {
 }
 
 /*
+ * Mirrors upstream/TypeScript/src/compiler/scanner.ts scanNumberFragment
+ * (~1171): decimal digits with optional `_` between digits (not leading,
+ * not trailing, not consecutive — invalid forms still lex as much as tsc
+ * does; strtod in set_numeric_coerced_value skips `_`).
+ */
+static void scan_number_digits_allow_separators(CtscScanner* s) {
+    for (;;) {
+        while (s->pos < s->source.len && is_digit(s->source.data[s->pos])) { s->pos++; }
+        if (s->pos < s->source.len && s->source.data[s->pos] == '_'
+            && s->pos + 1 < s->source.len && is_digit(s->source.data[s->pos + 1])) {
+            s->pos++;
+            continue;
+        }
+        break;
+    }
+}
+
+/*
  * Returns true iff a decimal point or exponent part was consumed. Needed so
  * scan_number can mirror tsc's `decimalFragment !== undefined || Scientific`
  * branch in scanNumber (upstream scanner.ts ~1312) which coerces tokenValue
@@ -53,13 +91,13 @@ static bool scan_number_fraction_and_exponent(CtscScanner* s) {
     if (s->pos < s->source.len && s->source.data[s->pos] == '.') {
         s->pos++;
         saw = true;
-        while (s->pos < s->source.len && is_digit(s->source.data[s->pos])) { s->pos++; }
+        scan_number_digits_allow_separators(s);
     }
     if (s->pos < s->source.len && (s->source.data[s->pos] == 'e' || s->source.data[s->pos] == 'E')) {
         s->pos++;
         saw = true;
         if (s->pos < s->source.len && (s->source.data[s->pos] == '+' || s->source.data[s->pos] == '-')) { s->pos++; }
-        while (s->pos < s->source.len && is_digit(s->source.data[s->pos])) { s->pos++; }
+        scan_number_digits_allow_separators(s);
     }
     return saw;
 }
@@ -172,18 +210,20 @@ static size_t ecma_format_nonneg_double(double v, char* out, size_t cap) {
  * [start, end). Mirrors tsc's `tokenValue = "" + +result` (upstream
  * scanner.ts ~1308 / ~1315): parse as a JS Number and format via
  * Number::toString. The range is expected to be an ASCII-only numeric
- * lexeme (digits / '.' / 'e' / 'E' / sign); any '_' separators have already
- * been rejected here (ctsc does not yet scan them).
+ * lexeme (digits / '.' / 'e' / 'E' / sign / `_`); `_` is skipped so strtod
+ * sees a contiguous JS number (mirrors `"" + +result` after tsc strips
+ * separators in scanner.ts ~1292-1299).
  */
 static void set_numeric_coerced_value(CtscScanner* s, size_t start, size_t end) {
     char buf[64];
     size_t n = end - start;
-    if (n >= sizeof(buf)) { n = sizeof(buf) - 1; }
-    for (size_t i = 0; i < n; i++) {
+    size_t wi = 0;
+    for (size_t i = 0; i < n && wi + 1 < sizeof(buf); i++) {
         uint16_t c = s->source.data[start + i];
-        buf[i] = (c < 0x80) ? (char)c : '?';
+        if (c == '_') { continue; }
+        buf[wi++] = (c < 0x80) ? (char)c : '?';
     }
-    buf[n] = 0;
+    buf[wi] = 0;
 
     double v = strtod(buf, NULL);
     if (!isfinite(v)) { v = 0.0; }
@@ -205,11 +245,11 @@ static void set_numeric_coerced_value(CtscScanner* s, size_t start, size_t end) 
 static void scan_number_leading_dot(CtscScanner* s) {
     size_t start = s->pos;
     s->pos++;
-    while (s->pos < s->source.len && is_digit(s->source.data[s->pos])) { s->pos++; }
+    scan_number_digits_allow_separators(s);
     if (s->pos < s->source.len && (s->source.data[s->pos] == 'e' || s->source.data[s->pos] == 'E')) {
         s->pos++;
         if (s->pos < s->source.len && (s->source.data[s->pos] == '+' || s->source.data[s->pos] == '-')) { s->pos++; }
-        while (s->pos < s->source.len && is_digit(s->source.data[s->pos])) { s->pos++; }
+        scan_number_digits_allow_separators(s);
     }
     s->current.kind = CTSC_SK_NumericLiteral;
     s->current.text = s->source.data + start;
@@ -217,12 +257,54 @@ static void scan_number_leading_dot(CtscScanner* s) {
     set_numeric_coerced_value(s, start, s->pos);
 }
 
-static bool is_identifier_start(uint16_t c) {
-    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || c == '$';
+/*
+ * Identifier-start / identifier-part classification. ASCII fast path mirrors
+ * upstream/TypeScript/src/compiler/scanner.ts isIdentifierStart / isIdentifierPart
+ * (~973, ~978): the non-ASCII branch consults the ESNext Unicode tables (we
+ * use ESNext because the harness oracle creates ts.createScanner with
+ * ScriptTarget.Latest; see harness/src/oracle.ts).
+ *
+ * Parameters are `uint32_t` so callers can pass either a UTF-16 code unit
+ * (BMP) or a decoded astral code point (via `code_point_at`).
+ */
+static bool is_identifier_start(uint32_t c) {
+    if (c < 128) {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || c == '$';
+    }
+    return ctsc_is_unicode_identifier_start(c);
 }
 
-static bool is_identifier_part(uint16_t c) {
-    return is_identifier_start(c) || is_digit(c);
+static bool is_identifier_part(uint32_t c) {
+    if (c < 128) {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+            || c == '_' || c == '$' || (c >= '0' && c <= '9');
+    }
+    return ctsc_is_unicode_identifier_part(c);
+}
+
+/*
+ * Decode the UTF-16 code point at position `p` (collapsing a high+low
+ * surrogate pair into a single astral code point). Mirrors upstream
+ * scanner.ts codePointAt/codePointUnchecked (~1131). Caller must ensure
+ * `p < s->source.len`; returns the BMP code unit unchanged otherwise.
+ */
+static uint32_t code_point_at(const CtscScanner* s, size_t p) {
+    uint16_t hi = s->source.data[p];
+    if (hi >= 0xD800 && hi <= 0xDBFF && p + 1 < s->source.len) {
+        uint16_t lo = s->source.data[p + 1];
+        if (lo >= 0xDC00 && lo <= 0xDFFF) {
+            return 0x10000u + ((uint32_t)(hi - 0xD800) << 10) + (uint32_t)(lo - 0xDC00);
+        }
+    }
+    return hi;
+}
+
+/*
+ * Number of UTF-16 code units required to encode `cp`. Mirrors upstream
+ * scanner.ts charSize (~4039).
+ */
+static size_t char_size(uint32_t cp) {
+    return cp >= 0x10000u ? 2u : 1u;
 }
 
 void ctsc_scanner_init(CtscScanner* s, const char* src, size_t len, struct CtscArena* arena, CtscDiagnosticList* diags) {
@@ -506,14 +588,14 @@ static int peek_extended_unicode_escape(CtscScanner* s) {
 static void scan_identifier_parts_into(CtscScanner* s, uint16_t** buf, size_t* len, size_t* cap) {
     size_t start = s->pos;
     while (s->pos < s->source.len) {
-        uint16_t ch = s->source.data[s->pos];
+        uint32_t ch = code_point_at(s, s->pos);
         if (is_identifier_part(ch)) {
-            s->pos++;
+            s->pos += char_size(ch);
             continue;
         }
         if (ch == '\\') {
             int ext = peek_extended_unicode_escape(s);
-            if (ext >= 0 && (ext <= 0xFFFF ? is_identifier_part((uint16_t)ext) : false)) {
+            if (ext >= 0 && is_identifier_part((uint32_t)ext)) {
                 /* Flush pending raw range, then consume the escape and append decoded. */
                 value_append_utf16_range(s, buf, len, cap, s->source.data + start, s->pos - start);
                 /* Advance past the escape: '\' 'u' '{' hex+ '}' */
@@ -534,7 +616,7 @@ static void scan_identifier_parts_into(CtscScanner* s, uint16_t** buf, size_t* l
                 continue;
             }
             int simple = peek_unicode_escape(s);
-            if (simple >= 0 && is_identifier_part((uint16_t)simple)) {
+            if (simple >= 0 && is_identifier_part((uint32_t)simple)) {
                 value_append_utf16_range(s, buf, len, cap, s->source.data + start, s->pos - start);
                 s->pos += 6;
                 value_push_u16(s, buf, len, cap, (uint16_t)simple);
@@ -548,10 +630,23 @@ static void scan_identifier_parts_into(CtscScanner* s, uint16_t** buf, size_t* l
     value_append_utf16_range(s, buf, len, cap, s->source.data + start, s->pos - start);
 }
 
+/*
+ * Mirrors upstream/TypeScript/src/compiler/scanner.ts scanIdentifier (~2425):
+ * consume the identifier starting at s->pos (whose first code point has
+ * already been validated as an IdentifierStart by the caller), advancing
+ * by `charSize(ch)` per code point so surrogate-paired astral characters
+ * occupy two UTF-16 code units.
+ */
 static void scan_identifier(CtscScanner* s) {
     size_t start = s->pos;
-    s->pos++;
-    while (s->pos < s->source.len && is_identifier_part(s->source.data[s->pos])) { s->pos++; }
+    /* Advance past the (already-validated) IdentifierStart. */
+    uint32_t first = code_point_at(s, s->pos);
+    s->pos += char_size(first);
+    while (s->pos < s->source.len) {
+        uint32_t cp = code_point_at(s, s->pos);
+        if (!is_identifier_part(cp)) { break; }
+        s->pos += char_size(cp);
+    }
     s->current.text = s->source.data + start;
     s->current.text_len = s->pos - start;
     /* Fast path: no escape. tokenValue == raw text. */
@@ -586,11 +681,11 @@ static bool try_scan_identifier_from_backslash(CtscScanner* s) {
     int ext = peek_extended_unicode_escape(s);
     int simple = -1;
     bool take_ext = false;
-    if (ext >= 0 && ext <= 0xFFFF && is_identifier_start((uint16_t)ext)) {
+    if (ext >= 0 && is_identifier_start((uint32_t)ext)) {
         take_ext = true;
     } else {
         simple = peek_unicode_escape(s);
-        if (!(simple >= 0 && is_identifier_start((uint16_t)simple))) {
+        if (!(simple >= 0 && is_identifier_start((uint32_t)simple))) {
             return false;
         }
     }
@@ -720,66 +815,87 @@ static void scan_number(CtscScanner* s) {
         return;
     }
 
-    while (s->pos < s->source.len && is_digit(s->source.data[s->pos])) { s->pos++; }
+    scan_number_digits_allow_separators(s);
     bool coerce = scan_number_fraction_and_exponent(s);
     s->current.kind = CTSC_SK_NumericLiteral;
     s->current.text = s->source.data + start;
     s->current.text_len = s->pos - start;
-    if (coerce) { set_numeric_coerced_value(s, start, s->pos); }
+    bool has_sep = false;
+    for (size_t i = start; i < s->pos; i++) {
+        if (s->source.data[i] == '_') { has_sep = true; break; }
+    }
+    /* Integer literals with `_` need coerced tokenValue (`60000`) even when
+     * there is no fraction/exponent (scanner.ts ~1318-1319). */
+    if (coerce || has_sep) { set_numeric_coerced_value(s, start, s->pos); }
 }
 
+/* Forward decl: escape helper is defined later alongside scan_template.
+ * `token_start` is the UTF-16 offset of the enclosing literal's opening quote
+ * or backtick; it is used as the diagnostic `start` for escape errors to
+ * match tsc's onError semantics (scanner.setOnError passes
+ * scanner.getTokenStart() as the position - see harness/src/oracle.ts). */
+static void scan_escape_sequence_string(CtscScanner* s, uint16_t** buf, size_t* len, size_t* cap,
+    bool report_invalid_escape, size_t token_start);
+
+/*
+ * Mirrors upstream/TypeScript/src/compiler/scanner.ts scanString (~1422).
+ * Delegates escape decoding to scanEscapeSequence so `\x`, `\u{...}`,
+ * legacy octal, line continuations and the other sequences produce the
+ * same cooked value as tsc. The raw `text` field covers the full source
+ * span including the quotes; `value` holds the decoded string.
+ */
 static void scan_string(CtscScanner* s) {
     uint16_t quote = s->source.data[s->pos];
-    size_t start = s->pos;
+    size_t token_start = s->pos;
     s->pos++;
-    /* decoded value buffer */
+    size_t content_start = s->pos;
+
     CtscArena* arena = (CtscArena*)s->arena_ptr;
     size_t cap = 16;
     uint16_t* buf = (uint16_t*)ctsc_arena_alloc_aligned(arena, cap * sizeof(uint16_t), sizeof(uint16_t));
     size_t len = 0;
-    while (s->pos < s->source.len) {
-        uint16_t c = s->source.data[s->pos];
-        if (c == quote) { s->pos++; break; }
-        if (is_line_break(c)) {
+
+    for (;;) {
+        if (s->pos >= s->source.len) {
+            value_append_utf16_range(s, &buf, &len, &cap,
+                s->source.data + content_start, s->pos - content_start);
             if (s->diagnostics) {
-                ctsc_diag_push(s->diagnostics, CTSC_DIAG_ERROR, 1002, (int)start, (int)(s->pos - start), "Unterminated string literal.");
+                ctsc_diag_push(s->diagnostics, CTSC_DIAG_ERROR, 1002,
+                    (int)token_start, (int)(s->pos - token_start),
+                    "Unterminated string literal.");
             }
             break;
         }
-        uint16_t out_c;
-        if (c == '\\' && s->pos + 1 < s->source.len) {
-            uint16_t e = s->source.data[s->pos + 1];
-            s->pos += 2;
-            switch (e) {
-                case 'n':  out_c = 0x0A; break;
-                case 'r':  out_c = 0x0D; break;
-                case 't':  out_c = 0x09; break;
-                case 'b':  out_c = 0x08; break;
-                case 'f':  out_c = 0x0C; break;
-                case 'v':  out_c = 0x0B; break;
-                case '0':  out_c = 0x00; break;
-                case '\\': out_c = 0x5C; break;
-                case '"':  out_c = 0x22; break;
-                case '\'': out_c = 0x27; break;
-                case '`':  out_c = 0x60; break;
-                default:   out_c = e; break;
-            }
-        } else {
-            out_c = c;
+        uint16_t c = s->source.data[s->pos];
+        if (c == quote) {
+            value_append_utf16_range(s, &buf, &len, &cap,
+                s->source.data + content_start, s->pos - content_start);
             s->pos++;
+            break;
         }
-        if (len + 1 > cap) {
-            size_t ncap = cap * 2;
-            uint16_t* nb = (uint16_t*)ctsc_arena_alloc_aligned(arena, ncap * sizeof(uint16_t), sizeof(uint16_t));
-            memcpy(nb, buf, len * sizeof(uint16_t));
-            buf = nb;
-            cap = ncap;
+        if (c == '\\') {
+            value_append_utf16_range(s, &buf, &len, &cap,
+                s->source.data + content_start, s->pos - content_start);
+            scan_escape_sequence_string(s, &buf, &len, &cap, /*report_invalid_escape*/ true, token_start);
+            content_start = s->pos;
+            continue;
         }
-        buf[len++] = out_c;
+        if (is_line_break(c)) {
+            value_append_utf16_range(s, &buf, &len, &cap,
+                s->source.data + content_start, s->pos - content_start);
+            if (s->diagnostics) {
+                ctsc_diag_push(s->diagnostics, CTSC_DIAG_ERROR, 1002,
+                    (int)token_start, (int)(s->pos - token_start),
+                    "Unterminated string literal.");
+            }
+            break;
+        }
+        s->pos++;
     }
+
     s->current.kind = CTSC_SK_StringLiteral;
-    s->current.text = s->source.data + start;
-    s->current.text_len = s->pos - start;
+    s->current.text = s->source.data + token_start;
+    s->current.text_len = s->pos - token_start;
     s->current.value = buf;
     s->current.value_len = len;
 }
@@ -815,9 +931,8 @@ static void value_append_utf16_range(CtscScanner* s, uint16_t** buf, size_t* len
  * units are appended to *buf / *len.
  */
 static void scan_escape_sequence_string(CtscScanner* s, uint16_t** buf, size_t* len, size_t* cap,
-    bool report_invalid_escape) {
+    bool report_invalid_escape, size_t token_start) {
     size_t esc_start = s->pos;
-    (void)report_invalid_escape;
     s->pos++;
     if (s->pos >= s->source.len) {
         if (s->diagnostics) {
@@ -872,13 +987,22 @@ static void scan_escape_sequence_string(CtscScanner* s, uint16_t** buf, size_t* 
             value_push_u16(s, buf, len, cap, ch);
             break;
         case 'x': {
+            /* Mirrors upstream scanner.ts scanEscapeSequence case 'x' (~1670):
+             * on too-few hex digits, emit Hexadecimal_digit_expected (1125)
+             * at the token start with length 0 (matching tsc's onError
+             * semantics) and fall back to the raw source slice. The error
+             * is suppressed when the caller passes `report_invalid_escape=false`
+             * (templates -- upstream's EscapeSequenceScanningFlags w/o
+             * ReportInvalidEscapeErrors). */
             int v = 0;
             for (int k = 0; k < 2; k++) {
                 if (s->pos >= s->source.len || !is_hex_digit(s->source.data[s->pos])) {
-                    if (s->diagnostics) {
-                        ctsc_diag_push(s->diagnostics, CTSC_DIAG_ERROR, 1700, (int)esc_start,
-                            (int)(s->pos - esc_start), "Hexadecimal digit expected.");
+                    if (report_invalid_escape && s->diagnostics) {
+                        ctsc_diag_push(s->diagnostics, CTSC_DIAG_ERROR, 1125,
+                            (int)token_start, 0, "Hexadecimal digit expected.");
                     }
+                    value_append_utf16_range(s, buf, len, cap,
+                        s->source.data + esc_start, s->pos - esc_start);
                     return;
                 }
                 v = (v << 4) | hex_digit_value(s->source.data[s->pos++]);
@@ -887,29 +1011,71 @@ static void scan_escape_sequence_string(CtscScanner* s, uint16_t** buf, size_t* 
             break;
         }
         case 'u': {
+            /* Mirrors upstream scanner.ts scanEscapeSequence case 'u' (~1621)
+             * and scanExtendedUnicodeEscape (~1708). On an invalid escape,
+             * tsc emits diagnostic(s) at the scanner's current pos with
+             * length 0 (the harness reports `start = getTokenStart()`),
+             * sets ContainsInvalidEscape, and returns the raw source slice
+             * `text.substring(start, pos)` as the cooked value. */
             if (s->pos < s->source.len && s->source.data[s->pos] == '{') {
+                /* '\\u{ HEX+ }' extended escape */
                 s->pos++;
                 int v = -1;
                 if (s->pos < s->source.len && is_hex_digit(s->source.data[s->pos])) {
                     v = 0;
                     while (s->pos < s->source.len && is_hex_digit(s->source.data[s->pos])) {
                         v = (v << 4) | hex_digit_value(s->source.data[s->pos++]);
+                        if (v > 0x10FFFF) {
+                            /* Keep consuming hex digits so the raw slice covers
+                             * them; cap v so we stay in a known state. */
+                            while (s->pos < s->source.len && is_hex_digit(s->source.data[s->pos])) {
+                                s->pos++;
+                            }
+                            v = 0x110000; /* sentinel: > 0x10FFFF */
+                            break;
+                        }
                     }
                 }
-                if (s->pos >= s->source.len || s->source.data[s->pos] != '}') {
-                    if (s->diagnostics) {
-                        ctsc_diag_push(s->diagnostics, CTSC_DIAG_ERROR, 1701, (int)esc_start,
-                            (int)(s->pos - esc_start), "Unterminated Unicode escape sequence.");
+                bool invalid = false;
+                if (v < 0) {
+                    /* No hex digits -- upstream reports Hexadecimal_digit_expected
+                     * at the current pos with length 0. */
+                    if (report_invalid_escape && s->diagnostics) {
+                        ctsc_diag_push(s->diagnostics, CTSC_DIAG_ERROR, 1125,
+                            (int)token_start, 0, "Hexadecimal digit expected.");
                     }
-                    return;
+                    invalid = true;
                 }
-                s->pos++;
-                if (v < 0 || v > 0x10FFFF) {
-                    if (s->diagnostics) {
-                        ctsc_diag_push(s->diagnostics, CTSC_DIAG_ERROR, 1702, (int)esc_start,
-                            (int)(s->pos - esc_start),
+                else if (v > 0x10FFFF) {
+                    if (report_invalid_escape && s->diagnostics) {
+                        ctsc_diag_push(s->diagnostics, CTSC_DIAG_ERROR, 1198,
+                            (int)token_start, 0,
                             "An extended Unicode escape value must be between 0x0 and 0x10FFFF inclusive.");
                     }
+                    invalid = true;
+                }
+                if (s->pos >= s->source.len) {
+                    if (report_invalid_escape && s->diagnostics && !invalid) {
+                        ctsc_diag_push(s->diagnostics, CTSC_DIAG_ERROR, 1126,
+                            (int)token_start, 0, "Unexpected end of text.");
+                    }
+                    invalid = true;
+                }
+                else if (s->source.data[s->pos] == '}') {
+                    s->pos++;
+                }
+                else {
+                    if (report_invalid_escape && s->diagnostics) {
+                        ctsc_diag_push(s->diagnostics, CTSC_DIAG_ERROR, 1199,
+                            (int)token_start, 0, "Unterminated Unicode escape sequence.");
+                    }
+                    invalid = true;
+                }
+                if (invalid) {
+                    /* Mirror `text.substring(start, pos)` -- append the raw
+                     * source slice of the escape to the cooked value. */
+                    value_append_utf16_range(s, buf, len, cap,
+                        s->source.data + esc_start, s->pos - esc_start);
                     return;
                 }
                 if (v <= 0xFFFF) {
@@ -922,13 +1088,16 @@ static void scan_escape_sequence_string(CtscScanner* s, uint16_t** buf, size_t* 
                 break;
             }
             {
+                /* '\\uXXXX' four-hex-digit escape */
                 int v = 0;
                 for (int k = 0; k < 4; k++) {
                     if (s->pos >= s->source.len || !is_hex_digit(s->source.data[s->pos])) {
-                        if (s->diagnostics) {
-                            ctsc_diag_push(s->diagnostics, CTSC_DIAG_ERROR, 1700, (int)esc_start,
-                                (int)(s->pos - esc_start), "Hexadecimal digit expected.");
+                        if (report_invalid_escape && s->diagnostics) {
+                            ctsc_diag_push(s->diagnostics, CTSC_DIAG_ERROR, 1125,
+                                (int)token_start, 0, "Hexadecimal digit expected.");
                         }
+                        value_append_utf16_range(s, buf, len, cap,
+                            s->source.data + esc_start, s->pos - esc_start);
                         return;
                     }
                     v = (v << 4) | hex_digit_value(s->source.data[s->pos++]);
@@ -994,7 +1163,7 @@ static void scan_template(CtscScanner* s) {
 
         if (curr == '\\') {
             value_append_utf16_range(s, &buf, &vlen, &cap, s->source.data + content_start, s->pos - content_start);
-            scan_escape_sequence_string(s, &buf, &vlen, &cap, /*report_invalid_escape*/ false);
+            scan_escape_sequence_string(s, &buf, &vlen, &cap, /*report_invalid_escape*/ false, token_start);
             content_start = s->pos;
             continue;
         }
@@ -1018,6 +1187,35 @@ static void scan_template(CtscScanner* s) {
     s->current.value_len = vlen;
 }
 
+/*
+ * Mirrors upstream/TypeScript/src/compiler/scanner.ts reScanTemplateToken (~3658):
+ *
+ *     function reScanTemplateToken(isTaggedTemplate: boolean): SyntaxKind {
+ *         pos = tokenStart;
+ *         return token = scanTemplateAndSetTokenValue(!isTaggedTemplate);
+ *     }
+ *
+ * The parser calls this after seeing CloseBraceToken inside a template
+ * substitution (parser.ts parseLiteralOfTemplateSpan ~3713). We back up
+ * `pos` to the start of the `}` token, clear the token text/value fields
+ * the way ctsc_scanner_next would, and then let scan_template consume the
+ * middle/tail fragment. scan_template itself sets kind/text/value; we fill
+ * in `current.end` at the end so the parser can read cur_end(p).
+ */
+CtscSyntaxKind ctsc_scanner_re_scan_template_token(CtscScanner* s) {
+    if (s->current.kind != CTSC_SK_CloseBraceToken) {
+        return s->current.kind;
+    }
+    s->pos = (size_t)s->current.start;
+    s->current.text = NULL;
+    s->current.text_len = 0;
+    s->current.value = NULL;
+    s->current.value_len = 0;
+    scan_template(s);
+    s->current.end = (int)s->pos;
+    return s->current.kind;
+}
+
 CtscSyntaxKind ctsc_scanner_next(CtscScanner* s) {
     s->current.full_start = (int)s->pos;
     skip_trivia(s);
@@ -1037,10 +1235,26 @@ CtscSyntaxKind ctsc_scanner_next(CtscScanner* s) {
 
     uint16_t c = s->source.data[s->pos];
 
-    if (is_identifier_start(c)) { scan_identifier(s); goto done; }
-    if (is_digit(c))            { scan_number(s);     goto done; }
-    if (c == '"' || c == '\'')  { scan_string(s);     goto done; }
-    if (c == '`')               { scan_template(s);   goto done; }
+    /* Fast-path dispatch on the ASCII subset. For non-ASCII we fall
+     * through to a code-point-aware IdentifierStart check below, mirroring
+     * upstream scanner.ts scan()'s `default: scanIdentifier(ch, ...)` arm
+     * (~2368). */
+    if (c < 128) {
+        if (is_identifier_start(c)) { scan_identifier(s); goto done; }
+        if (is_digit(c))            { scan_number(s);     goto done; }
+        if (c == '"' || c == '\'')  { scan_string(s);     goto done; }
+        if (c == '`')               { scan_template(s);   goto done; }
+    } else {
+        /* Non-ASCII: decode the code point (collapsing a surrogate pair)
+         * and classify it. Surrogates themselves never match
+         * IdentifierStart/Part; astral identifier chars are handled via
+         * `char_size`. */
+        uint32_t cp = code_point_at(s, s->pos);
+        if (is_identifier_start(cp)) { scan_identifier(s); goto done; }
+        /* Fall through: the char may still be whitespace (e.g. NBSP in
+         * skip_trivia covers 0xA0, 0xFEFF), otherwise it is an
+         * Invalid character. The default: branch advances by char_size. */
+    }
 
     switch (c) {
         case '{': s->pos++; s->current.kind = CTSC_SK_OpenBraceToken; break;
@@ -1121,6 +1335,73 @@ CtscSyntaxKind ctsc_scanner_next(CtscScanner* s) {
             else { s->pos++; s->current.kind = CTSC_SK_BarToken; }
             break;
         case '^': s->pos++; s->current.kind = CTSC_SK_CaretToken; break;
+        case '#': {
+            /*
+             * PrivateIdentifier (mirrors upstream/TypeScript/src/compiler/scanner.ts
+             * scan() case CharacterCodes.hash ~2324). The token spans `#` plus the
+             * trailing identifier name; `text` covers the raw `#name` source slice
+             * while `value` (when an escape decoded a part) holds the cooked name.
+             *
+             * `#!` at position 0 is shebang trivia, but only at the very start of
+             * the file (handled by skip_trivia callers in upstream). Here we just
+             * preserve the upstream behaviour for `#!` not at start: report
+             * Diagnostics.can_only_be_used_at_the_start_of_a_file and emit Unknown.
+             */
+            size_t hash_start = s->pos;
+            if (s->pos != 0 && peek(s, 1) == '!') {
+                if (s->diagnostics) {
+                    ctsc_diag_push(s->diagnostics, CTSC_DIAG_ERROR, 18026, (int)hash_start, 2,
+                        "'#!' can only be used at the start of a file.");
+                }
+                s->pos++;
+                s->current.kind = CTSC_SK_Unknown;
+                break;
+            }
+            uint32_t after = (s->pos + 1 < s->source.len)
+                ? code_point_at(s, s->pos + 1) : 0u;
+            if (after && is_identifier_start(after)) {
+                /* Consume `#` + identifier-start + identifier-parts. The text
+                 * span is the raw source slice including `#`. No escape in the
+                 * common ASCII path, so no value buffer is needed (mirrors
+                 * upstream getIdentifierToken returning PrivateIdentifier with
+                 * tokenValue == "#" + name when no escape was seen). */
+                s->pos += 1 + char_size(after);
+                while (s->pos < s->source.len) {
+                    uint32_t pcp = code_point_at(s, s->pos);
+                    if (!is_identifier_part(pcp)) { break; }
+                    s->pos += char_size(pcp);
+                }
+                s->current.kind = CTSC_SK_PrivateIdentifier;
+                s->current.text = s->source.data + hash_start;
+                s->current.text_len = s->pos - hash_start;
+                /* Slow path: a `\uXXXX` escape may follow as an identifier part. */
+                if (s->pos < s->source.len && s->source.data[s->pos] == '\\') {
+                    CtscArena* arena = (CtscArena*)s->arena_ptr;
+                    size_t cap = 16;
+                    uint16_t* vbuf = (uint16_t*)ctsc_arena_alloc_aligned(arena, cap * sizeof(uint16_t), sizeof(uint16_t));
+                    size_t vlen = 0;
+                    value_append_utf16_range(s, &vbuf, &vlen, &cap, s->source.data + hash_start, s->pos - hash_start);
+                    scan_identifier_parts_into(s, &vbuf, &vlen, &cap);
+                    s->current.text_len = s->pos - hash_start;
+                    s->current.value = vbuf;
+                    s->current.value_len = vlen;
+                }
+                break;
+            }
+            /* `#` not followed by an IdentifierStart: tsc still emits
+             * PrivateIdentifier with tokenValue == "#" and reports
+             * Diagnostics.Invalid_character at the `#` itself before advancing
+             * past it (upstream scanner.ts ~2361 `error(..., pos++, charSize(ch))`).
+             */
+            if (s->diagnostics) {
+                ctsc_diag_push(s->diagnostics, CTSC_DIAG_ERROR, 1127, (int)hash_start, 1, "Invalid character.");
+            }
+            s->pos++;
+            s->current.kind = CTSC_SK_PrivateIdentifier;
+            s->current.text = s->source.data + hash_start;
+            s->current.text_len = 1;
+            break;
+        }
         case '\\':
             /* An identifier may begin with a `\uXXXX` or `\u{XXXX}` escape
              * whose decoded code point is an IdentifierStart. See upstream
@@ -1132,13 +1413,21 @@ CtscSyntaxKind ctsc_scanner_next(CtscScanner* s) {
             s->pos++;
             s->current.kind = CTSC_SK_Unknown;
             break;
-        default:
+        default: {
+            /* Mirrors upstream scanner.ts scan() default arm (~2382-2385):
+             * report Invalid character with length = charSize(ch) and
+             * advance by the same amount. For a well-formed surrogate pair
+             * that is non-id, the whole code point is consumed as one
+             * invalid unit. */
+            uint32_t cp = code_point_at(s, s->pos);
+            size_t size = char_size(cp);
             if (s->diagnostics) {
-                ctsc_diag_push(s->diagnostics, CTSC_DIAG_ERROR, 1127, (int)s->pos, 1, "Invalid character.");
+                ctsc_diag_push(s->diagnostics, CTSC_DIAG_ERROR, 1127, (int)s->pos, (int)size, "Invalid character.");
             }
-            s->pos++;
+            s->pos += size;
             s->current.kind = CTSC_SK_Unknown;
             break;
+        }
     }
 
 done:

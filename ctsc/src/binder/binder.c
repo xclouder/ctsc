@@ -162,6 +162,26 @@ static void bind_node(CtscBindResult* r, CtscArena* a,
             bind_children(r, a, container_scope, blk_scope, &node->data.block.statements);
             break;
         }
+        case CTSC_SK_SwitchStatement:
+            bind_node(r, a, container_scope, block_scope,
+                      node->data.switchStatement.expression);
+            bind_node(r, a, container_scope, block_scope,
+                      node->data.switchStatement.caseBlock);
+            break;
+        case CTSC_SK_CaseBlock:
+            bind_children(r, a, container_scope, block_scope,
+                          &node->data.caseBlock.clauses);
+            break;
+        case CTSC_SK_CaseClause:
+            bind_node(r, a, container_scope, block_scope,
+                      node->data.caseClause.expression);
+            bind_children(r, a, container_scope, block_scope,
+                          &node->data.caseClause.statements);
+            break;
+        case CTSC_SK_DefaultClause:
+            bind_children(r, a, container_scope, block_scope,
+                          &node->data.defaultClause.statements);
+            break;
         case CTSC_SK_VariableStatement: {
             /* Mirrors binder.ts bindVariableDeclarationOrBindingElement (~3648):
              * each VariableDeclaration contributes a symbol. `let`/`const`

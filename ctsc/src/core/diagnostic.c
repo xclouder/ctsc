@@ -24,6 +24,38 @@ void ctsc_diag_free(CtscDiagnosticList* l) {
     l->count = 0;
 }
 
+/*
+ * Truncate the list so that only the first `keep` diagnostics remain. Used by
+ * speculative parse helpers (mirrors upstream parser.ts tryParse/speculationHelper
+ * which rolls back diagnostics emitted during the trial when the trial fails).
+ */
+void ctsc_diag_truncate(CtscDiagnosticList* l, size_t keep) {
+    if (keep >= l->count) return;
+    CtscDiagnostic* d = l->head;
+    size_t i = 0;
+    CtscDiagnostic* new_tail = NULL;
+    while (d && i < keep) {
+        new_tail = d;
+        d = d->next;
+        i++;
+    }
+    /* d is the first node to drop. */
+    while (d) {
+        CtscDiagnostic* n = d->next;
+        free(d->message);
+        free(d);
+        d = n;
+    }
+    if (new_tail) {
+        new_tail->next = NULL;
+        l->tail = new_tail;
+    } else {
+        l->head = NULL;
+        l->tail = NULL;
+    }
+    l->count = keep;
+}
+
 void ctsc_diag_push(CtscDiagnosticList* l, CtscDiagCategory cat, int code, int start, int length, const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);

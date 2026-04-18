@@ -14,7 +14,15 @@
     - Returns the PID so you can kill it later (Stop-Process -Id <pid>)
 
 .PARAMETER Model
-  Agent model. Default 'auto'. Examples: 'composer-2', 'sonnet-4', 'gpt-5'.
+  Primary agent model. Default 'composer-2' (fast + cheap).
+
+.PARAMETER FallbackModel
+  Model to escalate to after -FallbackAfter consecutive no-progress
+  attempts on a fixture. Default 'claude-opus-4-7-xhigh'. Pass '' to
+  disable escalation.
+
+.PARAMETER FallbackAfter
+  Number of stuck attempts before escalating (default 2).
 
 .PARAMETER RetryDeferred
   Clear the deferred flag on all non-passed fixtures before starting.
@@ -28,7 +36,9 @@
 
 [CmdletBinding()]
 param(
-  [string] $Model = "",
+  [string] $Model         = "composer-2",
+  [string] $FallbackModel = "claude-opus-4-7-xhigh",
+  [int]    $FallbackAfter = 2,
   [switch] $RetryDeferred,
   [int]    $StatusEvery = 20,
   [int]    $Max = 0,
@@ -67,6 +77,7 @@ $loopArgs = @("run", "loop", "--", "--build", "--status-every", "$StatusEvery", 
 if ($Max -le 0) { $loopArgs += "--forever" } else { $loopArgs += @("--max", "$Max") }
 if ($RetryDeferred) { $loopArgs += "--retry-deferred" }
 if ($Model) { $loopArgs += @("--model", $Model) }
+if ($FallbackModel) { $loopArgs += @("--fallback-model", $FallbackModel, "--fallback-after", "$FallbackAfter") }
 
 Write-Host "[run-loop] harness : $harness"
 Write-Host "[run-loop] log     : $logPath"
