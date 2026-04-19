@@ -474,6 +474,24 @@ static void emit_node(CtscJson* j, const CtscNode* n) {
             }
             break;
         }
+        case CTSC_SK_SpreadAssignment:
+            /* forEachChildInSpreadAssignment: expression only. */
+            if (n->data.spreadAssignment.expression) {
+                ctsc_json_key(j, "children");
+                ctsc_json_begin_arr(j);
+                emit_node(j, n->data.spreadAssignment.expression);
+                ctsc_json_end_arr(j);
+            }
+            break;
+        case CTSC_SK_SpreadElement:
+            /* forEachChildInSpreadElement: expression only (types.ts). */
+            if (n->data.spreadElement.expression) {
+                ctsc_json_key(j, "children");
+                ctsc_json_begin_arr(j);
+                emit_node(j, n->data.spreadElement.expression);
+                ctsc_json_end_arr(j);
+            }
+            break;
         case CTSC_SK_ComputedPropertyName:
             /* Mirrors upstream/TypeScript/src/compiler/parser.ts
              * forEachChildInComputedPropertyName: visits only `expression`.
@@ -542,6 +560,32 @@ static void emit_node(CtscJson* j, const CtscNode* n) {
                 }
                 for (size_t i = 0; i < n->data.classDeclaration.members.len; ++i) {
                     emit_node(j, n->data.classDeclaration.members.items[i]);
+                }
+                ctsc_json_end_arr(j);
+            }
+            break;
+        }
+        case CTSC_SK_TypeAliasDeclaration: {
+            /* Mirrors upstream parser.ts forEachChildInTypeAliasDeclaration (~907):
+             * modifiers, name, typeParameters, type. */
+            size_t child_count = n->data.typeAliasDeclaration.modifiers.len;
+            if (n->data.typeAliasDeclaration.name) child_count++;
+            child_count += n->data.typeAliasDeclaration.type_parameters.len;
+            if (n->data.typeAliasDeclaration.type) child_count++;
+            if (child_count > 0) {
+                ctsc_json_key(j, "children");
+                ctsc_json_begin_arr(j);
+                for (size_t i = 0; i < n->data.typeAliasDeclaration.modifiers.len; ++i) {
+                    emit_node(j, n->data.typeAliasDeclaration.modifiers.items[i]);
+                }
+                if (n->data.typeAliasDeclaration.name) {
+                    emit_node(j, n->data.typeAliasDeclaration.name);
+                }
+                for (size_t i = 0; i < n->data.typeAliasDeclaration.type_parameters.len; ++i) {
+                    emit_node(j, n->data.typeAliasDeclaration.type_parameters.items[i]);
+                }
+                if (n->data.typeAliasDeclaration.type) {
+                    emit_node(j, n->data.typeAliasDeclaration.type);
                 }
                 ctsc_json_end_arr(j);
             }
@@ -638,7 +682,7 @@ static void emit_node(CtscJson* j, const CtscNode* n) {
              * (currently impossible because name is always at least the zero-
              * width missing Identifier).
              */
-            size_t child_count = 0;
+            size_t child_count = n->data.methodDeclaration.modifiers.len;
             if (n->data.methodDeclaration.has_asterisk) child_count++;
             if (n->data.methodDeclaration.name) child_count++;
             child_count += n->data.methodDeclaration.type_parameters.len;
@@ -647,6 +691,9 @@ static void emit_node(CtscJson* j, const CtscNode* n) {
             if (child_count > 0) {
                 ctsc_json_key(j, "children");
                 ctsc_json_begin_arr(j);
+                for (size_t mi = 0; mi < n->data.methodDeclaration.modifiers.len; ++mi) {
+                    emit_node(j, n->data.methodDeclaration.modifiers.items[mi]);
+                }
                 if (n->data.methodDeclaration.has_asterisk) {
                     /* AsteriskToken leaf: {kind,pos,end}. Mirrors tsc's
                      * factoryCreateToken(AsteriskToken) / parseTokenNode
@@ -692,13 +739,16 @@ static void emit_node(CtscJson* j, const CtscNode* n) {
              * annotation are skipped until a fixture demands them. Undefined
              * visits are skipped the way ts.forEachChild / visitNode skip
              * undefined. */
-            size_t child_count = 0;
+            size_t child_count = n->data.accessorDeclaration.modifiers.len;
             if (n->data.accessorDeclaration.name) child_count++;
             child_count += n->data.accessorDeclaration.parameters.len;
             if (n->data.accessorDeclaration.body) child_count++;
             if (child_count > 0) {
                 ctsc_json_key(j, "children");
                 ctsc_json_begin_arr(j);
+                for (size_t mi = 0; mi < n->data.accessorDeclaration.modifiers.len; ++mi) {
+                    emit_node(j, n->data.accessorDeclaration.modifiers.items[mi]);
+                }
                 if (n->data.accessorDeclaration.name) {
                     emit_node(j, n->data.accessorDeclaration.name);
                 }
@@ -730,13 +780,16 @@ static void emit_node(CtscJson* j, const CtscNode* n) {
              *     → children=[ComputedPropertyName, NumericLiteral]
              * Undefined visits are skipped the way ts.forEachChild /
              * visitNode skip undefined. */
-            size_t child_count = 0;
+            size_t child_count = n->data.propertyDeclaration.modifiers.len;
             if (n->data.propertyDeclaration.name) child_count++;
             if (n->data.propertyDeclaration.type) child_count++;
             if (n->data.propertyDeclaration.initializer) child_count++;
             if (child_count > 0) {
                 ctsc_json_key(j, "children");
                 ctsc_json_begin_arr(j);
+                for (size_t mi = 0; mi < n->data.propertyDeclaration.modifiers.len; ++mi) {
+                    emit_node(j, n->data.propertyDeclaration.modifiers.items[mi]);
+                }
                 if (n->data.propertyDeclaration.name) {
                     emit_node(j, n->data.propertyDeclaration.name);
                 }
@@ -816,6 +869,13 @@ static void emit_node(CtscJson* j, const CtscNode* n) {
             emit_node(j, n->data.voidExpression.expression);
             ctsc_json_end_arr(j);
             break;
+        case CTSC_SK_AwaitExpression:
+            /* forEachChildInAwaitExpression (~751): visits `expression`. */
+            ctsc_json_key(j, "children");
+            ctsc_json_begin_arr(j);
+            emit_node(j, n->data.awaitExpression.expression);
+            ctsc_json_end_arr(j);
+            break;
         case CTSC_SK_TypeAssertionExpression: {
             /* Mirrors upstream/TypeScript/src/compiler/parser.ts
              * forEachChildInTypeAssertionExpression (~758): visits `type` then
@@ -859,6 +919,24 @@ static void emit_node(CtscJson* j, const CtscNode* n) {
                 }
                 if (n->data.tryStatement.finallyBlock) {
                     emit_node(j, n->data.tryStatement.finallyBlock);
+                }
+                ctsc_json_end_arr(j);
+            }
+            break;
+        }
+        case CTSC_SK_CatchClause: {
+            /* forEachChildInCatchClause (~892): variableDeclaration, block. */
+            size_t child_count = 0;
+            if (n->data.catchClause.variableDeclaration) child_count++;
+            if (n->data.catchClause.block) child_count++;
+            if (child_count > 0) {
+                ctsc_json_key(j, "children");
+                ctsc_json_begin_arr(j);
+                if (n->data.catchClause.variableDeclaration) {
+                    emit_node(j, n->data.catchClause.variableDeclaration);
+                }
+                if (n->data.catchClause.block) {
+                    emit_node(j, n->data.catchClause.block);
                 }
                 ctsc_json_end_arr(j);
             }
@@ -1006,6 +1084,15 @@ static void emit_node(CtscJson* j, const CtscNode* n) {
             ctsc_json_begin_arr(j);
             emit_node(j, n->data.templateSpan.expression);
             emit_node(j, n->data.templateSpan.literal);
+            ctsc_json_end_arr(j);
+            break;
+        }
+        case CTSC_SK_TaggedTemplateExpression: {
+            /* Mirrors forEachChildInTaggedTemplateExpression (~748): tag then template. */
+            ctsc_json_key(j, "children");
+            ctsc_json_begin_arr(j);
+            emit_node(j, n->data.taggedTemplateExpression.tag);
+            emit_node(j, n->data.taggedTemplateExpression.template_);
             ctsc_json_end_arr(j);
             break;
         }

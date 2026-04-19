@@ -126,6 +126,17 @@ typedef struct {
     CtscNode* literal;    /* TemplateMiddle | TemplateTail */
 } CtscTemplateSpanData;
 
+/*
+ * Mirrors upstream/TypeScript/src/compiler/types.ts TaggedTemplateExpression
+ * (`tag`, `template`: NoSubstitutionTemplateLiteral | TemplateExpression).
+ * Parsed by parser.ts parseTaggedTemplateRest (~6505), emitted by emitter.ts
+ * emitTaggedTemplateExpression (~2722).
+ */
+typedef struct {
+    CtscNode* tag;
+    CtscNode* template_; /* NoSubstitutionTemplateLiteral | TemplateExpression */
+} CtscTaggedTemplateExpressionData;
+
 typedef struct {
     CtscNode* expression;
 } CtscExpressionStatementData;
@@ -234,11 +245,19 @@ typedef struct {
     bool          has_asterisk;
     int           asterisk_pos;
     int           asterisk_end;
+    /* True when `async` preceded `function` (parser.ts parseFunctionDeclaration). */
+    bool          has_async;
     /* True for SourceFile-level `export function ...` (parser.ts parseDeclaration
      * ~7467 + parseFunctionDeclaration with ExportKeyword modifier). Only
      * FunctionDeclaration uses this; FunctionExpression leaves it false. */
     bool          has_export;
+    /* True for `export default function ...` (parser.ts parseDeclaration ~7530-7535
+     * → parseExportAssignment ~8736, expression parsed as function). Mutually
+     * exclusive with has_export in normal sources. */
+    bool          has_export_default;
     CtscNode*     name;       /* Identifier nullable (anon) */
+    /* Mirrors parseTypeParameters (~3987) between name and parseParameters. */
+    CtscNodeArray type_parameters;
     CtscNodeArray parameters;
     CtscNode*     body;       /* Block */
 } CtscFunctionDeclarationData;
@@ -263,22 +282,26 @@ typedef struct {
  * a synthetic token child between `parameters` and `body`.
  */
 typedef struct {
+    bool          has_async;
     CtscNodeArray parameters;
     int           equals_greater_than_pos;
     int           equals_greater_than_end;
     CtscNode*     body; /* Block or AssignmentExpression */
 } CtscArrowFunctionData;
 
+/* Mirrors upstream/TypeScript/src/compiler/parser.ts parseAwaitExpression (~5726). */
+typedef struct {
+    CtscNode* expression;
+} CtscAwaitExpressionData;
+
 /*
  * Mirrors upstream/TypeScript/src/compiler/parser.ts parseParameterWorker
  * (~4036) + forEachChildInParameter (~528): a ParameterDeclaration carries
  * `modifiers`, `dotDotDotToken`, `name`, `questionToken`, `type`, and
- * `initializer`. ctsc currently models `name`, `type`, `initializer`, plus
- * just enough state to round-trip a rest parameter (`...x`) through the
- * emitter — the TS-only `?` after the name is consumed by the parser so the
- * scanner advances, but is not surfaced to the emitter (the JS printer would
- * drop it via transformers/ts.ts visitParameter anyway, and no unlocked
- * fixture inspects it in the AST oracle).
+ * `initializer`. ctsc models `name`, `type`, `initializer`, plus rest-param
+ * state. The TS-only `?` after the name is consumed by the parser so the
+ * scanner advances, but is not surfaced to the emitter (the JS printer drops
+ * it via transformers/ts.ts visitParameter).
  *
  * `has_dot_dot_dot` is true for rest parameters. The token's span is kept
  * purely so future AST-JSON / forEachChild work can produce a synthetic
@@ -291,6 +314,10 @@ typedef struct {
     bool      has_dot_dot_dot;
     int       dot_dot_dot_pos;
     int       dot_dot_dot_end;
+    /* True when parseParameter consumed a public/private/protected/readonly
+     * modifier (mirrors isParameterPropertyDeclaration in utilitiesPublic.ts).
+     * Used by the emitter to inject this.<name> = <name> in constructors. */
+    bool      is_parameter_property;
 } CtscParameterData;
 
 /*
@@ -501,6 +528,11 @@ typedef struct {
 typedef struct {
     CtscNode* expression;
     CtscNode* name; /* Identifier */
+    /*
+     * True when this access used `?.` (optional chaining). Mirrors
+     * PropertyAccessExpression.questionDotToken in upstream types.ts.
+     */
+    bool      optional_chain;
 } CtscPropertyAccessExpressionData;
 
 /*
@@ -520,6 +552,7 @@ typedef struct {
 typedef struct {
     CtscNode* expression;
     CtscNode* argumentExpression;
+    bool      optional_chain; /* true when source was `?.[` */
 } CtscElementAccessExpressionData;
 
 typedef struct {
@@ -566,6 +599,24 @@ typedef struct {
     CtscNode* name;
     CtscNode* objectAssignmentInitializer; /* nullable */
 } CtscShorthandPropertyAssignmentData;
+
+/*
+ * Mirrors upstream/TypeScript/src/compiler/parser.ts parseObjectLiteralElement
+ * (~6703): `...` AssignmentExpression. forEachChildInSpreadAssignment visits
+ * only `expression` (types.ts SpreadAssignment).
+ */
+typedef struct {
+    CtscNode* expression;
+} CtscSpreadAssignmentData;
+
+/*
+ * Mirrors upstream/TypeScript/src/compiler/parser.ts parseArgumentExpression
+ * (~6685): SpreadElement — `...` UnaryExpression (types.ts SpreadElement).
+ * forEachChild visits only `expression`, matching SpreadAssignment's shape.
+ */
+typedef struct {
+    CtscNode* expression;
+} CtscSpreadElementData;
 
 /*
  * Mirrors upstream/TypeScript/src/compiler/parser.ts parseComputedPropertyName
@@ -625,15 +676,26 @@ typedef struct {
  * a single `children` array. ast_json.c mirrors that, skipping any undefined
  * children the way ts.forEachChild / visitNode does.
  *
- * ctsc does not yet model CatchClause; the only currently-unlocked TryStatement
- * fixture (106_parserMissingToken1.ts: `a / finally` at EOF) hits the
- * missing-try + bare-finally recovery path, so `catchClause` stays NULL.
+ * `catchClause` is populated by parseCatchClause (~7097) when the token after
+ * the try block is `catch`. The 106_parserMissingToken1.ts fixture (`a / finally`
+ * at EOF) still has `catchClause` NULL.
  */
 typedef struct {
     CtscNode* tryBlock;      /* Block, always present */
-    CtscNode* catchClause;   /* nullable (not yet modelled) */
+    CtscNode* catchClause;   /* nullable CatchClause */
     CtscNode* finallyBlock;  /* nullable Block */
 } CtscTryStatementData;
+
+/*
+ * Mirrors upstream/TypeScript/src/compiler/parser.ts parseCatchClause (~7097):
+ *   catch ( VariableDeclaration? ) Block
+ * `variableDeclaration` is absent when the `( )` pair is omitted (optional
+ * binding in ES2019 optional catch binding).
+ */
+typedef struct {
+    CtscNode* variableDeclaration; /* nullable VariableDeclaration */
+    CtscNode* block;               /* Block */
+} CtscCatchClauseData;
 
 /*
  * Mirrors upstream/TypeScript/src/compiler/parser.ts parseMethodDeclaration (~7782):
@@ -667,6 +729,7 @@ typedef struct {
  * forEachChildInMethodDeclaration (parser.ts ~530) visit order.
  */
 typedef struct {
+    CtscNodeArray modifiers;        /* ModifierLike token leaves; may be empty */
     bool          has_asterisk;
     int           asterisk_pos;
     int           asterisk_end;
@@ -700,6 +763,7 @@ typedef struct {
  * undefined when a semicolon stands in for the body (ambient / overload).
  */
 typedef struct {
+    CtscNodeArray modifiers;        /* ModifierLike token leaves; may be empty */
     CtscNode*     name;           /* PropertyName (Identifier | ComputedPropertyName | ...) */
     CtscNodeArray parameters;     /* typically empty for getters, one for setters */
     CtscNode*     body;           /* nullable Block */
@@ -731,6 +795,7 @@ typedef struct {
  * when there is no `=`.
  */
 typedef struct {
+    CtscNodeArray modifiers; /* ModifierLike token leaves; may be empty */
     CtscNode* name;        /* PropertyName (Identifier | ComputedPropertyName | ...) */
     CtscNode* type;        /* nullable TypeNode */
     CtscNode* initializer; /* nullable AssignmentExpression */
@@ -879,6 +944,7 @@ typedef struct {
 typedef struct {
     CtscNode*     name;     /* Identifier (possibly missing, zero-width) */
     CtscNodeArray members;  /* EnumMember list; may be empty */
+    bool          has_export; /* true when `export enum` (parser sets from ExportKeyword) */
 } CtscEnumDeclarationData;
 
 /*
@@ -938,6 +1004,18 @@ typedef struct {
     CtscNode* body; /* nullable: ModuleBlock or nested ModuleDeclaration */
 } CtscModuleDeclarationData;
 
+/*
+ * Mirrors upstream/TypeScript/src/compiler/types.ts TypeAliasDeclaration and
+ * parser.ts parseTypeAliasDeclaration (~8249): modifiers, name, typeParameters, type.
+ * forEachChildInTypeAliasDeclaration (parser.ts ~907-912) visits those in order.
+ */
+typedef struct {
+    CtscNodeArray modifiers; /* e.g. ExportKeyword for `export type` */
+    CtscNode*   name;
+    CtscNodeArray type_parameters;
+    CtscNode*   type;
+} CtscTypeAliasDeclarationData;
+
 struct CtscNode {
     CtscSyntaxKind kind;
     int            pos;
@@ -981,11 +1059,15 @@ struct CtscNode {
         CtscObjectLiteralExpressionData objectLiteralExpression;
         CtscPropertyAssignmentData      propertyAssignment;
         CtscShorthandPropertyAssignmentData shorthandPropertyAssignment;
+        CtscSpreadAssignmentData        spreadAssignment;
+        CtscSpreadElementData           spreadElement;
         CtscComputedPropertyNameData    computedPropertyName;
         CtscArrayLiteralExpressionData  arrayLiteralExpression;
         CtscBreakOrContinueStatementData breakOrContinueStatement;
         CtscTryStatementData            tryStatement;
+        CtscCatchClauseData             catchClause;
         CtscVoidExpressionData          voidExpression;
+        CtscAwaitExpressionData         awaitExpression;
         CtscYieldExpressionData         yieldExpression;
         CtscMethodDeclarationData       methodDeclaration;
         CtscAccessorDeclarationData     accessorDeclaration;
@@ -1000,9 +1082,11 @@ struct CtscNode {
         CtscBindingElementData          bindingElement;
         CtscTemplateExpressionData      templateExpression;
         CtscTemplateSpanData            templateSpan;
+        CtscTaggedTemplateExpressionData taggedTemplateExpression;
         CtscModuleBlockData             moduleBlock;
         CtscModuleDeclarationData       moduleDeclaration;
         CtscTypeAssertionExpressionData typeAssertionExpression;
+        CtscTypeAliasDeclarationData    typeAliasDeclaration;
     } data;
 };
 

@@ -4,6 +4,7 @@
 #include "ctsc/buffer.h"
 #include "ctsc/utf8.h"
 
+#include <stdint.h>
 #include <string.h>
 
 /*
@@ -186,6 +187,8 @@ static const char* op_text(CtscSyntaxKind k) {
         case CTSC_SK_GreaterThanToken:                            return ">";
         case CTSC_SK_LessThanEqualsToken:                         return "<=";
         case CTSC_SK_GreaterThanEqualsToken:                      return ">=";
+        case CTSC_SK_InstanceOfKeyword:                           return "instanceof";
+        case CTSC_SK_InKeyword:                                   return "in";
         case CTSC_SK_LessThanLessThanToken:                       return "<<";
         case CTSC_SK_GreaterThanGreaterThanToken:                 return ">>";
         case CTSC_SK_GreaterThanGreaterThanGreaterThanToken:      return ">>>";
@@ -396,6 +399,9 @@ static bool source_file_statement_is_dropped(const CtscNode* s) {
      * an elided node). The printer then drops the statement along with its
      * leading comments, matching `tsc`'s output for an interface-only source. */
     if (s->kind == CTSC_SK_InterfaceDeclaration) return true;
+    /* Mirrors upstream transformers/ts.ts visitTypeScript (~643): TypeAliasDeclaration
+     * is elided (createNotEmittedStatement); transpileModule emits no JS for it. */
+    if (s->kind == CTSC_SK_TypeAliasDeclaration) return true;
     return false;
 }
 
@@ -424,10 +430,68 @@ static bool identifier_text_equals_ascii(const CtscNode* id, const char* ascii) 
     }
 }
 
+/*
+ * Mirrors upstream transformers/ts.ts visitParameter (~2069): a leading
+ * ParameterDeclaration whose name is `this` is a type-only pseudo-parameter
+ * and is omitted from the printed JS (emitter.ts emitParameterList still
+ * walks parameters after the transformer; ctsc has no separate transform
+ * pass). Selfhost-derived 74_export_generic_rest.ts:
+ *     function (this: unknown, ...args) {}
+ *     → function (...args) {}
+ */
+static bool parameter_is_this_typing_only(const CtscNode* p) {
+    if (!p || p->kind != CTSC_SK_Parameter) return false;
+    return identifier_text_equals_ascii(p->data.parameter.name, "this");
+}
+
+static void emit_parameter_list_for_js(Emitter* e, const CtscNodeArray* params) {
+    bool first = true;
+    for (size_t i = 0; i < params->len; ++i) {
+        const CtscNode* p = params->items[i];
+        if (parameter_is_this_typing_only(p)) continue;
+        if (!first) write_cstr(e, ", ");
+        first = false;
+        emit(e, p);
+    }
+}
+
+/*
+ * Mirrors upstream/TypeScript/src/compiler/emitter.ts emitDecoratorsAndModifiers
+ * (~4449) for class elements: transpiled JS retains only `static` and `async`;
+ * accessibility / readonly / abstract modifiers are not printed (see
+ * canEmitModifier / shouldPrintImportSpecifier in the TS compiler; ctsc
+ * matches the common transpileModule output).
+ */
+static void emit_class_element_modifiers_for_js(Emitter* e, const CtscNodeArray* mods) {
+    if (!mods) return;
+    for (size_t i = 0; i < mods->len; ++i) {
+        const CtscNode* m = mods->items[i];
+        if (!m) continue;
+        switch (m->kind) {
+            case CTSC_SK_StaticKeyword:
+                write_cstr(e, "static ");
+                break;
+            case CTSC_SK_AsyncKeyword:
+                write_cstr(e, "async ");
+                break;
+            default:
+                break;
+        }
+    }
+}
+
 static bool method_is_constructor(const CtscNode* m) {
     if (!m || m->kind != CTSC_SK_MethodDeclaration) return false;
     const CtscNode* name = m->data.methodDeclaration.name;
     return identifier_text_equals_ascii(name, "constructor");
+}
+
+static bool class_member_is_body_less_function_like(const CtscNode* m) {
+    if (m->kind == CTSC_SK_MethodDeclaration
+        && m->data.methodDeclaration.body == NULL) return true;
+    if ((m->kind == CTSC_SK_GetAccessor || m->kind == CTSC_SK_SetAccessor)
+        && m->data.accessorDeclaration.body == NULL) return true;
+    return false;
 }
 
 static bool heritage_has_extends(const CtscClassDeclarationData* cd) {
@@ -439,6 +503,38 @@ static bool heritage_has_extends(const CtscClassDeclarationData* cd) {
         }
     }
     return false;
+}
+
+/*
+ * Mirrors upstream/TypeScript/src/compiler/emitter.ts emitHeritageClause (~4029)
+ * and emitList(..., ClassHeritageClauses) before `{` in
+ * emitClassDeclarationOrExpression (~3557).
+ *     writeSpace(); writeTokenText(node.token); writeSpace();
+ *     emitList(node, node.types, ListFormat.HeritageClauseTypes);
+ * ClassHeritageClauses is SingleLine; each HeritageClause begins with a leading
+ * space so `extends A implements B` prints without an extra list separator.
+ */
+static void emit_class_heritage_clauses(Emitter* e, const CtscClassDeclarationData* cd) {
+    const CtscNodeArray* hcs = &cd->heritage_clauses;
+    for (size_t hi = 0; hi < hcs->len; ++hi) {
+        const CtscNode* hc = hcs->items[hi];
+        if (!hc || hc->kind != CTSC_SK_HeritageClause) continue;
+        const CtscHeritageClauseData* hcd = &hc->data.heritageClause;
+        write_char(e, ' ');
+        if (hcd->token == CTSC_SK_ExtendsKeyword) {
+            write_cstr(e, "extends");
+        } else if (hcd->token == CTSC_SK_ImplementsKeyword) {
+            write_cstr(e, "implements");
+        } else {
+            continue;
+        }
+        write_char(e, ' ');
+        const CtscNodeArray* types = &hcd->types;
+        for (size_t ti = 0; ti < types->len; ++ti) {
+            if (ti) write_cstr(e, ", ");
+            emit(e, types->items[ti]);
+        }
+    }
 }
 
 static bool stmt_is_super_call(const CtscNode* s) {
@@ -453,6 +549,31 @@ static size_t super_call_prologue_end(const CtscNodeArray* stmts) {
     size_t i = 0;
     while (i < stmts->len && stmt_is_super_call(stmts->items[i])) i++;
     return i;
+}
+
+/*
+ * Mirrors upstream transformers/ts.ts transformParameterWithPropertyAssignment
+ * (~1430): `this.<name> = <name>;` for constructor parameter properties.
+ */
+static bool ctor_has_parameter_properties(const CtscNodeArray* params) {
+    for (size_t i = 0; i < params->len; ++i) {
+        const CtscNode* p = params->items[i];
+        if (p && p->kind == CTSC_SK_Parameter && p->data.parameter.is_parameter_property) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void emit_this_param_property_assignment(Emitter* e, const CtscNode* param) {
+    const CtscNode* name = param->data.parameter.name;
+    if (!name || name->kind != CTSC_SK_Identifier) return;
+    write_cstr(e, "this");
+    write_char(e, '.');
+    emit(e, name);
+    write_cstr(e, " = ");
+    emit(e, name);
+    write_char(e, ';');
 }
 
 static void emit_this_property_initializer(Emitter* e, const CtscNode* prop) {
@@ -479,6 +600,58 @@ static void emit_this_property_initializer(Emitter* e, const CtscNode* prop) {
     write_char(e, ';');
 }
 
+/*
+ * Mirrors upstream transformers/ts.ts class field lowering for static
+ * PropertyDeclarations: emit `ClassName.prop = init` after the class body
+ * (not `this.prop` in the constructor). Selfhost-derived 87_export_abstract.ts.
+ */
+static bool property_declaration_is_static(const CtscNode* prop) {
+    if (!prop || prop->kind != CTSC_SK_PropertyDeclaration) return false;
+    const CtscNodeArray* mods = &prop->data.propertyDeclaration.modifiers;
+    for (size_t i = 0; i < mods->len; ++i) {
+        const CtscNode* m = mods->items[i];
+        if (m && m->kind == CTSC_SK_StaticKeyword) return true;
+    }
+    return false;
+}
+
+static void emit_static_property_initializer(Emitter* e, const CtscNode* class_name, const CtscNode* prop) {
+    const CtscNode* name = prop->data.propertyDeclaration.name;
+    const CtscNode* init = prop->data.propertyDeclaration.initializer;
+    if (!class_name || !name || !init) return;
+    emit(e, class_name);
+    if (name->kind == CTSC_SK_Identifier) {
+        write_char(e, '.');
+        emit(e, name);
+    } else if (name->kind == CTSC_SK_ComputedPropertyName) {
+        write_char(e, '[');
+        emit(e, name->data.computedPropertyName.expression);
+        write_char(e, ']');
+    } else if (name->kind == CTSC_SK_StringLiteral || name->kind == CTSC_SK_NumericLiteral) {
+        write_char(e, '[');
+        emit(e, name);
+        write_char(e, ']');
+    } else {
+        write_char(e, '.');
+        emit(e, name);
+    }
+    write_cstr(e, " = ");
+    emit(e, init);
+    write_char(e, ';');
+}
+
+static void emit_trailing_static_property_initializers(
+    Emitter* e,
+    const CtscClassDeclarationData* cd,
+    const CtscNode* const* static_prop_buf,
+    size_t n_stat) {
+    if (!cd->name || n_stat == 0) return;
+    for (size_t si = 0; si < n_stat; ++si) {
+        write_raw_newline(e);
+        emit_static_property_initializer(e, cd->name, static_prop_buf[si]);
+    }
+}
+
 static void emit_merged_constructor_body(
     Emitter* e,
     const CtscNode** prop_inits,
@@ -497,8 +670,9 @@ static void emit_merged_constructor_body(
     const CtscNodeArray* bstmts = &body->data.block.statements;
     size_t n = bstmts->len;
     size_t super_end = has_extends ? super_call_prologue_end(bstmts) : 0;
+    bool has_pp = ctor_has_parameter_properties(params);
 
-    if (n == 0 && nprops == 0) {
+    if (n == 0 && nprops == 0 && !has_pp) {
         if (body->data.block.multi_line) {
             write_line(e);
         } else {
@@ -514,6 +688,14 @@ static void emit_merged_constructor_body(
             write_line(e);
             emit(e, bstmts->items[j]);
         }
+    }
+    for (size_t i = 0; i < params->len; ++i) {
+        const CtscNode* pm = params->items[i];
+        if (!pm || pm->kind != CTSC_SK_Parameter || !pm->data.parameter.is_parameter_property) {
+            continue;
+        }
+        write_line(e);
+        emit_this_param_property_assignment(e, pm);
     }
     for (size_t pi = 0; pi < nprops; ++pi) {
         write_line(e);
@@ -636,6 +818,109 @@ static void emit_case_clause_statements(Emitter* e, const CtscNodeArray* stmts) 
         emit(e, stmts->items[i]);
     }
     e->indent--;
+}
+
+/*
+ * Mirrors upstream transformers/ts.ts getExpressionForPropertyName (~1216):
+ * Identifier → StringLiteral(idText(name)); ComputedPropertyName → expression;
+ * other property names clone as-is.
+ */
+static void emit_enum_property_name_expression(Emitter* e, const CtscNode* prop_name) {
+    if (!prop_name) return;
+    if (prop_name->kind == CTSC_SK_Identifier) {
+        write_char(e, '"');
+        write_string_literal_escaped(e, prop_name->data.identifier.text, prop_name->data.identifier.text_len,
+                                    /*single_quote*/ false);
+        write_char(e, '"');
+        return;
+    }
+    if (prop_name->kind == CTSC_SK_ComputedPropertyName) {
+        emit(e, prop_name->data.computedPropertyName.expression);
+        return;
+    }
+    emit(e, prop_name);
+}
+
+static bool u16_parse_ascii_decimal_i64(const uint16_t* t, size_t len, int64_t* out) {
+    int64_t v = 0;
+    bool any = false;
+    for (size_t i = 0; i < len; ++i) {
+        uint16_t c = t[i];
+        if (c == (uint16_t) '_') continue;
+        if (c < (uint16_t) '0' || c > (uint16_t) '9') return false;
+        any = true;
+        v = v * 10 + (int64_t)(c - (uint16_t) '0');
+    }
+    if (!any) return false;
+    *out = v;
+    return true;
+}
+
+/*
+ * Mirrors resolver.getEnumMemberValue + transformEnumMemberDeclarationValue
+ * (transformers/ts.ts ~1913–1966) for the common literal-only shapes so the
+ * next implicit member can use auto-increment (constantValue + 1).
+ */
+static bool enum_member_init_constant_integer(const CtscNode* init, int64_t* out) {
+    if (!init) return false;
+    if (init->kind == CTSC_SK_NumericLiteral) {
+        const uint16_t* t;
+        size_t len;
+        if (init->data.numericLiteral.source_text && init->data.numericLiteral.source_text_len) {
+            t = init->data.numericLiteral.source_text;
+            len = init->data.numericLiteral.source_text_len;
+        } else {
+            t = init->data.numericLiteral.text;
+            len = init->data.numericLiteral.text_len;
+        }
+        return u16_parse_ascii_decimal_i64(t, len, out);
+    }
+    if (init->kind == CTSC_SK_PrefixUnaryExpression
+        && init->data.prefixUnaryExpression.operator_kind == CTSC_SK_MinusToken) {
+        const CtscNode* op = init->data.prefixUnaryExpression.operand;
+        int64_t v;
+        if (op && enum_member_init_constant_integer(op, &v)) {
+            *out = -v;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void write_i64_decimal(Emitter* e, int64_t v) {
+    if (v < 0) {
+        write_char(e, '-');
+        if (v == INT64_MIN) {
+            write_cstr(e, "9223372036854775808");
+            return;
+        }
+        v = -v;
+    }
+    if (v == 0) {
+        write_char(e, '0');
+        return;
+    }
+    char buf[32];
+    int n = 0;
+    uint64_t u = (uint64_t)v;
+    while (u > 0) {
+        buf[n++] = (char)('0' + (int)(u % 10));
+        u /= 10;
+    }
+    while (n > 0) write_char(e, buf[--n]);
+}
+
+static void emit_enum_member_value_and_bump_auto(Emitter* e, const CtscNode* init, int64_t* auto_num) {
+    if (!init) {
+        write_i64_decimal(e, *auto_num);
+        (*auto_num)++;
+        return;
+    }
+    emit(e, init);
+    int64_t v;
+    if (enum_member_init_constant_integer(init, &v)) {
+        *auto_num = v + 1;
+    }
 }
 
 static void emit(Emitter* e, const CtscNode* n) {
@@ -904,12 +1189,7 @@ static void emit(Emitter* e, const CtscNode* n) {
          * `writeLine()` — i.e. a single newline between tryBlock/catchClause
          * and the following keyword (`catch`/`finally`).
          *
-         * CatchClause is not yet modelled in ctsc (parse_try_statement keeps
-         * tryStatement.catchClause == NULL; the only unlocked fixture is the
-         * missing-try recovery path `a / finally`). When a fixture with a
-         * real `catch` unlocks, extend this case with the catchClause emit
-         * (emitter.ts emitCatchClause ~3393ish) before the finallyBlock
-         * branch.
+         * emitCatchClause (~4036) is implemented as CTSC_SK_CatchClause below.
          */
         case CTSC_SK_TryStatement: {
             const CtscNode* tryBlock     = n->data.tryStatement.tryBlock;
@@ -926,6 +1206,24 @@ static void emit(Emitter* e, const CtscNode* n) {
                 write_cstr(e, "finally ");
                 emit(e, finallyBlock);
             }
+            return;
+        }
+        /*
+         * Mirrors upstream/TypeScript/src/compiler/emitter.ts emitCatchClause
+         * (~4036): CatchKeyword + optional ( variableDeclaration ) + block.
+         * Type annotations on the binding are elided via VariableDeclaration emit
+         * (name only; no type node in JS output).
+         */
+        case CTSC_SK_CatchClause: {
+            write_cstr(e, "catch");
+            write_char(e, ' ');
+            if (n->data.catchClause.variableDeclaration) {
+                write_char(e, '(');
+                emit(e, n->data.catchClause.variableDeclaration);
+                write_char(e, ')');
+                write_char(e, ' ');
+            }
+            emit(e, n->data.catchClause.block);
             return;
         }
         /*
@@ -1086,6 +1384,13 @@ static void emit(Emitter* e, const CtscNode* n) {
         case CTSC_SK_TemplateSpan:
             emit(e, n->data.templateSpan.expression);
             emit(e, n->data.templateSpan.literal);
+            return;
+        /* Mirrors upstream/TypeScript/src/compiler/emitter.ts
+         * emitTaggedTemplateExpression (~2722): emit tag, space, template. */
+        case CTSC_SK_TaggedTemplateExpression:
+            emit(e, n->data.taggedTemplateExpression.tag);
+            write_char(e, ' ');
+            emit(e, n->data.taggedTemplateExpression.template_);
             return;
         case CTSC_SK_RegularExpressionLiteral:
             /* Mirrors upstream/TypeScript/src/compiler/emitter.ts emitLiteral
@@ -1325,7 +1630,11 @@ static void emit(Emitter* e, const CtscNode* n) {
          */
         case CTSC_SK_PropertyAccessExpression:
             emit(e, n->data.propertyAccessExpression.expression);
-            write_char(e, '.');
+            if (n->data.propertyAccessExpression.optional_chain) {
+                write_cstr(e, "?.");
+            } else {
+                write_char(e, '.');
+            }
             emit(e, n->data.propertyAccessExpression.name);
             return;
         /*
@@ -1343,6 +1652,9 @@ static void emit(Emitter* e, const CtscNode* n) {
          */
         case CTSC_SK_ElementAccessExpression:
             emit(e, n->data.elementAccessExpression.expression);
+            if (n->data.elementAccessExpression.optional_chain) {
+                write_cstr(e, "?.");
+            }
             write_char(e, '[');
             emit(e, n->data.elementAccessExpression.argumentExpression);
             write_char(e, ']');
@@ -1445,15 +1757,24 @@ static void emit(Emitter* e, const CtscNode* n) {
              * Block in expression position), but the same guard is safe. */
             if (!n->data.functionDeclaration.body) return;
             if (n->kind == CTSC_SK_FunctionDeclaration
+                && n->data.functionDeclaration.has_export_default) {
+                /* emitter.ts emitExportAssignment (~3734) + function declaration
+                 * print: `export default function name() { ... }`. */
+                write_cstr(e, "export default ");
+            } else if (n->kind == CTSC_SK_FunctionDeclaration
                 && n->data.functionDeclaration.has_export) {
                 /* emitter.ts emitDecoratorsAndModifiers (~3735) + emitFunctionDeclarationOrExpression
                  * (~3430): ExportKeyword is written before `function`. */
                 write_cstr(e, "export ");
             }
+            if (n->data.functionDeclaration.has_async) {
+                /* emitFunctionDeclarationOrExpression (~3430): AsyncKeyword via emitModifiers. */
+                write_cstr(e, "async ");
+            }
             write_cstr(e, "function ");
             if (n->data.functionDeclaration.name) emit(e, n->data.functionDeclaration.name);
             write_char(e, '(');
-            emit_list(e, &n->data.functionDeclaration.parameters, ", ");
+            emit_parameter_list_for_js(e, &n->data.functionDeclaration.parameters);
             write_cstr(e, ") ");
             emit(e, n->data.functionDeclaration.body);
             return;
@@ -1469,15 +1790,19 @@ static void emit(Emitter* e, const CtscNode* n) {
          *     emitInitializer(node.initializer, ...);
          * The TS→JS transformer (transformers/ts.ts visitParameter) already
          * drops questionToken and the type annotation before this printer
-         * runs, so for JS output we only need to write `...` (when present)
-         * followed by the name. Decorators/modifiers and initializers are
-         * not yet modelled on a ctsc Parameter.
+         * runs, so for JS output we write `...` (when present), the binding
+         * name, then ` = initializer` when parse_parameter captured a
+         * default (mirrors emitInitializer ~2233).
          */
         case CTSC_SK_Parameter:
             if (n->data.parameter.has_dot_dot_dot) {
                 write_cstr(e, "...");
             }
             emit(e, n->data.parameter.name);
+            if (n->data.parameter.initializer) {
+                write_cstr(e, " = ");
+                emit(e, n->data.parameter.initializer);
+            }
             return;
         /*
          * Mirrors upstream/TypeScript/src/compiler/emitter.ts
@@ -1501,6 +1826,35 @@ static void emit(Emitter* e, const CtscNode* n) {
             write_char(e, '[');
             emit_list(e, &n->data.bindingPattern.elements, ", ");
             write_char(e, ']');
+            return;
+        /*
+         * Mirrors upstream/TypeScript/src/compiler/emitter.ts emitBindingElement
+         * (~2597):
+         *     emit(node.dotDotDotToken);
+         *     if (node.propertyName) { emit(propertyName); writePunctuation(":");
+         *         writeSpace(); }
+         *     emit(node.name);
+         *     emitInitializer(node.initializer, ...);
+         * Type annotations are stripped before print in the real pipeline; ctsc
+         * has none on BindingElement. Initializer uses the same ` = ` shape as
+         * VariableDeclaration.
+         */
+        case CTSC_SK_BindingElement:
+            if (n->data.bindingElement.has_dotdotdot) {
+                write_cstr(e, "...");
+            }
+            if (n->data.bindingElement.propertyName) {
+                emit(e, n->data.bindingElement.propertyName);
+                write_char(e, ':');
+                write_char(e, ' ');
+            }
+            if (n->data.bindingElement.name) {
+                emit(e, n->data.bindingElement.name);
+            }
+            if (n->data.bindingElement.initializer) {
+                write_cstr(e, " = ");
+                emit(e, n->data.bindingElement.initializer);
+            }
             return;
         /*
          * Mirrors upstream/TypeScript/src/compiler/emitter.ts emitArrowFunction
@@ -1530,8 +1884,12 @@ static void emit(Emitter* e, const CtscNode* n) {
          * fixtures exercise them). Extend this case as those fixtures land.
          */
         case CTSC_SK_ArrowFunction: {
+            if (n->data.arrowFunction.has_async) {
+                /* emitArrowFunction (~2760): emitModifierList → async */
+                write_cstr(e, "async ");
+            }
             write_char(e, '(');
-            emit_list(e, &n->data.arrowFunction.parameters, ", ");
+            emit_parameter_list_for_js(e, &n->data.arrowFunction.parameters);
             write_cstr(e, ") => ");
             const CtscNode* body = n->data.arrowFunction.body;
             if (body && body->kind == CTSC_SK_Block) {
@@ -1604,6 +1962,11 @@ static void emit(Emitter* e, const CtscNode* n) {
         case CTSC_SK_VoidExpression:
             write_cstr(e, "void ");
             emit(e, n->data.voidExpression.expression);
+            return;
+        case CTSC_SK_AwaitExpression:
+            /* emitAwaitExpression (~2801). */
+            write_cstr(e, "await ");
+            emit(e, n->data.awaitExpression.expression);
             return;
         case CTSC_SK_DeleteExpression:
             write_cstr(e, "delete ");
@@ -1707,6 +2070,8 @@ static void emit(Emitter* e, const CtscNode* n) {
                 const CtscNode* p = props->items[i];
                 if (p->kind == CTSC_SK_MethodDeclaration
                     && p->data.methodDeclaration.body == NULL) continue;
+                if ((p->kind == CTSC_SK_GetAccessor || p->kind == CTSC_SK_SetAccessor)
+                    && p->data.accessorDeclaration.body == NULL) continue;
                 emit_count++;
             }
             write_char(e, '{');
@@ -1716,12 +2081,34 @@ static void emit(Emitter* e, const CtscNode* n) {
                 const CtscNode* p = props->items[i];
                 if (p->kind == CTSC_SK_MethodDeclaration
                     && p->data.methodDeclaration.body == NULL) continue;
+                if ((p->kind == CTSC_SK_GetAccessor || p->kind == CTSC_SK_SetAccessor)
+                    && p->data.accessorDeclaration.body == NULL) continue;
                 if (!first) write_cstr(e, ", ");
                 first = false;
                 emit(e, p);
             }
             if (emit_count > 0) write_char(e, ' ');
             write_char(e, '}');
+            return;
+        }
+        /*
+         * Mirrors upstream/TypeScript/src/compiler/emitter.ts
+         * emitAccessorDeclaration (~2291):
+         *     emitDecoratorsAndModifiers(...);
+         *     writeKeyword("get"|"set"); writeSpace(); emit(node.name); ...
+         */
+        case CTSC_SK_GetAccessor:
+        case CTSC_SK_SetAccessor: {
+            emit_class_element_modifiers_for_js(e, &n->data.accessorDeclaration.modifiers);
+            write_cstr(e, n->kind == CTSC_SK_GetAccessor ? "get " : "set ");
+            if (n->data.accessorDeclaration.name) emit(e, n->data.accessorDeclaration.name);
+            write_char(e, '(');
+            emit_parameter_list_for_js(e, &n->data.accessorDeclaration.parameters);
+            write_char(e, ')');
+            if (n->data.accessorDeclaration.body) {
+                write_char(e, ' ');
+                emit(e, n->data.accessorDeclaration.body);
+            }
             return;
         }
         /*
@@ -1753,10 +2140,11 @@ static void emit(Emitter* e, const CtscNode* n) {
          * transformation.
          */
         case CTSC_SK_MethodDeclaration: {
+            emit_class_element_modifiers_for_js(e, &n->data.methodDeclaration.modifiers);
             if (n->data.methodDeclaration.has_asterisk) write_char(e, '*');
             if (n->data.methodDeclaration.name) emit(e, n->data.methodDeclaration.name);
             write_char(e, '(');
-            emit_list(e, &n->data.methodDeclaration.parameters, ", ");
+            emit_parameter_list_for_js(e, &n->data.methodDeclaration.parameters);
             write_char(e, ')');
             if (n->data.methodDeclaration.body) {
                 write_char(e, ' ');
@@ -1783,7 +2171,8 @@ static void emit(Emitter* e, const CtscNode* n) {
          *
          * ctsc's parser maps consecutive commas (tsc's OmittedExpression) by
          * just advancing past them (parser.c parse_primary ~189), so we never
-         * produce a literal hole here. SpreadElement is not yet modelled.
+         * produce a literal hole here. SpreadElement is parsed via
+         * parse_argument_expression (~6685).
          *
          * A trailing comma on the source element list (NodeArray.hasTrailingComma,
          * parser.ts ~3496) round-trips through emitNodeListItems' trailing-comma
@@ -1833,9 +2222,8 @@ static void emit(Emitter* e, const CtscNode* n) {
          *     }
          * which is what the transpileModule oracle prints.
          *
-         * ctsc does not yet model modifiers / typeParameters /
-         * heritageClauses on a ClassDeclaration — fixtures that exercise
-         * those will grow the shape.
+         * Modifiers / typeParameters are still partial; heritageClauses are
+         * emitted (emit_class_heritage_clauses) to match ClassHeritageClauses.
          */
         /*
          * Mirrors upstream/TypeScript/src/compiler/emitter.ts
@@ -1879,6 +2267,24 @@ static void emit(Emitter* e, const CtscNode* n) {
             return;
         /*
          * Mirrors upstream/TypeScript/src/compiler/emitter.ts
+         * emitSpreadAssignment (~4081):
+         *     emitTokenWithComment(DotDotDotToken, ...);
+         *     emitExpression(node.expression, ...);
+         */
+        case CTSC_SK_SpreadAssignment:
+            write_cstr(e, "...");
+            emit(e, n->data.spreadAssignment.expression);
+            return;
+        /*
+         * Mirrors upstream/TypeScript/src/compiler/emitter.ts
+         * emitSpreadExpression (~4071): DotDotDotToken + expression.
+         */
+        case CTSC_SK_SpreadElement:
+            write_cstr(e, "...");
+            emit(e, n->data.spreadElement.expression);
+            return;
+        /*
+         * Mirrors upstream/TypeScript/src/compiler/emitter.ts
          * emitComputedPropertyName (~2194):
          *     writePunctuation("[");
          *     emitExpression(node.expression, parenthesizer.parenthesizeExpressionOfComputedPropertyName);
@@ -1906,17 +2312,24 @@ static void emit(Emitter* e, const CtscNode* n) {
             const CtscClassDeclarationData* cd = &n->data.classDeclaration;
             const CtscNodeArray* ms = &cd->members;
 
-            const CtscNode* prop_buf[128];
-            size_t nprops = 0;
-            for (size_t i = 0; i < ms->len && nprops < 128; ++i) {
+            const CtscNode* inst_prop_buf[128];
+            const CtscNode* static_prop_buf[128];
+            size_t n_inst = 0;
+            size_t n_stat = 0;
+            for (size_t i = 0; i < ms->len; ++i) {
                 const CtscNode* mem = ms->items[i];
-                if (mem->kind == CTSC_SK_PropertyDeclaration
-                    && mem->data.propertyDeclaration.initializer) {
-                    prop_buf[nprops++] = mem;
+                if (mem->kind != CTSC_SK_PropertyDeclaration
+                    || !mem->data.propertyDeclaration.initializer) {
+                    continue;
+                }
+                if (property_declaration_is_static(mem)) {
+                    if (n_stat < 128) static_prop_buf[n_stat++] = mem;
+                } else {
+                    if (n_inst < 128) inst_prop_buf[n_inst++] = mem;
                 }
             }
 
-            if (nprops == 0) {
+            if (n_inst == 0) {
                 if (n->kind == CTSC_SK_ClassDeclaration && cd->has_export) {
                     write_cstr(e, "export ");
                 }
@@ -1925,6 +2338,7 @@ static void emit(Emitter* e, const CtscNode* n) {
                     write_char(e, ' ');
                     emit(e, cd->name);
                 }
+                emit_class_heritage_clauses(e, cd);
                 write_char(e, ' ');
                 write_char(e, '{');
                 /*
@@ -1942,8 +2356,11 @@ static void emit(Emitter* e, const CtscNode* n) {
                 size_t emit_count = 0;
                 for (size_t i = 0; i < ms->len; ++i) {
                     const CtscNode* m = ms->items[i];
-                    if (m->kind == CTSC_SK_MethodDeclaration
-                        && m->data.methodDeclaration.body == NULL) continue;
+                    if (class_member_is_body_less_function_like(m)) continue;
+                    if (m->kind == CTSC_SK_PropertyDeclaration
+                        && m->data.propertyDeclaration.initializer) {
+                        continue;
+                    }
                     emit_count++;
                 }
                 if (emit_count == 0) {
@@ -1952,15 +2369,24 @@ static void emit(Emitter* e, const CtscNode* n) {
                     e->indent++;
                     for (size_t i = 0; i < ms->len; ++i) {
                         const CtscNode* m = ms->items[i];
-                        if (m->kind == CTSC_SK_MethodDeclaration
-                            && m->data.methodDeclaration.body == NULL) continue;
+                        if (class_member_is_body_less_function_like(m)) continue;
+                        if (m->kind == CTSC_SK_PropertyDeclaration
+                            && m->data.propertyDeclaration.initializer) {
+                            continue;
+                        }
                         write_line(e);
-                        emit(e, m);
+                        if (method_is_constructor(m)) {
+                            emit_merged_constructor_body(
+                                e, inst_prop_buf, 0, m, heritage_has_extends(cd));
+                        } else {
+                            emit(e, m);
+                        }
                     }
                     e->indent--;
                     write_line(e);
                 }
                 write_char(e, '}');
+                emit_trailing_static_property_initializers(e, cd, static_prop_buf, n_stat);
                 return;
             }
 
@@ -1982,12 +2408,13 @@ static void emit(Emitter* e, const CtscNode* n) {
                 write_char(e, ' ');
                 emit(e, cd->name);
             }
+            emit_class_heritage_clauses(e, cd);
             write_char(e, ' ');
             write_char(e, '{');
             e->indent++;
             if (!ctor_m) {
                 write_line(e);
-                emit_synthetic_constructor_for_property_inits(e, prop_buf, nprops);
+                emit_synthetic_constructor_for_property_inits(e, inst_prop_buf, n_inst);
             }
             for (size_t i = 0; i < ms->len; ++i) {
                 const CtscNode* mem = ms->items[i];
@@ -1995,13 +2422,12 @@ static void emit(Emitter* e, const CtscNode* n) {
                     && mem->data.propertyDeclaration.initializer) {
                     continue;
                 }
-                if (mem->kind == CTSC_SK_MethodDeclaration
-                    && mem->data.methodDeclaration.body == NULL) {
+                if (class_member_is_body_less_function_like(mem)) {
                     continue;
                 }
                 if (method_is_constructor(mem)) {
                     write_line(e);
-                    emit_merged_constructor_body(e, prop_buf, nprops, mem, has_ext);
+                    emit_merged_constructor_body(e, inst_prop_buf, n_inst, mem, has_ext);
                     continue;
                 }
                 write_line(e);
@@ -2010,6 +2436,7 @@ static void emit(Emitter* e, const CtscNode* n) {
             e->indent--;
             write_line(e);
             write_char(e, '}');
+            emit_trailing_static_property_initializers(e, cd, static_prop_buf, n_stat);
             return;
         }
         /*
@@ -2039,19 +2466,22 @@ static void emit(Emitter* e, const CtscNode* n) {
          *       <name>["<key>"] = <value>;
          *   - any other (numeric / computed / undefined) initializer:
          *       <name>[<name>["<key>"] = <value>] = "<key>";
-         * For an undefined initializer (bare `A,` in source) tsc substitutes
-         * `void 0`. ctsc's parse_enum_member leaves `initializer` as NULL
-         * when the source omitted `= expr`; we mirror tsc by writing `void 0`
-         * in that slot. The current fixture (106_parserEnumDeclaration4.ts)
-         * has zero members, so none of the member branches are exercised yet —
-         * they are laid out here so that future fixtures with members extend
-         * naturally without rewriting the emission sequence.
+         * For an undefined initializer (bare `A,` in source) the checker
+         * supplies the next auto-increment constant (transformers/ts.ts
+         * transformEnumMemberDeclarationValue ~1952): ctsc tracks the same
+         * running counter in the emitter (parse_enum_member leaves
+         * `initializer` NULL when `= expr` was omitted).
          */
         case CTSC_SK_EnumDeclaration: {
             const CtscNode* name = n->data.enumDeclaration.name;
             const CtscNodeArray* members = &n->data.enumDeclaration.members;
 
-            /* Statement 1: `var <name>;` */
+            /* Statement 1: `var <name>;` — `export enum` lowers to `export var`
+             * (addVarForEnumOrModuleDeclaration preserves ExportKeyword on the
+             * synthesised VariableStatement; upstream emitter.ts prints it). */
+            if (n->data.enumDeclaration.has_export) {
+                write_cstr(e, "export ");
+            }
             write_cstr(e, "var ");
             if (name) emit(e, name);
             write_char(e, ';');
@@ -2073,14 +2503,16 @@ static void emit(Emitter* e, const CtscNode* n) {
             write_cstr(e, ") {");
             if (members->len > 0) {
                 e->indent++;
+                int64_t enum_auto = 0;
                 for (size_t i = 0; i < members->len; ++i) {
                     write_line(e);
                     const CtscNode* m = members->items[i];
-                    /* EnumMember is modelled as PropertyAssignment (see
-                     * parser.c parse_enum_member). Use `name` as the property
-                     * key in the outer access, and model the two branches
-                     * from transformEnumMember. */
-                    if (m->kind == CTSC_SK_PropertyAssignment) {
+                    /* EnumMember uses the PropertyAssignment union slot (see
+                     * parser.c parse_enum_member). PropertyAssignment is kept
+                     * for symmetry; emitted shape follows transformEnumMember
+                     * (~1913). */
+                    if (m->kind == CTSC_SK_PropertyAssignment
+                        || m->kind == CTSC_SK_EnumMember) {
                         const CtscNode* mname = m->data.propertyAssignment.name;
                         const CtscNode* init  = m->data.propertyAssignment.initializer;
                         bool is_string_init = init && init->kind == CTSC_SK_StringLiteral;
@@ -2088,7 +2520,7 @@ static void emit(Emitter* e, const CtscNode* n) {
                             /* <name>[<key>] = <value>; */
                             if (name) emit(e, name);
                             write_char(e, '[');
-                            emit(e, mname);
+                            emit_enum_property_name_expression(e, mname);
                             write_cstr(e, "] = ");
                             emit(e, init);
                             write_char(e, ';');
@@ -2098,12 +2530,11 @@ static void emit(Emitter* e, const CtscNode* n) {
                             write_char(e, '[');
                             if (name) emit(e, name);
                             write_char(e, '[');
-                            emit(e, mname);
+                            emit_enum_property_name_expression(e, mname);
                             write_cstr(e, "] = ");
-                            if (init) emit(e, init);
-                            else      write_cstr(e, "void 0");
+                            emit_enum_member_value_and_bump_auto(e, init, &enum_auto);
                             write_cstr(e, "] = ");
-                            emit(e, mname);
+                            emit_enum_property_name_expression(e, mname);
                             write_char(e, ';');
                         }
                     } else {
@@ -2125,6 +2556,16 @@ static void emit(Emitter* e, const CtscNode* n) {
             write_cstr(e, " = {}));");
             return;
         }
+        /*
+         * Mirrors upstream/TypeScript/src/compiler/emitter.ts
+         * emitExpressionWithTypeArguments (~2987):
+         *     emitExpression(node.expression, ...);
+         *     emitTypeArguments(node, node.typeArguments);
+         * JS output omits type arguments; heritage / `new` uses the same shape.
+         */
+        case CTSC_SK_ExpressionWithTypeArguments:
+            emit(e, n->data.expressionWithTypeArguments.expression);
+            return;
         default:
             return;
     }

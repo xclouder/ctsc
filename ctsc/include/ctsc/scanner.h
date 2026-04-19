@@ -211,6 +211,7 @@ typedef enum {
     CTSC_SK_ClassDeclaration,
     CTSC_SK_ClassExpression,
     CTSC_SK_InterfaceDeclaration,
+    CTSC_SK_TypeAliasDeclaration,
     CTSC_SK_HeritageClause,
     CTSC_SK_ExpressionWithTypeArguments,
     CTSC_SK_EnumDeclaration,
@@ -230,9 +231,15 @@ typedef enum {
     CTSC_SK_BindingElement,
     CTSC_SK_TemplateExpression,
     CTSC_SK_TemplateSpan,
+    CTSC_SK_TaggedTemplateExpression,
     CTSC_SK_ModuleDeclaration,
     CTSC_SK_ModuleBlock,
     CTSC_SK_TypeAssertionExpression,
+    CTSC_SK_AwaitExpression,
+    CTSC_SK_SpreadAssignment,
+    CTSC_SK_SpreadElement,
+    /* Mirrors ts.SyntaxKind.CatchClause (forEachChild: variableDeclaration, block). */
+    CTSC_SK_CatchClause,
 
     CTSC_SK__COUNT
 } CtscSyntaxKind;

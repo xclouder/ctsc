@@ -198,6 +198,7 @@ static const char* const k_names[CTSC_SK__COUNT] = {
     [CTSC_SK_ClassDeclaration]                  = "ClassDeclaration",
     [CTSC_SK_ClassExpression]                   = "ClassExpression",
     [CTSC_SK_InterfaceDeclaration]              = "InterfaceDeclaration",
+    [CTSC_SK_TypeAliasDeclaration]              = "TypeAliasDeclaration",
     [CTSC_SK_HeritageClause]                    = "HeritageClause",
     [CTSC_SK_ExpressionWithTypeArguments]       = "ExpressionWithTypeArguments",
     [CTSC_SK_EnumDeclaration]                   = "EnumDeclaration",
@@ -217,9 +218,14 @@ static const char* const k_names[CTSC_SK__COUNT] = {
     [CTSC_SK_BindingElement]                    = "BindingElement",
     [CTSC_SK_TemplateExpression]                = "TemplateExpression",
     [CTSC_SK_TemplateSpan]                      = "TemplateSpan",
+    [CTSC_SK_TaggedTemplateExpression]          = "TaggedTemplateExpression",
     [CTSC_SK_ModuleDeclaration]                 = "ModuleDeclaration",
     [CTSC_SK_ModuleBlock]                       = "ModuleBlock",
     [CTSC_SK_TypeAssertionExpression]           = "TypeAssertionExpression",
+    [CTSC_SK_AwaitExpression]                   = "AwaitExpression",
+    [CTSC_SK_SpreadAssignment]                  = "SpreadAssignment",
+    [CTSC_SK_SpreadElement]                     = "SpreadElement",
+    [CTSC_SK_CatchClause]                       = "CatchClause",
 };
 
 const char* ctsc_syntax_kind_name(CtscSyntaxKind k) {

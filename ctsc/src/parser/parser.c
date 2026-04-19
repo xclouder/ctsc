@@ -27,6 +27,9 @@ typedef struct {
     CtscArena*           arena;
     CtscDiagnosticList*  diagnostics;
     int                  source_end;
+    /* Incremented while parsing a Block body of an async function or async arrow
+     * (mirrors parser.ts inAwaitContext / parseAwaitExpression ~5713). */
+    int                  await_context_depth;
 } Parser;
 
 static void advance(Parser* p) { ctsc_scanner_next(&p->scanner); }
@@ -90,7 +93,12 @@ static CtscNode* parse_identifier(Parser* p) {
  */
 static CtscNode* parse_binding_identifier(Parser* p) {
     CtscSyntaxKind k = cur(p);
+    /* parser.ts parseIdentifier (~2648): `this` as a parameter name uses
+     * ThisKeyword in the scanner but materialises as Identifier — needed for
+     * `function (this: unknown, ...) {}` (emitter selfhost-derived
+     * 74_export_generic_rest.ts). */
     if (k == CTSC_SK_Identifier
+        || k == CTSC_SK_ThisKeyword
         || (k >= CTSC_SK_AsKeyword && k <= CTSC_SK_UnknownKeyword)) {
         return make_identifier_from_current(p);
     }
@@ -133,6 +141,7 @@ static CtscNode* parse_right_side_of_dot(Parser* p) {
 
 static CtscNode* parse_expression(Parser* p);
 static CtscNode* parse_assignment_expression(Parser* p);
+static CtscNode* parse_argument_expression(Parser* p);
 static CtscNode* parse_identifier_or_pattern(Parser* p);
 static bool token_is_identifier_expression(CtscSyntaxKind k);
 static bool is_let_declaration(Parser* p);
@@ -144,12 +153,18 @@ static CtscNode* parse_object_literal_expression(Parser* p);
 static CtscNode* parse_block(Parser* p);
 static CtscNode* parse_parameter(Parser* p);
 static CtscNode* parse_type_annotation(Parser* p);
+static void skip_type_in_type_parameter_position(Parser* p);
+static void consume_postfix_type_operators(Parser* p);
 static CtscNode* parse_class_declaration_or_expression(Parser* p, CtscSyntaxKind kind);
 static CtscNode* parse_class_declaration_or_expression_with_modifiers(
     Parser* p, CtscSyntaxKind kind, int pos, const CtscNodeArray* modifiers);
 static CtscNode* parse_function_expression(Parser* p);
 static bool is_binding_identifier_kind(CtscSyntaxKind k);
 static bool is_start_of_statement_token(const Parser* p);
+static void parse_modifiers(Parser* p, CtscNodeArray* out);
+
+static CtscNode* parse_template_expression_with_head(Parser* p, int fs, CtscNode* head);
+static CtscNode* parse_tagged_template_rest(Parser* p, CtscNode* tag);
 
 static CtscNode* parse_primary(Parser* p) {
     CtscSyntaxKind k = cur(p);
@@ -284,64 +299,7 @@ static CtscNode* parse_primary(Parser* p) {
         head->data.templateLiteralLike.text = p->scanner.current.text;
         head->data.templateLiteralLike.text_len = p->scanner.current.text_len;
         advance(p);
-
-        CtscNodeArray spans; ctsc_node_array_init(&spans);
-        for (;;) {
-            int span_fs = cur_full_start(p);
-            CtscNode* expr = parse_expression(p);
-            if (!expr) {
-                expr = make_missing_identifier(p);
-            }
-            /* parseLiteralOfTemplateSpan (~3713): on `}` rescan a
-             * TemplateMiddle/TemplateTail; otherwise synthesise a missing
-             * TemplateTail at the current scanner position. */
-            CtscNode* literal;
-            int lit_fs = cur_full_start(p);
-            if (cur(p) == CTSC_SK_CloseBraceToken) {
-                /* Mirrors parser.ts parseLiteralOfTemplateSpan (~3713):
-                 *     reScanTemplateToken(isTaggedTemplate);
-                 *     return parseTemplateMiddleOrTemplateTail();
-                 * The scanner rewinds to the `}` and rescans up to the next
-                 * `` ` `` or `${`, emitting TemplateMiddle or TemplateTail. */
-                ctsc_scanner_re_scan_template_token(&p->scanner);
-                CtscSyntaxKind lk = cur(p);
-                if (lk == CTSC_SK_TemplateMiddle || lk == CTSC_SK_TemplateTail) {
-                    literal = ctsc_node_new(p->arena, lk, lit_fs, cur_end(p));
-                    literal->data.templateLiteralLike.text = p->scanner.current.text;
-                    literal->data.templateLiteralLike.text_len = p->scanner.current.text_len;
-                    advance(p);
-                } else {
-                    literal = ctsc_node_new(p->arena, CTSC_SK_TemplateTail, lit_fs, lit_fs);
-                    literal->data.templateLiteralLike.text = NULL;
-                    literal->data.templateLiteralLike.text_len = 0;
-                }
-            } else if (cur(p) == CTSC_SK_TemplateMiddle || cur(p) == CTSC_SK_TemplateTail) {
-                literal = ctsc_node_new(p->arena, cur(p), lit_fs, cur_end(p));
-                literal->data.templateLiteralLike.text = p->scanner.current.text;
-                literal->data.templateLiteralLike.text_len = p->scanner.current.text_len;
-                advance(p);
-            } else {
-                /* createMissingNode(TemplateTail, ...) — zero-width at
-                 * scanner.getTokenFullStart() with empty text. */
-                ctsc_diag_push(p->diagnostics, CTSC_DIAG_ERROR, 1005,
-                    cur_start(p), cur_end(p) - cur_start(p),
-                    "'}' expected.");
-                literal = ctsc_node_new(p->arena, CTSC_SK_TemplateTail, lit_fs, lit_fs);
-                literal->data.templateLiteralLike.text = NULL;
-                literal->data.templateLiteralLike.text_len = 0;
-            }
-            int span_end = cur_full_start(p);
-            CtscNode* span = ctsc_node_new(p->arena, CTSC_SK_TemplateSpan, span_fs, span_end);
-            span->data.templateSpan.expression = expr;
-            span->data.templateSpan.literal    = literal;
-            ctsc_node_array_push(&spans, p->arena, span);
-            if (literal->kind != CTSC_SK_TemplateMiddle) break;
-        }
-        int te_end = cur_full_start(p);
-        CtscNode* te = ctsc_node_new(p->arena, CTSC_SK_TemplateExpression, fs, te_end);
-        te->data.templateExpression.head = head;
-        te->data.templateExpression.templateSpans = spans;
-        return te;
+        return parse_template_expression_with_head(p, fs, head);
     }
     if (k == CTSC_SK_OpenParenToken) {
         /* Mirrors upstream/TypeScript/src/compiler/parser.ts parseParenthesizedExpression
@@ -407,7 +365,7 @@ static CtscNode* parse_primary(Parser* p) {
                     int epos = cur_full_start(p);
                     e = ctsc_node_new(p->arena, CTSC_SK_OmittedExpression, epos, epos);
                 } else {
-                    e = parse_assignment_expression(p);
+                    e = parse_argument_expression(p);
                     if (!e) break;
                 }
                 ctsc_node_array_push(&elements, p->arena, e);
@@ -463,7 +421,7 @@ static CtscNode* parse_primary(Parser* p) {
  * after the closing bracket). The resulting node's pos is the caller-supplied
  * `left->pos`, which is the `pos` tsc threads through the rest loop.
  */
-static CtscNode* parse_element_access_rest_after_open(Parser* p, CtscNode* left) {
+static CtscNode* parse_element_access_rest_after_open(Parser* p, CtscNode* left, bool optional_chain) {
     CtscNode* argument;
     if (cur(p) == CTSC_SK_CloseBracketToken) {
         /* Mirrors parser.ts ~6435: createMissingNode(SyntaxKind.Identifier, true,
@@ -491,6 +449,7 @@ static CtscNode* parse_element_access_rest_after_open(Parser* p, CtscNode* left)
     CtscNode* ea = ctsc_node_new(p->arena, CTSC_SK_ElementAccessExpression, left->pos, end);
     ea->data.elementAccessExpression.expression = left;
     ea->data.elementAccessExpression.argumentExpression = argument;
+    ea->data.elementAccessExpression.optional_chain = optional_chain;
     return ea;
 }
 
@@ -710,6 +669,107 @@ static bool try_parse_type_arguments_in_expression_capturing(Parser* p, CtscNode
     }
 }
 
+/*
+ * Mirrors upstream/TypeScript/src/compiler/parser.ts
+ * isStartOfOptionalPropertyOrElementAccessChain (~6388) with
+ * nextTokenIsIdentifierOrKeywordOrOpenBracketOrTemplate (~6381).
+ */
+static bool is_start_of_optional_property_or_element_access_chain(Parser* p) {
+    if (cur(p) != CTSC_SK_QuestionDotToken) return false;
+    CtscScanner saved = p->scanner;
+    advance(p);
+    CtscSyntaxKind k = cur(p);
+    p->scanner = saved;
+    if (k == CTSC_SK_OpenBracketToken) return true;
+    if (k == CTSC_SK_NoSubstitutionTemplateLiteral || k == CTSC_SK_TemplateHead) return true;
+    if (k == CTSC_SK_Identifier) return true;
+    if (k >= CTSC_SK_BreakKeyword && k <= CTSC_SK_UnknownKeyword) return true;
+    return false;
+}
+
+/*
+ * Continuation of parseTemplateExpression (~3668) after TemplateHead is
+ * consumed. Mirrors parseTemplateSpans / parseTemplateSpan with the same
+ * reScanTemplateToken behaviour as parseTemplateExpression with isTaggedTemplate false.
+ */
+static CtscNode* parse_template_expression_with_head(Parser* p, int fs, CtscNode* head) {
+    CtscNodeArray spans;
+    ctsc_node_array_init(&spans);
+    for (;;) {
+        int span_fs = cur_full_start(p);
+        CtscNode* expr = parse_expression(p);
+        if (!expr) {
+            expr = make_missing_identifier(p);
+        }
+        CtscNode* literal;
+        int lit_fs = cur_full_start(p);
+        if (cur(p) == CTSC_SK_CloseBraceToken) {
+            ctsc_scanner_re_scan_template_token(&p->scanner);
+            CtscSyntaxKind lk = cur(p);
+            if (lk == CTSC_SK_TemplateMiddle || lk == CTSC_SK_TemplateTail) {
+                literal = ctsc_node_new(p->arena, lk, lit_fs, cur_end(p));
+                literal->data.templateLiteralLike.text = p->scanner.current.text;
+                literal->data.templateLiteralLike.text_len = p->scanner.current.text_len;
+                advance(p);
+            } else {
+                literal = ctsc_node_new(p->arena, CTSC_SK_TemplateTail, lit_fs, lit_fs);
+                literal->data.templateLiteralLike.text = NULL;
+                literal->data.templateLiteralLike.text_len = 0;
+            }
+        } else if (cur(p) == CTSC_SK_TemplateMiddle || cur(p) == CTSC_SK_TemplateTail) {
+            literal = ctsc_node_new(p->arena, cur(p), lit_fs, cur_end(p));
+            literal->data.templateLiteralLike.text = p->scanner.current.text;
+            literal->data.templateLiteralLike.text_len = p->scanner.current.text_len;
+            advance(p);
+        } else {
+            ctsc_diag_push(p->diagnostics, CTSC_DIAG_ERROR, 1005,
+                cur_start(p), cur_end(p) - cur_start(p),
+                "'}' expected.");
+            literal = ctsc_node_new(p->arena, CTSC_SK_TemplateTail, lit_fs, lit_fs);
+            literal->data.templateLiteralLike.text = NULL;
+            literal->data.templateLiteralLike.text_len = 0;
+        }
+        int span_end = cur_full_start(p);
+        CtscNode* span = ctsc_node_new(p->arena, CTSC_SK_TemplateSpan, span_fs, span_end);
+        span->data.templateSpan.expression = expr;
+        span->data.templateSpan.literal    = literal;
+        ctsc_node_array_push(&spans, p->arena, span);
+        if (literal->kind != CTSC_SK_TemplateMiddle) break;
+    }
+    int te_end = cur_full_start(p);
+    CtscNode* te = ctsc_node_new(p->arena, CTSC_SK_TemplateExpression, fs, te_end);
+    te->data.templateExpression.head = head;
+    te->data.templateExpression.templateSpans = spans;
+    return te;
+}
+
+/*
+ * Mirrors upstream/TypeScript/src/compiler/parser.ts parseTaggedTemplateRest (~6505).
+ */
+static CtscNode* parse_tagged_template_rest(Parser* p, CtscNode* tag) {
+    int pos = tag->pos;
+    CtscNode* tmpl;
+    if (cur(p) == CTSC_SK_NoSubstitutionTemplateLiteral) {
+        tmpl = ctsc_node_new(p->arena, CTSC_SK_NoSubstitutionTemplateLiteral, cur_start(p), cur_end(p));
+        tmpl->data.templateLiteralLike.text = p->scanner.current.text;
+        tmpl->data.templateLiteralLike.text_len = p->scanner.current.text_len;
+        advance(p);
+    } else if (cur(p) == CTSC_SK_TemplateHead) {
+        int hfs = cur_full_start(p);
+        CtscNode* head = ctsc_node_new(p->arena, CTSC_SK_TemplateHead, hfs, cur_end(p));
+        head->data.templateLiteralLike.text = p->scanner.current.text;
+        head->data.templateLiteralLike.text_len = p->scanner.current.text_len;
+        advance(p);
+        tmpl = parse_template_expression_with_head(p, hfs, head);
+    } else {
+        return tag;
+    }
+    CtscNode* n = ctsc_node_new(p->arena, CTSC_SK_TaggedTemplateExpression, pos, tmpl->end);
+    n->data.taggedTemplateExpression.tag = tag;
+    n->data.taggedTemplateExpression.template_ = tmpl;
+    return n;
+}
+
 static CtscNode* parse_call_or_property_rest(Parser* p, CtscNode* left) {
     for (;;) {
         if (cur(p) == CTSC_SK_OpenParenToken) {
@@ -724,7 +784,7 @@ static CtscNode* parse_call_or_property_rest(Parser* p, CtscNode* left) {
                  * a top-level `,` here is the argument separator, not the
                  * comma operator. See parseArgumentExpression (~6685). */
                 for (;;) {
-                    CtscNode* a = parse_assignment_expression(p);
+                    CtscNode* a = parse_argument_expression(p);
                     if (!a) break;
                     ctsc_node_array_push(&args, p->arena, a);
                     if (!accept(p, CTSC_SK_CommaToken)) break;
@@ -736,6 +796,26 @@ static CtscNode* parse_call_or_property_rest(Parser* p, CtscNode* left) {
             call->data.callExpression.expression = left;
             call->data.callExpression.arguments = args;
             left = call;
+            continue;
+        }
+        /*
+         * Optional chaining `?.` before property or element access.
+         * Mirrors parser.ts parseMemberExpressionRest (~6457-6473).
+         */
+        if (cur(p) == CTSC_SK_QuestionDotToken && is_start_of_optional_property_or_element_access_chain(p)) {
+            advance(p); /* `?.` */
+            if (cur(p) == CTSC_SK_OpenBracketToken) {
+                advance(p);
+                left = parse_element_access_rest_after_open(p, left, true);
+                continue;
+            }
+            CtscNode* name = parse_right_side_of_dot(p);
+            if (!name) break;
+            CtscNode* pa = ctsc_node_new(p->arena, CTSC_SK_PropertyAccessExpression, left->pos, name->end);
+            pa->data.propertyAccessExpression.expression = left;
+            pa->data.propertyAccessExpression.name = name;
+            pa->data.propertyAccessExpression.optional_chain = true;
+            left = pa;
             continue;
         }
         if (cur(p) == CTSC_SK_DotToken) {
@@ -757,7 +837,13 @@ static CtscNode* parse_call_or_property_rest(Parser* p, CtscNode* left) {
              *     parseOptional(SyntaxKind.OpenBracketToken) ->
              *     parseElementAccessExpressionRest. */
             advance(p);
-            left = parse_element_access_rest_after_open(p, left);
+            left = parse_element_access_rest_after_open(p, left, false);
+            continue;
+        }
+        /* Mirrors parser.ts parseMemberExpressionRest (~6476):
+         * isTemplateStartOfTaggedTemplate -> parseTaggedTemplateRest. */
+        if (cur(p) == CTSC_SK_NoSubstitutionTemplateLiteral || cur(p) == CTSC_SK_TemplateHead) {
+            left = parse_tagged_template_rest(p, left);
             continue;
         }
         /* Mirrors upstream/TypeScript/src/compiler/parser.ts parseCallExpressionRest
@@ -779,7 +865,7 @@ static CtscNode* parse_call_or_property_rest(Parser* p, CtscNode* left) {
                 CtscNodeArray args; ctsc_node_array_init(&args);
                 if (cur(p) != CTSC_SK_CloseParenToken) {
                     for (;;) {
-                        CtscNode* a = parse_assignment_expression(p);
+                        CtscNode* a = parse_argument_expression(p);
                         if (!a) break;
                         ctsc_node_array_push(&args, p->arena, a);
                         if (!accept(p, CTSC_SK_CommaToken)) break;
@@ -811,8 +897,8 @@ static CtscNode* parse_call_or_property_rest(Parser* p, CtscNode* left) {
  * type-arguments absorption (`<...>`). Unlike parse_call_or_property_rest,
  * this helper intentionally stops at the first `(` so that `new X(args)`
  * builds a NewExpression (arguments consumed by parse_new_expression below)
- * rather than CallExpression(X, args). Optional chains (`?.`) are not yet
- * modelled; they will be grown when fixtures demand them.
+ * rather than CallExpression(X, args). Optional chains (`?.`) for property /
+ * element access are handled the same way as in parse_call_or_property_rest.
  *
  * Type arguments are handled exactly as in parser.ts ~6490 — a speculative
  * `tryParse(parseTypeArgumentsInExpression)` attempt. In upstream, a
@@ -839,6 +925,24 @@ static CtscNode* parse_member_expression_rest(Parser* p, CtscNode* left,
                                               CtscNodeArray* out_type_args,
                                               bool* out_has_type_args) {
     for (;;) {
+        if (cur(p) == CTSC_SK_QuestionDotToken && is_start_of_optional_property_or_element_access_chain(p)) {
+            advance(p); /* `?.` */
+            if (cur(p) == CTSC_SK_OpenBracketToken) {
+                advance(p);
+                left = parse_element_access_rest_after_open(p, left, true);
+                if (out_has_type_args) *out_has_type_args = false;
+                continue;
+            }
+            CtscNode* name = parse_right_side_of_dot(p);
+            if (!name) break;
+            CtscNode* pa = ctsc_node_new(p->arena, CTSC_SK_PropertyAccessExpression, left->pos, name->end);
+            pa->data.propertyAccessExpression.expression = left;
+            pa->data.propertyAccessExpression.name = name;
+            pa->data.propertyAccessExpression.optional_chain = true;
+            left = pa;
+            if (out_has_type_args) *out_has_type_args = false;
+            continue;
+        }
         if (cur(p) == CTSC_SK_DotToken) {
             advance(p);
             /* Mirrors parser.ts parsePropertyAccessExpressionRest (~6415):
@@ -856,7 +960,7 @@ static CtscNode* parse_member_expression_rest(Parser* p, CtscNode* left,
         }
         if (cur(p) == CTSC_SK_OpenBracketToken) {
             advance(p);
-            left = parse_element_access_rest_after_open(p, left);
+            left = parse_element_access_rest_after_open(p, left, false);
             if (out_has_type_args) *out_has_type_args = false;
             continue;
         }
@@ -938,7 +1042,7 @@ static CtscNode* parse_new_expression(Parser* p) {
         advance(p);
         if (cur(p) != CTSC_SK_CloseParenToken) {
             for (;;) {
-                CtscNode* a = parse_assignment_expression(p);
+                CtscNode* a = parse_argument_expression(p);
                 if (!a) break;
                 ctsc_node_array_push(&n->data.newExpression.arguments, p->arena, a);
                 if (!accept(p, CTSC_SK_CommaToken)) break;
@@ -1100,6 +1204,28 @@ static CtscNode* parse_type_assertion(Parser* p) {
     return n;
 }
 
+/*
+ * Mirrors upstream/TypeScript/src/compiler/parser.ts isAwaitExpression (~5713):
+ * in await context always; otherwise lookAhead(nextTokenIsIdentifierOrKeywordOrLiteralOnSameLine).
+ */
+static bool is_await_expression(Parser* p) {
+    if (cur(p) != CTSC_SK_AwaitKeyword) return false;
+    if (p->await_context_depth > 0) return true;
+    CtscScanner saved = p->scanner;
+    advance(p);
+    bool same_line = !p->scanner.current.has_preceding_line_break;
+    bool ok = false;
+    if (same_line) {
+        CtscSyntaxKind nk = cur(p);
+        ok = is_binding_identifier_kind(nk) || nk == CTSC_SK_NumericLiteral
+            || nk == CTSC_SK_StringLiteral || nk == CTSC_SK_NoSubstitutionTemplateLiteral
+            || nk == CTSC_SK_RegularExpressionLiteral
+            || (nk >= CTSC_SK_BreakKeyword && nk <= CTSC_SK_UnknownKeyword);
+    }
+    p->scanner = saved;
+    return ok;
+}
+
 static CtscNode* parse_unary(Parser* p) {
     if (is_simple_prefix_unary_op(cur(p))) {
         int fs = cur_full_start(p);
@@ -1162,6 +1288,22 @@ static CtscNode* parse_unary(Parser* p) {
         return v;
     }
     /* Mirrors upstream/TypeScript/src/compiler/parser.ts parseSimpleUnaryExpression
+     * (~5819): case AwaitKeyword when isAwaitExpression → parseAwaitExpression (~5726). */
+    if (cur(p) == CTSC_SK_AwaitKeyword && is_await_expression(p)) {
+        int fs = cur_full_start(p);
+        advance(p);
+        CtscNode* operand = parse_unary(p);
+        if (!operand) {
+            ctsc_diag_push(p->diagnostics, CTSC_DIAG_ERROR, 1109,
+                cur_start(p), cur_end(p) - cur_start(p),
+                "Expression expected.");
+            operand = make_missing_identifier(p);
+        }
+        CtscNode* aw = ctsc_node_new(p->arena, CTSC_SK_AwaitExpression, fs, operand->end);
+        aw->data.awaitExpression.expression = operand;
+        return aw;
+    }
+    /* Mirrors upstream/TypeScript/src/compiler/parser.ts parseSimpleUnaryExpression
      * (~5809): when the current token is `<` in non-JSX mode, dispatch to
      * parseTypeAssertion to parse `< Type > UnaryExpression`. Without this
      * the `<` is left to the binary-expression precedence climber, which
@@ -1191,11 +1333,14 @@ static bool is_equality_op(CtscSyntaxKind k) {
         || k == CTSC_SK_EqualsEqualsEqualsToken || k == CTSC_SK_ExclamationEqualsEqualsToken;
 }
 static bool is_relational_op(CtscSyntaxKind k) {
+    /* Mirrors upstream getBinaryOperatorPrecedence (~5990): relational includes
+     * `instanceof` and `in` (parser.ts parseBinaryExpressionRest ~5608). */
     return k == CTSC_SK_LessThanToken || k == CTSC_SK_GreaterThanToken
-        || k == CTSC_SK_LessThanEqualsToken || k == CTSC_SK_GreaterThanEqualsToken;
+        || k == CTSC_SK_LessThanEqualsToken || k == CTSC_SK_GreaterThanEqualsToken
+        || k == CTSC_SK_InstanceOfKeyword
+        || k == CTSC_SK_InKeyword;
 }
 static bool is_logical_and_op(CtscSyntaxKind k) { return k == CTSC_SK_AmpersandAmpersandToken; }
-static bool is_logical_or_op(CtscSyntaxKind k)  { return k == CTSC_SK_BarBarToken; }
 
 /*
  * Mirrors upstream/TypeScript/src/compiler/parser.ts parseBinaryExpressionRest (~5608):
@@ -1266,7 +1411,17 @@ static CtscNode* parse_shift(Parser* p)          { return parse_binary_level(p, 
 static CtscNode* parse_relational(Parser* p)     { return parse_binary_level(p, parse_shift,          is_relational_op); }
 static CtscNode* parse_equality(Parser* p)       { return parse_binary_level(p, parse_relational,     is_equality_op); }
 static CtscNode* parse_logical_and(Parser* p)    { return parse_binary_level(p, parse_equality,       is_logical_and_op); }
-static CtscNode* parse_logical_or(Parser* p)     { return parse_binary_level(p, parse_logical_and,    is_logical_or_op); }
+/*
+ * Mirrors upstream/TypeScript/src/compiler/utilities.ts getBinaryOperatorPrecedence
+ * (~5990): `||` and `??` share OperatorPrecedence.Coalesce / LogicalOR (utilities.ts
+ * ~5754-5759), so they parse at the same level with left associativity.
+ */
+static bool is_logical_or_or_nullish_coalesce_op(CtscSyntaxKind k) {
+    return k == CTSC_SK_BarBarToken || k == CTSC_SK_QuestionQuestionToken;
+}
+static CtscNode* parse_logical_or(Parser* p) {
+    return parse_binary_level(p, parse_logical_and, is_logical_or_or_nullish_coalesce_op);
+}
 
 static CtscNode* parse_conditional(Parser* p) {
     CtscNode* cond = parse_logical_or(p);
@@ -1313,11 +1468,10 @@ static bool is_assignment_op(CtscSyntaxKind k) {
  * fixture) must NOT be treated as an assignment target so that the `=`
  * is left for statement-level recovery and ASI splits the source into
  * two statements (parser.ts parseAssignmentExpressionOrHigher ~5128).
- * Kinds ctsc does not yet model (JsxElement, TaggedTemplateExpression,
- * NonNullExpression, ExpressionWithTypeArguments, MetaProperty,
- * MissingDeclaration, PrivateIdentifier, BigIntLiteral) are omitted for
- * now; they will be grown alongside the parser productions that create
- * them.
+ * Kinds ctsc does not yet model (JsxElement, NonNullExpression,
+ * ExpressionWithTypeArguments, MetaProperty, MissingDeclaration,
+ * PrivateIdentifier, BigIntLiteral) are omitted for now; they will be grown
+ * alongside the parser productions that create them.
  */
 static bool is_left_hand_side_expression_kind(CtscSyntaxKind k) {
     switch (k) {
@@ -1325,6 +1479,8 @@ static bool is_left_hand_side_expression_kind(CtscSyntaxKind k) {
         case CTSC_SK_ElementAccessExpression:
         case CTSC_SK_NewExpression:
         case CTSC_SK_CallExpression:
+        case CTSC_SK_TaggedTemplateExpression:
+        case CTSC_SK_TemplateExpression:
         case CTSC_SK_ArrayLiteralExpression:
         case CTSC_SK_ParenthesizedExpression:
         case CTSC_SK_ObjectLiteralExpression:
@@ -1504,9 +1660,12 @@ static bool looks_like_parenthesized_arrow_function(Parser* p) {
  * model the isStartOfStatement recovery branch (~5538) — no unlocked
  * fixture needs it — so we take the simpler two-way split.
  */
-static CtscNode* parse_arrow_function_body(Parser* p) {
+static CtscNode* parse_arrow_function_body(Parser* p, bool is_async) {
     if (cur(p) == CTSC_SK_OpenBraceToken) {
-        return parse_block(p);
+        if (is_async) p->await_context_depth++;
+        CtscNode* b = parse_block(p);
+        if (is_async) p->await_context_depth--;
+        return b;
     }
     CtscNode* expr = parse_assignment_expression(p);
     if (!expr) {
@@ -1551,10 +1710,13 @@ static bool is_start_of_parameter(const Parser* p) {
      * loop above routes `(...x) => ...` into parse_parameter rather than
      * abortParsingListOrMoveToNextToken. */
     if (k == CTSC_SK_DotDotDotToken) return true;
+    /* `this` is a reserved word but valid as the first parameter (this-
+     * typing); parseBindingIdentifier materialises it as Identifier. */
+    if (k == CTSC_SK_ThisKeyword) return true;
     return is_binding_identifier_kind(k);
 }
 
-static CtscNode* parse_parenthesized_arrow_function(Parser* p) {
+static CtscNode* parse_parenthesized_arrow_function(Parser* p, bool is_async_arrow) {
     int fs = cur_full_start(p);
     expect(p, CTSC_SK_OpenParenToken);
     CtscNodeArray params; ctsc_node_array_init(&params);
@@ -1650,7 +1812,7 @@ static CtscNode* parse_parenthesized_arrow_function(Parser* p) {
     CtscNode* body;
     if (last_token == CTSC_SK_EqualsGreaterThanToken
         || last_token == CTSC_SK_OpenBraceToken) {
-        body = parse_arrow_function_body(p);
+        body = parse_arrow_function_body(p, is_async_arrow);
     } else {
         /* parseIdentifier(): when the current token is not an identifier,
          * createIdentifier falls through to createMissingNode(Identifier)
@@ -1664,10 +1826,22 @@ static CtscNode* parse_parenthesized_arrow_function(Parser* p) {
     }
     int end = body ? body->end : cur_full_start(p);
     CtscNode* af = ctsc_node_new(p->arena, CTSC_SK_ArrowFunction, fs, end);
+    af->data.arrowFunction.has_async = is_async_arrow;
     af->data.arrowFunction.parameters = params;
     af->data.arrowFunction.equals_greater_than_pos = eg_pos;
     af->data.arrowFunction.equals_greater_than_end = eg_end;
     af->data.arrowFunction.body = body;
+    return af;
+}
+
+static CtscNode* parse_async_parenthesized_arrow_function(Parser* p) {
+    int fs = cur_full_start(p);
+    advance(p); /* async */
+    CtscNode* af = parse_parenthesized_arrow_function(p, true);
+    if (af && af->kind == CTSC_SK_ArrowFunction) {
+        af->pos = fs;
+        af->data.arrowFunction.has_async = true;
+    }
     return af;
 }
 
@@ -1682,9 +1856,10 @@ static CtscNode* parse_simple_arrow_function(Parser* p, CtscNode* identifier) {
     int eg_pos = cur_full_start(p);
     int eg_end = cur_end(p);
     advance(p); /* `=>` */
-    CtscNode* body = parse_arrow_function_body(p);
+    CtscNode* body = parse_arrow_function_body(p, false);
     int end = body ? body->end : cur_full_start(p);
     CtscNode* af = ctsc_node_new(p->arena, CTSC_SK_ArrowFunction, identifier->pos, end);
+    af->data.arrowFunction.has_async = false;
     af->data.arrowFunction.parameters = params;
     af->data.arrowFunction.equals_greater_than_pos = eg_pos;
     af->data.arrowFunction.equals_greater_than_end = eg_end;
@@ -1720,6 +1895,18 @@ static CtscNode* parse_assignment_expression(Parser* p) {
     if (is_yield_expression(p)) {
         return parse_yield_expression(p);
     }
+    /* Mirrors parser.ts tryParseAsyncSimpleArrowFunctionExpression (~5395):
+     * async [no LT] ( ... ) => ... */
+    if (cur(p) == CTSC_SK_AsyncKeyword && !p->scanner.current.has_preceding_line_break) {
+        CtscScanner saved = p->scanner;
+        advance(p);
+        bool ok = !p->scanner.current.has_preceding_line_break && cur(p) == CTSC_SK_OpenParenToken
+            && looks_like_parenthesized_arrow_function(p);
+        p->scanner = saved;
+        if (ok) {
+            return parse_async_parenthesized_arrow_function(p);
+        }
+    }
     /* Production 4: parenthesized ArrowFunctionExpression. Mirrors parser.ts
      * tryParseParenthesizedArrowFunctionExpression (~5216). We commit only
      * when the lookahead is unambiguous — see looks_like_parenthesized_arrow_function.
@@ -1728,7 +1915,7 @@ static CtscNode* parse_assignment_expression(Parser* p) {
      * diagnostic checkpoint across parseParametersWorker. */
     if (cur(p) == CTSC_SK_OpenParenToken
         && looks_like_parenthesized_arrow_function(p)) {
-        return parse_parenthesized_arrow_function(p);
+        return parse_parenthesized_arrow_function(p, false);
     }
     CtscNode* left = parse_conditional(p);
     if (!left) return NULL;
@@ -1756,6 +1943,29 @@ static CtscNode* parse_assignment_expression(Parser* p) {
         return b;
     }
     return left;
+}
+
+/*
+ * Mirrors upstream/TypeScript/src/compiler/parser.ts parseArgumentExpression
+ * (~6685) / parseArgumentOrArrayLiteralElement (~6679): optional DotDotDotToken
+ * then AssignmentExpression → SpreadElement; otherwise AssignmentExpression.
+ */
+static CtscNode* parse_argument_expression(Parser* p) {
+    if (cur(p) == CTSC_SK_DotDotDotToken) {
+        int fs = cur_full_start(p);
+        advance(p);
+        CtscNode* expr = parse_assignment_expression(p);
+        if (!expr) {
+            ctsc_diag_push(p->diagnostics, CTSC_DIAG_ERROR, 1109,
+                cur_start(p), cur_end(p) - cur_start(p),
+                "Expression expected.");
+            expr = make_missing_identifier(p);
+        }
+        CtscNode* n = ctsc_node_new(p->arena, CTSC_SK_SpreadElement, fs, expr->end);
+        n->data.spreadElement.expression = expr;
+        return n;
+    }
+    return parse_assignment_expression(p);
 }
 
 /*
@@ -1917,12 +2127,10 @@ static CtscNode* parse_property_name(Parser* p) {
 /*
  * Mirrors upstream/TypeScript/src/compiler/parser.ts parseTypeParameter (~3955):
  *     TypeParameter: (modifiers)? Identifier (`extends` Type)? (`=` Type)?
- * ctsc currently models only the bare-identifier form exercised by
- * 107_FunctionPropertyAssignments6_es6.ts (`{ *<T>() { } }`). Modifiers,
- * constraint, and default are skipped until a fixture demands them.
- * finishNode positions: pos = getNodePos (full_start of the first token),
- * end = scanner.getTokenFullStart() AFTER the last consumed token — for the
- * single-identifier form that is just the identifier's own end.
+ * Modifiers are still skipped; constraint and default are consumed so the
+ * scanner reaches the `>` / `,` that closes the type-parameter list (fixture
+ * emitter/selfhost-derived/57_generic_constraint.ts: `T extends () => void`).
+ * finishNode end = scanner.getTokenFullStart() after the constraint/default.
  */
 static CtscNode* parse_type_parameter(Parser* p) {
     int pos = cur_full_start(p);
@@ -1930,7 +2138,15 @@ static CtscNode* parse_type_parameter(Parser* p) {
     if (!name) {
         name = make_missing_identifier(p);
     }
-    int end = name->end;
+    if (cur(p) == CTSC_SK_ExtendsKeyword) {
+        advance(p);
+        skip_type_in_type_parameter_position(p);
+    }
+    if (cur(p) == CTSC_SK_EqualsToken) {
+        advance(p);
+        skip_type_in_type_parameter_position(p);
+    }
+    int end = cur_full_start(p);
     CtscNode* tp = ctsc_node_new(p->arena, CTSC_SK_TypeParameter, pos, end);
     tp->data.typeParameter.name = name;
     return tp;
@@ -1996,7 +2212,8 @@ static CtscNode* parse_method_declaration_rest(
     Parser* p,
     int pos,
     bool has_asterisk, int asterisk_pos, int asterisk_end,
-    CtscNode* name)
+    CtscNode* name,
+    const CtscNodeArray* modifiers_opt)
 {
     /* parser.ts parseMethodDeclaration (~7794): `const typeParameters =
      * parseTypeParameters();` runs between the name/questionToken and the
@@ -2040,6 +2257,11 @@ static CtscNode* parse_method_declaration_rest(
     }
     int end = body ? body->end : cur_full_start(p);
     CtscNode* m = ctsc_node_new(p->arena, CTSC_SK_MethodDeclaration, pos, end);
+    if (modifiers_opt) {
+        m->data.methodDeclaration.modifiers = *modifiers_opt;
+    } else {
+        ctsc_node_array_init(&m->data.methodDeclaration.modifiers);
+    }
     m->data.methodDeclaration.has_asterisk = has_asterisk;
     m->data.methodDeclaration.asterisk_pos = asterisk_pos;
     m->data.methodDeclaration.asterisk_end = asterisk_end;
@@ -2082,7 +2304,8 @@ static bool token_can_follow_get_or_set(CtscSyntaxKind k) {
  * models only `name`, `parameters`, and `body`; typeParameters, return-type
  * annotation, and modifiers are skipped until a fixture demands them.
  */
-static CtscNode* parse_accessor_declaration(Parser* p, int pos, CtscSyntaxKind kind) {
+static CtscNode* parse_accessor_declaration(Parser* p, int pos, CtscSyntaxKind kind,
+                                            const CtscNodeArray* modifiers_opt) {
     CtscNode* name = parse_property_name(p);
 
     /* parseTypeParameters runs between name and `(` in upstream. Consume
@@ -2121,6 +2344,11 @@ static CtscNode* parse_accessor_declaration(Parser* p, int pos, CtscSyntaxKind k
     }
     int end = body ? body->end : cur_full_start(p);
     CtscNode* n = ctsc_node_new(p->arena, kind, pos, end);
+    if (modifiers_opt) {
+        n->data.accessorDeclaration.modifiers = *modifiers_opt;
+    } else {
+        ctsc_node_array_init(&n->data.accessorDeclaration.modifiers);
+    }
     n->data.accessorDeclaration.name = name;
     n->data.accessorDeclaration.parameters = params;
     n->data.accessorDeclaration.body = body;
@@ -2144,14 +2372,31 @@ static CtscNode* parse_accessor_declaration(Parser* p, int pos, CtscSyntaxKind k
  *     falls through to parseIdentifier(Expression_expected) producing a
  *     zero-width missing Identifier at scanner.getTokenFullStart().
  *
- * SpreadAssignment, modifiers, questionToken, exclamationToken, and JSDoc
- * annotations are not yet modelled. When the current token cannot begin any
+ * SpreadAssignment is handled first (~6703). Modifiers, questionToken,
+ * exclamationToken, and JSDoc annotations are not yet modelled. When the current token cannot begin any
  * element (e.g. an unrecognised punctuator after recovery),
  * parse_object_literal_expression's progress check advances past it so the
  * outer literal's pos/end stays correct.
  */
 static CtscNode* parse_object_literal_element(Parser* p) {
     int pos = cur_full_start(p);
+
+    /* parser.ts parseObjectLiteralElement (~6703): parseOptionalToken(DotDotDotToken)
+     * then parseAssignmentExpressionOrHigher. */
+    if (cur(p) == CTSC_SK_DotDotDotToken) {
+        advance(p);
+        CtscNode* expr = parse_assignment_expression(p);
+        if (!expr) {
+            ctsc_diag_push(p->diagnostics, CTSC_DIAG_ERROR, 1109,
+                cur_start(p), cur_end(p) - cur_start(p),
+                "Expression expected.");
+            expr = make_missing_identifier(p);
+        }
+        int sa_end = cur_full_start(p);
+        CtscNode* sa = ctsc_node_new(p->arena, CTSC_SK_SpreadAssignment, pos, sa_end);
+        sa->data.spreadAssignment.expression = expr;
+        return sa;
+    }
 
     /* parser.ts parseObjectLiteralElement (~6709 / ~6712):
      *   if (parseContextualModifier(SyntaxKind.GetKeyword)) return parseAccessorDeclaration(..., GetAccessor, ...);
@@ -2169,7 +2414,7 @@ static CtscNode* parse_object_literal_element(Parser* p) {
         size_t saved_diag_count = p->diagnostics->count;
         advance(p); /* consume `get` / `set` speculatively */
         if (token_can_follow_get_or_set(cur(p))) {
-            return parse_accessor_declaration(p, pos, accessor_kind);
+            return parse_accessor_declaration(p, pos, accessor_kind, NULL);
         }
         /* tryParse failed: restore and fall through to the identifier /
          * ShorthandPropertyAssignment path (e.g. `{ get: 1 }` or `{ get }`
@@ -2202,7 +2447,7 @@ static CtscNode* parse_object_literal_element(Parser* p) {
      * parse_method_declaration_rest consumes before parseParameters. */
     if (has_asterisk || cur(p) == CTSC_SK_OpenParenToken || cur(p) == CTSC_SK_LessThanToken) {
         return parse_method_declaration_rest(p, pos,
-            has_asterisk, asterisk_pos, asterisk_end, name);
+            has_asterisk, asterisk_pos, asterisk_end, name, NULL);
     }
 
     /* parser.ts ~6734: `tokenIsIdentifier && token() !== ColonToken` routes
@@ -2437,20 +2682,43 @@ static CtscNode* parse_type_literal(Parser* p) {
 }
 
 /*
- * Mirrors upstream/TypeScript/src/compiler/parser.ts parseTypeAnnotation (~4961):
- *     TypeAnnotation: ":" Type
- * Returns NULL when no ":" is present. ctsc currently models only the subset
- * of Type productions that appears in the fixtures (TypeLiteral "{...}"); all
- * other shapes are token-skipped to keep VariableDeclaration.end aligned with
- * tsc's finishNode position. This is safe because the oracle omits the
- * declaration's `type` field (harness/src/oracle-ast.ts), so only positions
- * matter for parity.
+ * Mirrors upstream/TypeScript/src/compiler/parser.ts parsePostfixTypeOrHigher
+ * (~4716): after parseNonArrayType(), consume repeated postfix `[` ... `]`
+ * (array type `T[]` or indexed access `T[K]`). Without this, `...nums: number[]`
+ * leaves `[` unconsumed and the parameter-list loop treats `[]` as a second
+ * Parameter (ArrayBindingPattern) — emitter/selfhost-derived/60_rest_parameters.ts.
  */
-static CtscNode* parse_type_annotation(Parser* p) {
-    if (cur(p) != CTSC_SK_ColonToken) return NULL;
-    advance(p); /* ":" */
+static void consume_postfix_type_operators(Parser* p) {
+    while (!p->scanner.current.has_preceding_line_break
+           && cur(p) == CTSC_SK_OpenBracketToken) {
+        advance(p); /* `[` */
+        if (cur(p) != CTSC_SK_CloseBracketToken && token_can_start_type(cur(p))) {
+            skip_type_in_type_parameter_position(p);
+        }
+        if (cur(p) == CTSC_SK_CloseBracketToken) {
+            advance(p);
+        } else {
+            break;
+        }
+    }
+}
+
+/*
+ * Parses a Type after `:` (annotations) or `=` (type aliases). When
+ * `allow_multiline` is false, a line break at the top level terminates the
+ * type (ASI / variable-declaration parity). When true, multiline union types
+ * after `=` are absorbed (mirrors parser.ts parseTypeAliasDeclaration ~8257
+ * feeding parseType, selfhost-derived 89_type_alias_erase.ts).
+ *
+ * Mirrors upstream/TypeScript/src/compiler/parser.ts parseTypeAnnotation (~4961)
+ * for the `:` case: TypeAnnotation: ":" Type
+ */
+static CtscNode* parse_type_in_annotation_position(Parser* p, bool allow_multiline) {
     if (cur(p) == CTSC_SK_OpenBraceToken) {
-        return parse_type_literal(p);
+        CtscNode* tl = parse_type_literal(p);
+        consume_postfix_type_operators(p);
+        tl->end = cur_full_start(p);
+        return tl;
     }
     /* Mirrors upstream/TypeScript/src/compiler/parser.ts parseNonArrayType (~4629):
      *     case SyntaxKind.VoidKeyword:
@@ -2465,9 +2733,16 @@ static CtscNode* parse_type_annotation(Parser* p) {
      * below). */
     if (cur(p) == CTSC_SK_VoidKeyword) {
         int fs = cur_full_start(p);
+        CtscScanner saved = p->scanner;
         advance(p);
-        int end = cur_full_start(p);
-        return ctsc_node_new(p->arena, CTSC_SK_VoidKeyword, fs, end);
+        /* Union types (`void | null`) must use the stop-set fallback so `|`
+         * and the RHS are absorbed (parser.ts parseUnionType ~4876). */
+        if (cur(p) != CTSC_SK_BarToken) {
+            consume_postfix_type_operators(p);
+            int end = cur_full_start(p);
+            return ctsc_node_new(p->arena, CTSC_SK_VoidKeyword, fs, end);
+        }
+        p->scanner = saved;
     }
     /* Mirrors upstream/TypeScript/src/compiler/parser.ts parseNonArrayType
      * (~4591-4602):
@@ -2512,10 +2787,26 @@ static CtscNode* parse_type_annotation(Parser* p) {
             advance(p);
             bool next_is_dot = cur(p) == CTSC_SK_DotToken;
             if (!next_is_dot) {
-                int end = cur_full_start(p);
-                return ctsc_node_new(p->arena, tk, fs, end);
+                if (cur(p) == CTSC_SK_BarToken) {
+                    p->scanner = saved;
+                } else {
+                    consume_postfix_type_operators(p);
+                    /* Union after postfix (`string[] | undefined`) must use the
+                     * stop-set fallback so `| ...` is absorbed (parser.ts
+                     * parseUnionType ~4876). Returning here left `| undefined`
+                     * unconsumed; the parameter list then parsed `undefined` as
+                     * a second Parameter (selfhost-derived optional-chain export
+                     * fixture). */
+                    if (cur(p) == CTSC_SK_BarToken) {
+                        p->scanner = saved;
+                    } else {
+                        int end = cur_full_start(p);
+                        return ctsc_node_new(p->arena, tk, fs, end);
+                    }
+                }
+            } else {
+                p->scanner = saved;
             }
-            p->scanner = saved;
         }
     }
     /* Identifier-led TypeReference: mirror upstream parser.ts parseTypeReference
@@ -2535,14 +2826,18 @@ static CtscNode* parse_type_annotation(Parser* p) {
         size_t saved_diag_count = p->diagnostics->count;
         CtscNode* tr = parse_type_node(p);
         if (tr) {
+            consume_postfix_type_operators(p);
+            tr->end = cur_full_start(p);
             CtscSyntaxKind nk = cur(p);
             bool terminates =
                 (nk == CTSC_SK_EqualsToken || nk == CTSC_SK_CommaToken
                  || nk == CTSC_SK_SemicolonToken
                  || nk == CTSC_SK_CloseParenToken || nk == CTSC_SK_CloseBracketToken
                  || nk == CTSC_SK_CloseBraceToken
+                 || nk == CTSC_SK_OpenBraceToken
+                 || nk == CTSC_SK_EqualsGreaterThanToken
                  || nk == CTSC_SK_EndOfFileToken)
-                || p->scanner.current.has_preceding_line_break;
+                || (p->scanner.current.has_preceding_line_break && !allow_multiline);
             if (terminates) return tr;
         }
         p->scanner = saved;
@@ -2560,6 +2855,12 @@ static CtscNode* parse_type_annotation(Parser* p) {
     int bracket_depth = 0;
     int paren_depth = 0;
     int angle_depth = 0;
+    /* After a tuple/array type `[...]` at depth 0, the next `{` begins the
+     * function body, not a TypeLiteral — without this, the fallback swallows
+     * the body (emitter/selfhost-derived/57_generic_constraint.ts:
+     * `): [A, B] {`). */
+    bool after_top_level_bracket = false;
+    CtscSyntaxKind last_consumed_kind = CTSC_SK_Unknown;
     while (cur(p) != CTSC_SK_EndOfFileToken) {
         CtscSyntaxKind k = cur(p);
         /* Unknown (e.g. a stray '\\') always terminates the type at any depth:
@@ -2572,10 +2873,76 @@ static CtscNode* parse_type_annotation(Parser* p) {
          * stray token (not past it). */
         if (k == CTSC_SK_Unknown) break;
         if (brace_depth == 0 && bracket_depth == 0 && paren_depth == 0 && angle_depth == 0) {
+            if (after_top_level_bracket && k == CTSC_SK_OpenBraceToken) {
+                break;
+            }
+            if (after_top_level_bracket && k != CTSC_SK_OpenBraceToken) {
+                after_top_level_bracket = false;
+            }
+            /* Do not stop at `=>`: parenthesised function types
+             * `(a: T) => U` must absorb the arrow and return type; stopping at
+             * `=>` left `void` unconsumed and the `{` body was misparsed
+             * (emitter/selfhost-derived/74_export_generic_rest.ts).
+             * Stop at `{` when it cannot start a union RHS object type — i.e.
+             * not immediately after `|` (`A | { b: number }` must keep `{`).
+             * Leading `{` after `:` uses parse_type_literal (~2634), not here. */
             if (k == CTSC_SK_EqualsToken || k == CTSC_SK_CommaToken
                 || k == CTSC_SK_SemicolonToken
                 || k == CTSC_SK_CloseParenToken || k == CTSC_SK_CloseBracketToken
-                || k == CTSC_SK_CloseBraceToken) {
+                || k == CTSC_SK_CloseBraceToken
+                || (k == CTSC_SK_OpenBraceToken && last_consumed_kind != CTSC_SK_BarToken)) {
+                break;
+            }
+            if (p->scanner.current.has_preceding_line_break && !allow_multiline) break;
+        }
+        if (k == CTSC_SK_OpenBraceToken) brace_depth++;
+        else if (k == CTSC_SK_CloseBraceToken) { if (brace_depth == 0) break; brace_depth--; }
+        else if (k == CTSC_SK_OpenBracketToken) bracket_depth++;
+        else if (k == CTSC_SK_CloseBracketToken) {
+            if (bracket_depth == 0) break;
+            bracket_depth--;
+            if (bracket_depth == 0) after_top_level_bracket = true;
+        }
+        else if (k == CTSC_SK_OpenParenToken) paren_depth++;
+        else if (k == CTSC_SK_CloseParenToken) { if (paren_depth == 0) break; paren_depth--; }
+        else if (k == CTSC_SK_LessThanToken) angle_depth++;
+        else if (k == CTSC_SK_GreaterThanToken && angle_depth > 0) angle_depth--;
+        advance(p);
+        last_consumed_kind = k;
+    }
+    int end = cur_full_start(p);
+    return ctsc_node_new(p->arena, CTSC_SK_TypeReference, fs, end);
+}
+
+/*
+ * Mirrors upstream/TypeScript/src/compiler/parser.ts parseTypeAnnotation (~4961).
+ * Returns NULL when no ":" is present.
+ */
+static CtscNode* parse_type_annotation(Parser* p) {
+    if (cur(p) != CTSC_SK_ColonToken) return NULL;
+    advance(p); /* ":" */
+    return parse_type_in_annotation_position(p, false);
+}
+
+/*
+ * Consumes one Type after `extends` or `=` in a TypeParameterDeclaration.
+ * Mirrors the fallback branch of parse_type_annotation (~2552): brace/bracket/
+ * paren/angle-balanced scan until a top-level delimiter.
+ */
+static void skip_type_in_type_parameter_position(Parser* p) {
+    int brace_depth = 0;
+    int bracket_depth = 0;
+    int paren_depth = 0;
+    int angle_depth = 0;
+    while (cur(p) != CTSC_SK_EndOfFileToken) {
+        CtscSyntaxKind k = cur(p);
+        if (k == CTSC_SK_Unknown) break;
+        if (brace_depth == 0 && bracket_depth == 0 && paren_depth == 0 && angle_depth == 0) {
+            if (k == CTSC_SK_EqualsToken || k == CTSC_SK_CommaToken
+                || k == CTSC_SK_SemicolonToken
+                || k == CTSC_SK_CloseParenToken || k == CTSC_SK_CloseBracketToken
+                || k == CTSC_SK_CloseBraceToken
+                || k == CTSC_SK_GreaterThanToken) {
                 break;
             }
             if (p->scanner.current.has_preceding_line_break) break;
@@ -2590,8 +2957,6 @@ static CtscNode* parse_type_annotation(Parser* p) {
         else if (k == CTSC_SK_GreaterThanToken && angle_depth > 0) angle_depth--;
         advance(p);
     }
-    int end = cur_full_start(p);
-    return ctsc_node_new(p->arena, CTSC_SK_TypeReference, fs, end);
 }
 
 static CtscNode* parse_variable_declaration(Parser* p) {
@@ -2852,12 +3217,9 @@ static CtscNode* parse_statement(Parser* p);
  *     fixture (`class C {\n   *\n}`): the `*` method has a zero-width missing
  *     name at the full_start of the following `}` and no parameters / body.
  *
- * Modifiers, decorators, get/set accessors, constructor, index signatures,
- * and plain property / method declarations without a leading `*` are not yet
- * modelled — returns NULL so the caller can advance past the unrecognised
- * token to avoid infinite loops (matches the `skip` fallback previously
- * used by parse_class_declaration_or_expression). Grown alongside fixtures
- * that exercise each branch.
+ * Extended alongside selfhost-derived fixtures: parseModifiers (~8015),
+ * contextual get/set accessors (~8081), and ConstructorKeyword (~8088),
+ * then parsePropertyOrMethodDeclaration (~7835) for the remaining members.
  */
 /*
  * Mirrors upstream/TypeScript/src/compiler/parser.ts parsePropertyDeclaration
@@ -2874,7 +3236,8 @@ static CtscNode* parse_statement(Parser* p);
  * finishNode's end = scanner.getTokenFullStart() AFTER the last consumed
  * token, matching cur_full_start(p) at the return point.
  */
-static CtscNode* parse_property_declaration_rest(Parser* p, int pos, CtscNode* name) {
+static CtscNode* parse_property_declaration_rest(Parser* p, int pos, CtscNode* name,
+                                                 const CtscNodeArray* modifiers_opt) {
     /* parseOptionalToken(ExclamationToken) when no QuestionToken was consumed
      * AND scanner.hasPrecedingLineBreak() is false. ctsc does not yet model
      * the `!` definite-assignment modifier — no active fixture demands it —
@@ -2905,6 +3268,11 @@ static CtscNode* parse_property_declaration_rest(Parser* p, int pos, CtscNode* n
     if (cur(p) == CTSC_SK_SemicolonToken) advance(p);
     int end = cur_full_start(p);
     CtscNode* pd = ctsc_node_new(p->arena, CTSC_SK_PropertyDeclaration, pos, end);
+    if (modifiers_opt) {
+        pd->data.propertyDeclaration.modifiers = *modifiers_opt;
+    } else {
+        ctsc_node_array_init(&pd->data.propertyDeclaration.modifiers);
+    }
     pd->data.propertyDeclaration.name = name;
     pd->data.propertyDeclaration.type = type;
     pd->data.propertyDeclaration.initializer = init;
@@ -2926,14 +3294,36 @@ static CtscNode* parse_class_element(Parser* p) {
         return ctsc_node_new(p->arena, CTSC_SK_SemicolonClassElement, pos, end);
     }
 
+    /* Mirrors upstream parser.ts parseClassElement (~8076): parseModifiers
+     * before dispatching to accessors / constructor / parsePropertyOrMethodDeclaration. */
+    CtscNodeArray modifiers; ctsc_node_array_init(&modifiers);
+    parse_modifiers(p, &modifiers);
+
+    /* parser.ts ~8081-8087: contextual get / set accessors. */
+    if (cur(p) == CTSC_SK_GetKeyword || cur(p) == CTSC_SK_SetKeyword) {
+        CtscSyntaxKind accessor_kind = (cur(p) == CTSC_SK_GetKeyword)
+            ? CTSC_SK_GetAccessor : CTSC_SK_SetAccessor;
+        CtscScanner saved = p->scanner;
+        size_t saved_diag_count = p->diagnostics->count;
+        advance(p);
+        if (token_can_follow_get_or_set(cur(p))) {
+            return parse_accessor_declaration(p, pos, accessor_kind, &modifiers);
+        }
+        p->scanner = saved;
+        ctsc_diag_truncate(p->diagnostics, saved_diag_count);
+    }
+
+    /* parser.ts ~8088-8094: constructor declaration (ConstructorKeyword). */
+    if (cur(p) == CTSC_SK_ConstructorKeyword) {
+        CtscNode* name = make_identifier_from_current(p);
+        return parse_method_declaration_rest(p, pos,
+            false, 0, 0, name, &modifiers);
+    }
+
     /* parsePropertyOrMethodDeclaration (~7835): parseOptionalToken(`*`),
      * parsePropertyName, parseOptionalToken(`?`), then dispatch to
      * parseMethodDeclaration when the next token is `(` / `<` / asteriskToken
-     * was present, otherwise parsePropertyDeclaration. The property-name
-     * starters tracked by parseClassElement (~8102) are identifier-or-keyword,
-     * StringLiteral, NumericLiteral, BigIntLiteral, `*`, and `[` (computed
-     * name). `class A {}` hits none of these and falls through to NULL so
-     * the outer loop terminates on `}` / EOF. */
+     * was present, otherwise parsePropertyDeclaration. */
     CtscSyntaxKind k = cur(p);
     bool is_property_name_start =
         (k == CTSC_SK_AsteriskToken)
@@ -2950,23 +3340,18 @@ static CtscNode* parse_class_element(Parser* p) {
         has_asterisk = true;
         asterisk_pos = cur_full_start(p);
         advance(p); /* `*` */
-        /* parseTokenNode (~2553) records end = scanner.getTokenFullStart()
-         * AFTER nextToken(); mirror that here. */
         asterisk_end = cur_full_start(p);
     }
 
     CtscNode* name = parse_property_name(p);
-    /* parseOptionalToken(QuestionToken) — consumed and discarded (not modelled). */
     if (cur(p) == CTSC_SK_QuestionToken) advance(p);
 
-    /* parser.ts ~7845: asteriskToken OR `(` OR `<` routes to MethodDeclaration. */
     if (has_asterisk || cur(p) == CTSC_SK_OpenParenToken || cur(p) == CTSC_SK_LessThanToken) {
         return parse_method_declaration_rest(p, pos,
-            has_asterisk, asterisk_pos, asterisk_end, name);
+            has_asterisk, asterisk_pos, asterisk_end, name, &modifiers);
     }
 
-    /* Otherwise PropertyDeclaration. */
-    return parse_property_declaration_rest(p, pos, name);
+    return parse_property_declaration_rest(p, pos, name, &modifiers);
 }
 
 /*
@@ -3408,6 +3793,46 @@ static CtscNode* parse_interface_declaration(Parser* p) {
 }
 
 /*
+ * Mirrors upstream/TypeScript/src/compiler/parser.ts parseTypeAliasDeclaration (~8249).
+ * Current token must be TypeKeyword. `decl_start_pos` is the finished node's
+ * `pos` (`export` for `export type ...`, otherwise `type`). When `export_mod`
+ * is non-NULL it points at a modifier list whose only element is the
+ * ExportKeyword spanning the `export` token.
+ */
+static CtscNode* parse_type_alias_declaration(
+    Parser* p, int decl_start_pos, const CtscNodeArray* export_mod) {
+    advance(p); /* `type` */
+    CtscNode* name;
+    if (is_binding_identifier_kind(cur(p))) {
+        name = make_identifier_from_current(p);
+    } else {
+        ctsc_diag_push(p->diagnostics, CTSC_DIAG_ERROR, 1003,
+            cur_start(p), cur_end(p) - cur_start(p),
+            "Identifier expected.");
+        name = make_missing_identifier(p);
+    }
+    CtscNodeArray type_parameters;
+    ctsc_node_array_init(&type_parameters);
+    (void)parse_type_parameters(p, &type_parameters);
+    expect(p, CTSC_SK_EqualsToken);
+    CtscNode* type = parse_type_in_annotation_position(p, true);
+    if (cur(p) == CTSC_SK_SemicolonToken) {
+        advance(p);
+    }
+    int end = cur_full_start(p);
+    CtscNode* n = ctsc_node_new(p->arena, CTSC_SK_TypeAliasDeclaration, decl_start_pos, end);
+    if (export_mod && export_mod->len > 0) {
+        n->data.typeAliasDeclaration.modifiers = *export_mod;
+    } else {
+        ctsc_node_array_init(&n->data.typeAliasDeclaration.modifiers);
+    }
+    n->data.typeAliasDeclaration.name = name;
+    n->data.typeAliasDeclaration.type_parameters = type_parameters;
+    n->data.typeAliasDeclaration.type = type;
+    return n;
+}
+
+/*
  * Mirrors upstream/TypeScript/src/compiler/parser.ts parseEnumDeclaration (~8275):
  *     parseExpected(EnumKeyword);
  *     const name = parseIdentifier();
@@ -3750,17 +4175,33 @@ static CtscNode* parse_module_declaration(Parser* p) {
  * `finally`; TryStatement.end = 30 (finishNode = scanner.getTokenFullStart()
  * at return time = EOF full_start).
  *
- * ctsc does not yet model CatchClause; no currently-unlocked fixture
- * exercises `catch`. When a fixture demands it, add CatchClause parsing
- * here (mirrors parseCatchClause ~7097) and populate tryStatement.catchClause.
+ * parseCatchClause (~7097) populates tryStatement.catchClause when the token
+ * after the try block is `catch`.
  */
+static CtscNode* parse_catch_clause(Parser* p) {
+    int pos = cur_full_start(p);
+    expect(p, CTSC_SK_CatchKeyword);
+    CtscNode* variableDeclaration = NULL;
+    if (accept(p, CTSC_SK_OpenParenToken)) {
+        variableDeclaration = parse_variable_declaration(p);
+        expect(p, CTSC_SK_CloseParenToken);
+    }
+    CtscNode* block = parse_block_or_missing(p);
+    int end = block ? block->end : cur_full_start(p);
+    CtscNode* cc = ctsc_node_new(p->arena, CTSC_SK_CatchClause, pos, end);
+    cc->data.catchClause.variableDeclaration = variableDeclaration;
+    cc->data.catchClause.block = block;
+    return cc;
+}
+
 static CtscNode* parse_try_statement(Parser* p) {
     int pos = cur_full_start(p);
     expect(p, CTSC_SK_TryKeyword);
     CtscNode* tryBlock = parse_block_or_missing(p);
     CtscNode* catchClause = NULL;
-    /* parseCatchClause not yet implemented; a `catch` here is absorbed by
-     * parse_statement's TryKeyword dispatch recovery on subsequent fixtures. */
+    if (cur(p) == CTSC_SK_CatchKeyword) {
+        catchClause = parse_catch_clause(p);
+    }
     CtscNode* finallyBlock = NULL;
     if (!catchClause || cur(p) == CTSC_SK_FinallyKeyword) {
         /* parseExpected(FinallyKeyword, Diagnostics.catch_or_finally_expected). */
@@ -3998,12 +4439,30 @@ static CtscNode* parse_identifier_or_pattern(Parser* p) {
  *   - optional `: Type` annotation consumed via parse_type_annotation so the
  *     Parameter.end extends through it (Parameter end = finishNode's end =
  *     scanner.getTokenFullStart() after the last consumed sub-node).
- *   - optional `= Initializer` skipped for now (no unlocked fixture needs it;
- *     the 107_parserErrorRecovery_ParameterList5.ts fixture ends before any
- *     initializer could appear).
+ *   - optional `= Initializer` via parseInitializer (~5065): parseOptional
+ *     (EqualsToken) + parseAssignmentExpressionOrHigher — mirrors parser.ts
+ *     parseParameterWorker (~4077-4083). Needed for class/function default
+ *     parameters (emitter/selfhost-derived/85_class_default_params.ts).
  */
+/*
+ * Mirrors upstream/TypeScript/src/compiler/parser.ts parseModifiers for the
+ * subset valid on parameter properties (utilitiesPublic.ts
+ * ModifierFlags.ParameterPropertyModifier).
+ */
+static bool is_parameter_property_modifier_start(CtscSyntaxKind k) {
+    return k == CTSC_SK_PublicKeyword
+        || k == CTSC_SK_PrivateKeyword
+        || k == CTSC_SK_ProtectedKeyword
+        || k == CTSC_SK_ReadonlyKeyword;
+}
+
 static CtscNode* parse_parameter(Parser* p) {
     int fs = cur_full_start(p);
+    bool is_parameter_property = false;
+    while (is_parameter_property_modifier_start(cur(p))) {
+        is_parameter_property = true;
+        advance(p);
+    }
     bool has_ddd = false;
     int ddd_pos = 0, ddd_end = 0;
     if (cur(p) == CTSC_SK_DotDotDotToken) {
@@ -4030,13 +4489,20 @@ static CtscNode* parse_parameter(Parser* p) {
      * running after every sub-parse). */
     CtscNode* type = parse_type_annotation(p);
     int end = type ? type->end : (q_end >= 0 ? q_end : name->end);
+    CtscNode* initializer = NULL;
+    if (accept(p, CTSC_SK_EqualsToken)) {
+        /* Mirrors upstream parser.ts parseInitializer (~5065). */
+        initializer = parse_assignment_expression(p);
+        if (initializer) end = initializer->end;
+    }
     CtscNode* pm = ctsc_node_new(p->arena, CTSC_SK_Parameter, fs, end);
     pm->data.parameter.name = name;
     pm->data.parameter.type = type;
-    pm->data.parameter.initializer = NULL;
+    pm->data.parameter.initializer = initializer;
     pm->data.parameter.has_dot_dot_dot = has_ddd;
     pm->data.parameter.dot_dot_dot_pos = ddd_pos;
     pm->data.parameter.dot_dot_dot_end = ddd_end;
+    pm->data.parameter.is_parameter_property = is_parameter_property;
     return pm;
 }
 
@@ -4054,7 +4520,8 @@ static CtscNode* parse_parameter(Parser* p) {
 static void parse_function_signature_and_body(Parser* p,
                                               CtscNodeArray* out_params,
                                               CtscNode** out_body,
-                                              int* out_body_end) {
+                                              int* out_body_end,
+                                              bool is_async_function) {
     /* Mirrors upstream/TypeScript/src/compiler/parser.ts parseParameters
      * (~4150): when parseExpected(OpenParen) fails the function bails out
      * via `return createMissingList<ParameterDeclaration>()` WITHOUT entering
@@ -4097,7 +4564,9 @@ static void parse_function_signature_and_body(Parser* p,
         for (;;) {
             if (cur(p) == CTSC_SK_CloseParenToken) break;
             if (cur(p) == CTSC_SK_EndOfFileToken) break;
-            if (is_binding_identifier_kind(cur(p))) {
+            /* Mirrors isStartOfParameter (~3993): rest (`...`) and binding
+             * patterns `{`/`[` — same as parse_parenthesized_arrow_function. */
+            if (is_start_of_parameter(p)) {
                 int el_fs = cur_full_start(p);
                 CtscNode* pm = parse_parameter(p);
                 if (!pm) break;
@@ -4164,7 +4633,9 @@ static void parse_function_signature_and_body(Parser* p,
     CtscNode* body = NULL;
     int body_end;
     if (cur(p) == CTSC_SK_OpenBraceToken) {
+        if (is_async_function) p->await_context_depth++;
         body = parse_block(p);
+        if (is_async_function) p->await_context_depth--;
         body_end = body->end;
     } else if (can_parse_semicolon_here(p)) {
         accept(p, CTSC_SK_SemicolonToken);
@@ -4186,7 +4657,7 @@ static void parse_function_signature_and_body(Parser* p,
     *out_body_end = body_end;
 }
 
-static CtscNode* parse_function_declaration(Parser* p) {
+static CtscNode* parse_function_declaration(Parser* p, bool is_async) {
     int fs = cur_full_start(p);
     advance(p); /* function */
     /* Mirrors upstream/TypeScript/src/compiler/parser.ts parseFunctionDeclaration
@@ -4202,9 +4673,8 @@ static CtscNode* parse_function_declaration(Parser* p) {
      * (~2684 -> createIdentifier ~2619), which materialises a zero-width
      * missing Identifier when the current token is not a BindingIdentifier
      * (see the 106_parserEqualsGreaterThanAfterFunction1.ts fixture:
-     * `function =>` → name pos=end=fullStart(`=>`)). We don't model the
-     * `export default` (parseOptionalBindingIdentifier) path yet — no
-     * currently-unlocked fixture exercises it. */
+     * `function =>` → name pos=end=fullStart(`=>`)). Anonymous `export default
+     * function ()` (parseOptionalBindingIdentifier) is not modelled yet. */
     if (cur(p) == CTSC_SK_AsteriskToken) {
         advance(p);
     }
@@ -4228,12 +4698,18 @@ static CtscNode* parse_function_declaration(Parser* p) {
     } else {
         name = make_missing_identifier(p);
     }
+    /* parser.ts parseFunctionDeclaration (~7743): typeParameters before parameters. */
+    CtscNodeArray type_parameters;
+    ctsc_node_array_init(&type_parameters);
+    (void)parse_type_parameters(p, &type_parameters);
     CtscNodeArray params;
     CtscNode* body;
     int body_end;
-    parse_function_signature_and_body(p, &params, &body, &body_end);
+    parse_function_signature_and_body(p, &params, &body, &body_end, is_async);
     CtscNode* fn = ctsc_node_new(p->arena, CTSC_SK_FunctionDeclaration, fs, body_end);
+    fn->data.functionDeclaration.has_async = is_async;
     fn->data.functionDeclaration.name = name;
+    fn->data.functionDeclaration.type_parameters = type_parameters;
     fn->data.functionDeclaration.parameters = params;
     fn->data.functionDeclaration.body = body;
     return fn;
@@ -4284,15 +4760,19 @@ static CtscNode* parse_function_expression(Parser* p) {
     if (is_binding_identifier_kind(cur(p))) {
         name = make_identifier_from_current(p);
     }
+    CtscNodeArray type_parameters;
+    ctsc_node_array_init(&type_parameters);
+    (void)parse_type_parameters(p, &type_parameters);
     CtscNodeArray params;
     CtscNode* body;
     int body_end;
-    parse_function_signature_and_body(p, &params, &body, &body_end);
+    parse_function_signature_and_body(p, &params, &body, &body_end, false);
     CtscNode* fn = ctsc_node_new(p->arena, CTSC_SK_FunctionExpression, fs, body_end);
     fn->data.functionDeclaration.has_asterisk = has_asterisk;
     fn->data.functionDeclaration.asterisk_pos = asterisk_pos;
     fn->data.functionDeclaration.asterisk_end = asterisk_end;
     fn->data.functionDeclaration.name = name;
+    fn->data.functionDeclaration.type_parameters = type_parameters;
     fn->data.functionDeclaration.parameters = params;
     fn->data.functionDeclaration.body = body;
     return fn;
@@ -4831,7 +5311,23 @@ static CtscNode* parse_statement(Parser* p) {
             if (is_let_declaration(p)) return parse_variable_statement(p);
             break;
         case CTSC_SK_FunctionKeyword:
-            return parse_function_declaration(p);
+            return parse_function_declaration(p, false);
+        case CTSC_SK_AsyncKeyword: {
+            /* Mirrors upstream parser.ts parseStatement (~7305): AsyncKeyword may
+             * start `async function ...` (parseFunctionDeclaration with AsyncKeyword). */
+            int async_fs = cur_full_start(p);
+            CtscScanner saved = p->scanner;
+            advance(p);
+            if (!p->scanner.current.has_preceding_line_break && cur(p) == CTSC_SK_FunctionKeyword) {
+                CtscNode* fn = parse_function_declaration(p, true);
+                if (fn && fn->kind == CTSC_SK_FunctionDeclaration) {
+                    fn->pos = async_fs;
+                }
+                return fn;
+            }
+            p->scanner = saved;
+            break;
+        }
         /* Mirrors upstream/TypeScript/src/compiler/parser.ts parseStatement
          * (~7445-7457): ExportKeyword routes to parseDeclaration when
          * isStartOfDeclaration() is true. parseDeclarationWorker (~7514-7515)
@@ -4842,13 +5338,42 @@ static CtscNode* parse_statement(Parser* p) {
             int export_pos = cur_full_start(p);
             CtscScanner saved = p->scanner;
             advance(p); /* export */
+            bool export_async = false;
+            bool is_default_export = false;
+            /* Mirrors upstream parser.ts parseDeclaration (~7530-7535):
+             * `export default` → parseExportAssignment (~8736); for
+             * `export default function ...` the assignment expression is a
+             * function, which we model as FunctionDeclaration + has_export_default. */
+            if (cur(p) == CTSC_SK_DefaultKeyword && !p->scanner.current.has_preceding_line_break) {
+                advance(p); /* default */
+                is_default_export = true;
+            }
+            if (is_default_export) {
+                if (cur(p) == CTSC_SK_AsyncKeyword && !p->scanner.current.has_preceding_line_break) {
+                    advance(p);
+                    export_async = true;
+                }
+            } else {
+                if (cur(p) == CTSC_SK_AsyncKeyword && !p->scanner.current.has_preceding_line_break) {
+                    advance(p);
+                    export_async = true;
+                }
+            }
             if (cur(p) == CTSC_SK_FunctionKeyword) {
-                CtscNode* fn = parse_function_declaration(p);
+                CtscNode* fn = parse_function_declaration(p, export_async);
                 if (fn && fn->kind == CTSC_SK_FunctionDeclaration) {
-                    fn->data.functionDeclaration.has_export = true;
+                    if (is_default_export) {
+                        fn->data.functionDeclaration.has_export_default = true;
+                    } else {
+                        fn->data.functionDeclaration.has_export = true;
+                    }
                     fn->pos = export_pos;
                 }
                 return fn;
+            }
+            if (is_default_export) {
+                p->scanner = saved;
+                break;
             }
             if (cur(p) == CTSC_SK_VarKeyword || cur(p) == CTSC_SK_ConstKeyword
                 || (cur(p) == CTSC_SK_LetKeyword && is_let_declaration(p))) {
@@ -4859,13 +5384,49 @@ static CtscNode* parse_statement(Parser* p) {
                 }
                 return stmt;
             }
-            if (cur(p) == CTSC_SK_ClassKeyword) {
-                CtscNode* cls = parse_class_declaration_or_expression_with_modifiers(
-                    p, CTSC_SK_ClassDeclaration, export_pos, NULL);
-                if (cls && cls->kind == CTSC_SK_ClassDeclaration) {
-                    cls->data.classDeclaration.has_export = true;
+            /* Mirrors upstream parser.ts parseDeclaration (~7536): `export` may be
+             * followed by TS modifier keywords before ClassKeyword, e.g.
+             * `export abstract class C {}` (selfhost-derived 87_export_abstract.ts). */
+            {
+                CtscScanner saved_before_class_mods = p->scanner;
+                CtscNodeArray export_class_mods;
+                ctsc_node_array_init(&export_class_mods);
+                while (is_ts_modifier_keyword(cur(p)) && !p->scanner.current.has_preceding_line_break) {
+                    CtscSyntaxKind mk = cur(p);
+                    int mpos = cur_full_start(p);
+                    advance(p);
+                    int mend = cur_full_start(p);
+                    CtscNode* m = ctsc_node_new(p->arena, mk, mpos, mend);
+                    ctsc_node_array_push(&export_class_mods, p->arena, m);
                 }
-                return cls;
+                if (cur(p) == CTSC_SK_ClassKeyword) {
+                    CtscNode* cls = parse_class_declaration_or_expression_with_modifiers(
+                        p, CTSC_SK_ClassDeclaration, export_pos,
+                        export_class_mods.len > 0 ? &export_class_mods : NULL);
+                    if (cls && cls->kind == CTSC_SK_ClassDeclaration) {
+                        cls->data.classDeclaration.has_export = true;
+                    }
+                    return cls;
+                }
+                p->scanner = saved_before_class_mods;
+            }
+            if (cur(p) == CTSC_SK_EnumKeyword) {
+                CtscNode* en = parse_enum_declaration(p);
+                if (en && en->kind == CTSC_SK_EnumDeclaration) {
+                    en->data.enumDeclaration.has_export = true;
+                    en->pos = export_pos;
+                }
+                return en;
+            }
+            /* Mirrors upstream parser.ts parseDeclaration → parseTypeAliasDeclaration
+             * for `export type Name = ...`. */
+            if (cur(p) == CTSC_SK_TypeKeyword && !p->scanner.current.has_preceding_line_break) {
+                int type_kw_pos = cur_full_start(p);
+                CtscNodeArray export_mods;
+                ctsc_node_array_init(&export_mods);
+                CtscNode* ek = ctsc_node_new(p->arena, CTSC_SK_ExportKeyword, export_pos, type_kw_pos);
+                ctsc_node_array_push(&export_mods, p->arena, ek);
+                return parse_type_alias_declaration(p, export_pos, &export_mods);
             }
             p->scanner = saved;
             break;
@@ -4881,6 +5442,10 @@ static CtscNode* parse_statement(Parser* p) {
              * following token is not a valid identifier the parser emits a
              * zero-width missing Identifier (same error-recovery as tsc). */
             return parse_interface_declaration(p);
+        /* Mirrors upstream parser.ts parseStatement (~7521) → parseDeclaration
+         * (~7467) → parseTypeAliasDeclaration (~8249) for `type Name = ...`. */
+        case CTSC_SK_TypeKeyword:
+            return parse_type_alias_declaration(p, cur_full_start(p), NULL);
         case CTSC_SK_EnumKeyword:
             return parse_enum_declaration(p);
         /* Mirrors upstream/TypeScript/src/compiler/parser.ts parseStatement
@@ -5089,6 +5654,7 @@ CtscParseResult ctsc_parse(const char* src, size_t len, CtscArena* arena) {
     p.diagnostics = r.diagnostics;
     ctsc_scanner_init(&p.scanner, src, len, arena, r.diagnostics);
     p.source_end = (int)p.scanner.source.len;
+    p.await_context_depth = 0;
 
     CtscNode* sf = ctsc_node_new(arena, CTSC_SK_SourceFile, 0, p.source_end);
     ctsc_node_array_init(&sf->data.sourceFile.statements);
