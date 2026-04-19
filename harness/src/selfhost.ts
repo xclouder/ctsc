@@ -148,6 +148,11 @@ async function checkPackage(
   const files: FileResult[] = [];
   await rm(distDir, { recursive: true, force: true });
   await mkdir(distDir, { recursive: true });
+  // ts.transpileModule with target ES2020 emits ESM (`import`/`export`).
+  // For node to resolve relative `import "./foo.js"` between dist files
+  // we need to mark dist as ESM. This is harmless for single-file packages
+  // because their dist/index.js has no relative imports.
+  await writeFile(join(distDir, "package.json"), `{"type":"module"}\n`, "utf8");
 
   let allMatch = true;
 

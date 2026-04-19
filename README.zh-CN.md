@@ -150,6 +150,18 @@ self-host 的价值是暴露 fixture 覆盖不到的**复合 bug**（一个 .ts 
 3. 跑 `npm run loop`（或并行脚本）让 agent 修到过。
 4. 再跑一次 `npm run selfhost`，通常会有新 bug 浮上来 —— 回到第 2 步。
 
+## Milestone 进度
+
+- **M1（单文件 transpile）— 已基本完成 (tag `m1-14-of-15-real-world`)**：
+  15 个 mini-package 中 14 个 `node` 跑得通；11 个对 `tsc` 字节一致；剩
+  下的差异在 pretty-printer 行宽，不影响语义。
+- **M2（多文件 + 模块）— 进行中**：第 16 号 mini-package
+  (`16_multifile/`) 引入 `import { add } from "./math.js"` 形态，立刻
+  暴露出 ctsc 完全没有实现 `import` 声明（之前所有 fixture 都不带
+  `import`）。新增 fixtures 92-96 覆盖 named / default / namespace /
+  type-only / re-export 五种形态；90-91 收尾 union return type bug。
+- **M3（tsconfig + project references）— 待启动**。
+
 ## Phase 路线图
 
 - Phase 0：core（arena / UTF-8 / UTF-16 / hashmap / diagnostic / JSON writer）— **已完成**。
