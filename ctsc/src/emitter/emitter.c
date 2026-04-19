@@ -358,6 +358,218 @@ static int lines_between_positions(const CtscUtf16Buf* src, size_t pos1, size_t 
     return lines;
 }
 
+#define CTSC_MAX_LEADING_COMMENTS 64
+
+typedef struct {
+    size_t pos;
+    size_t end;
+    bool is_block;
+    bool has_trailing_nl;
+} CtscCommentRangeRec;
+
+/*
+ * 0-based line index of `pos` (UTF-16 offset), mirroring
+ * getLineOfLocalPositionFromLineMap (utilities.ts) for emitter use.
+ */
+static int line_of_position(const CtscUtf16Buf* src, size_t pos) {
+    if (!src) return 0;
+    const uint16_t* t = src->data;
+    size_t len = src->len;
+    if (pos > len) pos = len;
+    int line = 0;
+    for (size_t i = 0; i < pos;) {
+        uint16_t c = t[i];
+        if (c == 0x0D) {
+            line++;
+            if (i + 1 < pos && t[i + 1] == 0x0A) i += 2; else i++;
+            continue;
+        }
+        if (c == 0x0A || c == 0x2028 || c == 0x2029) { line++; i++; continue; }
+        i++;
+    }
+    return line;
+}
+
+static bool is_white_space_like_u16_emitter(uint16_t ch) {
+    if (ch < 128) {
+        return ch == 0x09 || ch == 0x0B || ch == 0x0C || ch == 0x20;
+    }
+    return ch == 0x00A0 || ch == 0x0085 || ch == 0x1680
+        || (ch >= 0x2000 && ch <= 0x200B) || ch == 0x202F || ch == 0x205F
+        || ch == 0x3000 || ch == 0xFEFF;
+}
+
+/*
+ * Mirrors upstream/TypeScript/src/compiler/scanner.ts iterateCommentRanges
+ * (~826) in reduce mode: getLeadingCommentRanges (scanner.ts ~957).
+ */
+static size_t collect_leading_comment_ranges(
+    const CtscUtf16Buf* src,
+    size_t pos_in,
+    CtscCommentRangeRec* out,
+    size_t max_out) {
+    if (!src || max_out == 0) return 0;
+    const uint16_t* t = src->data;
+    size_t len = src->len;
+    size_t pos = pos_in;
+    if (pos > len) return 0;
+
+    bool collecting = false;
+    if (pos == 0) {
+        collecting = true;
+        if (len >= 2 && t[0] == '#' && t[1] == '!') {
+            while (pos < len && !is_line_break_u16(t[pos])) pos++;
+        }
+    }
+
+    size_t out_count = 0;
+    size_t pending_pos = 0;
+    size_t pending_end = 0;
+    bool pending_block = false;
+    bool pending_has_trailing_nl = false;
+    bool has_pending = false;
+
+    while (pos < len) {
+        uint16_t ch = t[pos];
+        if (ch == 0x0D) {
+            if (pos + 1 < len && t[pos + 1] == 0x0A) pos += 2; else pos++;
+            collecting = true;
+            if (has_pending) pending_has_trailing_nl = true;
+            continue;
+        }
+        if (ch == 0x0A || ch == 0x2028 || ch == 0x2029) {
+            pos++;
+            collecting = true;
+            if (has_pending) pending_has_trailing_nl = true;
+            continue;
+        }
+        if (ch == 0x09 || ch == 0x0B || ch == 0x0C || ch == 0x20) { pos++; continue; }
+        if (ch == 0xFEFF) { pos++; continue; }
+        if (ch > 127 && is_white_space_like_u16_emitter(ch)) {
+            pos++;
+            continue;
+        }
+        if (ch == '/' && pos + 1 < len && (t[pos + 1] == '/' || t[pos + 1] == '*')) {
+            bool is_block = t[pos + 1] == '*';
+            size_t start_pos = pos;
+            pos += 2;
+            bool has_trailing_nl = false;
+            if (!is_block) {
+                while (pos < len && !is_line_break_u16(t[pos])) pos++;
+                if (pos < len) has_trailing_nl = true;
+            } else {
+                while (pos + 1 < len && !(t[pos] == '*' && t[pos + 1] == '/')) pos++;
+                if (pos + 1 < len) pos += 2;
+                size_t scan = pos;
+                while (scan < len) {
+                    uint16_t d = t[scan];
+                    if (is_line_break_u16(d)) { has_trailing_nl = true; break; }
+                    if (d == 0x09 || d == 0x0B || d == 0x0C || d == 0x20) { scan++; continue; }
+                    break;
+                }
+            }
+            if (collecting) {
+                if (has_pending) {
+                    if (out_count < max_out) {
+                        out[out_count].pos = pending_pos;
+                        out[out_count].end = pending_end;
+                        out[out_count].is_block = pending_block;
+                        out[out_count].has_trailing_nl = pending_has_trailing_nl;
+                        out_count++;
+                    } else {
+                        return out_count;
+                    }
+                }
+                pending_pos = start_pos;
+                pending_end = pos;
+                pending_block = is_block;
+                pending_has_trailing_nl = has_trailing_nl;
+                has_pending = true;
+            }
+            continue;
+        }
+        break;
+    }
+    if (has_pending && out_count < max_out) {
+        out[out_count].pos = pending_pos;
+        out[out_count].end = pending_end;
+        out[out_count].is_block = pending_block;
+        out[out_count].has_trailing_nl = pending_has_trailing_nl;
+        out_count++;
+    }
+    return out_count;
+}
+
+/*
+ * Mirrors upstream utilities.ts emitDetachedComments (~7012) for the
+ * SourceFile statements list: copyright-style comments separated by at least
+ * one blank line from the first statement are emitted before emitList.
+ * Selfhost-derived 91_union_type_alias_object.ts (leading `//` header before
+ * elided `type` aliases).
+ */
+/*
+ * When `emit_detached_comments` returns true, `*out_last_detached_comment_src_end`
+ * is set to the UTF-16 index that `collect_leading_comment_ranges` stores as
+ * `.end` on the last detached range (same as TS CommentRange.end for //-:
+ * the first line-break code unit after the comment text). Callers resume
+ * leading-comment emission from that index (emitter.ts ~6128).
+ */
+static bool emit_detached_comments(Emitter* e, size_t statements_node_pos, size_t* out_last_detached_comment_src_end) {
+    if (!e->source) return false;
+    const CtscUtf16Buf* src = e->source;
+    CtscCommentRangeRec leading[CTSC_MAX_LEADING_COMMENTS];
+    size_t n_leading = collect_leading_comment_ranges(
+        src, statements_node_pos, leading, CTSC_MAX_LEADING_COMMENTS);
+    if (n_leading == 0) return false;
+
+    CtscCommentRangeRec detached[CTSC_MAX_LEADING_COMMENTS];
+    size_t n_detached = 0;
+    for (size_t i = 0; i < n_leading; i++) {
+        if (n_detached > 0) {
+            int last_line = line_of_position(src, detached[n_detached - 1].end);
+            int comment_line = line_of_position(src, leading[i].pos);
+            if (comment_line >= last_line + 2) break;
+        }
+        detached[n_detached++] = leading[i];
+    }
+    if (n_detached == 0) return false;
+
+    size_t last_detached_end = detached[n_detached - 1].end;
+    if (out_last_detached_comment_src_end) {
+        *out_last_detached_comment_src_end = last_detached_end;
+    }
+    int last_comment_line = line_of_position(src, last_detached_end);
+    size_t after_trivia = skip_trivia_u16(src, statements_node_pos);
+    int node_line = line_of_position(src, after_trivia);
+    if (node_line < last_comment_line + 2) return false;
+
+    /* emitNewLineBeforeLeadingComments (utilities.ts ~6938) */
+    if (statements_node_pos != detached[0].pos
+        && line_of_position(src, statements_node_pos)
+            != line_of_position(src, detached[0].pos)) {
+        write_raw_newline(e);
+    }
+
+    /* emitComments (utilities.ts ~6963), leadingSeparator=false, trailingSeparator=true */
+    bool emit_intervening_sep = false;
+    for (size_t i = 0; i < n_detached; i++) {
+        if (emit_intervening_sep) {
+            write_char(e, ' ');
+            emit_intervening_sep = false;
+        }
+        write_u16(e, src->data + detached[i].pos, detached[i].end - detached[i].pos);
+        if (detached[i].has_trailing_nl) {
+            write_raw_newline(e);
+        } else {
+            emit_intervening_sep = true;
+        }
+    }
+    if (emit_intervening_sep) {
+        write_char(e, ' ');
+    }
+    return true;
+}
+
 /*
  * Mirrors upstream/TypeScript/src/compiler/emitter.ts getLinesBetweenNodes
  * (~5196): without preserveSourceNewlines (the transpileModule default) tsc
@@ -366,6 +578,8 @@ static int lines_between_positions(const CtscUtf16Buf* src, size_t pos1, size_t 
  * That is sufficient for the cascade in 105_parserGreaterThanTokenAmbiguity4.
  */
 static void emit(Emitter* e, const CtscNode* n);
+static void emit_named_import_bindings_value_only(Emitter* e, const CtscNode* nb);
+static void emit_import_clause_js(Emitter* e, const CtscNode* clause);
 
 /*
  * Mirrors upstream/TypeScript/src/compiler/transformers/ts.ts
@@ -386,6 +600,33 @@ static void emit(Emitter* e, const CtscNode* n);
  * future fixture unlocks `declare function` / `declare class` / etc., mirror
  * the same flag on those statement data structs and extend this predicate.
  */
+static bool named_import_bindings_has_value_specifier(const CtscNode* nb) {
+    if (!nb) return false;
+    if (nb->kind == CTSC_SK_NamespaceImport) return true;
+    if (nb->kind != CTSC_SK_NamedImports) return false;
+    const CtscNodeArray* el = &nb->data.namedImports.elements;
+    for (size_t i = 0; i < el->len; i++) {
+        CtscNode* sp = el->items[i];
+        if (sp->kind == CTSC_SK_ImportSpecifier && !sp->data.importSpecifier.is_type_only) return true;
+    }
+    return false;
+}
+
+/*
+ * Mirrors upstream/TypeScript/src/compiler/transformers/ts.ts visitImportDeclaration
+ * (~2259-2280): elide `import type ...` and imports whose clause has no value
+ * bindings after stripping inline `type` specifiers (visitImportSpecifier ~2319).
+ */
+static bool source_file_import_declaration_is_elided(const CtscNode* s) {
+    if (s->kind != CTSC_SK_ImportDeclaration) return false;
+    const CtscNode* clause = s->data.importDeclaration.importClause;
+    if (!clause) return false;
+    if (clause->kind != CTSC_SK_ImportClause) return false;
+    if (clause->data.importClause.is_type_only) return true;
+    if (clause->data.importClause.name) return false;
+    return !named_import_bindings_has_value_specifier(clause->data.importClause.namedBindings);
+}
+
 static bool source_file_statement_is_dropped(const CtscNode* s) {
     if (!s) return true;
     if (s->kind == CTSC_SK_FunctionDeclaration
@@ -402,6 +643,10 @@ static bool source_file_statement_is_dropped(const CtscNode* s) {
     /* Mirrors upstream transformers/ts.ts visitTypeScript (~643): TypeAliasDeclaration
      * is elided (createNotEmittedStatement); transpileModule emits no JS for it. */
     if (s->kind == CTSC_SK_TypeAliasDeclaration) return true;
+    if (source_file_import_declaration_is_elided(s)) return true;
+    /* Mirrors upstream transformers/ts.ts visitExportDeclaration (~2341):
+     * `export type { ... } from` is elided entirely. */
+    if (s->kind == CTSC_SK_ExportDeclaration && s->data.exportDeclaration.is_type_only) return true;
     return false;
 }
 
@@ -947,6 +1192,18 @@ static void emit(Emitter* e, const CtscNode* n) {
              * entire content is leading trivia (statements.len == 0) we
              * replay at `statements_end` instead, mirroring the trailing
              * emitLeadingComments call at `detachedRange.end` (~5944). */
+            /* emitBodyWithDetachedComments (emitter.ts ~5922): emitDetachedComments
+             * (utilities.ts ~7012) on the statements list before emitSourceFileWorker.
+             * Uses the first statement's pos (NodeArray.pos), not the first *emitted*
+             * statement — otherwise a leading copyright block before elided `type`
+             * aliases is never replayed (selfhost-derived 91_union_type_alias_object.ts).
+             */
+            size_t last_detached_comment_src_end = 0;
+            bool detached_wrote = false;
+            if (ss->len > 0) {
+                detached_wrote = emit_detached_comments(
+                    e, (size_t)ss->items[0]->pos, &last_detached_comment_src_end);
+            }
             /* Skip leading statements that the TS-to-JS transformer
              * replaces with NotEmittedStatement (see
              * source_file_statement_is_dropped). emitLeadingComments at
@@ -961,10 +1218,56 @@ static void emit(Emitter* e, const CtscNode* n) {
             }
             if (first_emitted < ss->len) {
                 size_t leading_pos = (size_t)ss->items[first_emitted]->pos;
-                emit_source_file_leading_comments(e, leading_pos);
+                /*
+                 * When the first emitted node spans pos=0 (leading trivia of its
+                 * first token starts at the beginning of the file), the detached
+                 * pass and emit_source_file_leading_comments would both replay
+                 * the same header (utilities.ts emitDetachedComments vs
+                 * emitLeadingComments). Skip the second pass if detached already
+                 * wrote (selfhost-derived 92_import_named.ts). When leading_pos > 0
+                 * (e.g. elided type aliases before `export` in 91_union_type_alias_object.ts)
+                 * the leading replay is still needed for the non-detached case.
+                 */
+                if (!detached_wrote || leading_pos != 0) {
+                    emit_source_file_leading_comments(e, leading_pos);
+                } else if (e->source) {
+                    /*
+                     * Detached comments at pos 0 suppress emit_source_file_leading_comments
+                     * to avoid duplicate headers (selfhost-derived 92_import_named.ts).
+                     * Mirror forEachLeadingCommentWithoutDetachedComments (emitter.ts ~6128):
+                     * resume leading-comment iteration from last(detachedComments).end.
+                     * iterateCommentRanges consumes intervening line breaks without writing
+                     * them (scanner.ts ~850), so a blank line in the source between the
+                     * detached header and the first statement is not replayed (tsc
+                     * transpileModule output for selfhost-derived 93_import_default.ts).
+                     */
+                    emit_source_file_leading_comments(e, last_detached_comment_src_end);
+                }
             } else if (ss->len == 0) {
                 emit_source_file_leading_comments(
                     e, (size_t)n->data.sourceFile.statements_end);
+            }
+            /* After utilities.ts emitDetachedComments, tsc's emitList still
+             * inserts a line break before the first emitted JS when every
+             * intervening statement is an elided type alias (the printer's
+             * writeLine chain collapses while skipping NotEmittedStatement
+             * nodes, but the blank line before the first `export` must still
+             * appear once detached comments were emitted). Without this,
+             * selfhost-derived 91_union_type_alias_object.ts loses the blank
+             * line between the header and `export function`. Do not run when
+             * the prefix includes `interface` (61_optional_chain.ts) or when
+             * no detached block was written (89_type_alias_erase.ts). */
+            if (detached_wrote && first_emitted > 0) {
+                bool only_elided_type_aliases = true;
+                for (size_t j = 0; j < first_emitted; j++) {
+                    if (ss->items[j]->kind != CTSC_SK_TypeAliasDeclaration) {
+                        only_elided_type_aliases = false;
+                        break;
+                    }
+                }
+                if (only_elided_type_aliases) {
+                    write_raw_newline(e);
+                }
             }
             for (size_t i = 0; i < ss->len; ++i) {
                 if (source_file_statement_is_dropped(ss->items[i])) continue;
@@ -2566,8 +2869,162 @@ static void emit(Emitter* e, const CtscNode* n) {
         case CTSC_SK_ExpressionWithTypeArguments:
             emit(e, n->data.expressionWithTypeArguments.expression);
             return;
+        /*
+         * Mirrors upstream/TypeScript/src/compiler/emitter.ts emitImportDeclaration
+         * (~3688), emitImportClause (~3705), emitNamedImports (~3726),
+         * emitImportSpecifier (~3730).
+         */
+        case CTSC_SK_ImportDeclaration:
+            write_cstr(e, "import ");
+            if (n->data.importDeclaration.importClause) {
+                emit_import_clause_js(e, n->data.importDeclaration.importClause);
+                write_cstr(e, " from ");
+            }
+            emit(e, n->data.importDeclaration.moduleSpecifier);
+            write_char(e, ';');
+            return;
+        case CTSC_SK_ImportClause:
+            emit_import_clause_js(e, n);
+            return;
+        case CTSC_SK_NamedImports: {
+            const CtscNodeArray* el = &n->data.namedImports.elements;
+            if (el->len == 0) {
+                write_cstr(e, "{}");
+            } else {
+                write_cstr(e, "{ ");
+                emit_list(e, el, ", ");
+                write_cstr(e, " }");
+            }
+            return;
+        }
+        case CTSC_SK_NamespaceImport:
+            write_char(e, '*');
+            write_cstr(e, " as ");
+            emit(e, n->data.namespaceImport.name);
+            return;
+        case CTSC_SK_ImportSpecifier:
+            if (n->data.importSpecifier.propertyName) {
+                emit(e, n->data.importSpecifier.propertyName);
+                write_cstr(e, " as ");
+            }
+            emit(e, n->data.importSpecifier.name);
+            return;
+        /*
+         * emitExportDeclaration (~3753); `export * as ns from` lowers via
+         * transformers/module/esnextAnd2015.ts visitExportDeclaration (~331)
+         * when module kind is ES2015 (transpileModule default).
+         */
+        case CTSC_SK_ExportDeclaration: {
+            const CtscExportDeclarationData* d = &n->data.exportDeclaration;
+            if (d->export_clause && d->export_clause->kind == CTSC_SK_NamespaceExport && d->module_specifier) {
+                const CtscNode* export_name = d->export_clause->data.namespaceExport.name;
+                write_cstr(e, "import * as ");
+                write_u16(e, export_name->data.identifier.text, export_name->data.identifier.text_len);
+                write_cstr(e, "_1 from ");
+                emit(e, d->module_specifier);
+                write_cstr(e, ";\nexport { ");
+                write_u16(e, export_name->data.identifier.text, export_name->data.identifier.text_len);
+                write_cstr(e, "_1 as ");
+                emit(e, export_name);
+                write_cstr(e, " };");
+                return;
+            }
+            write_cstr(e, "export ");
+            if (d->export_clause) {
+                emit(e, d->export_clause);
+            } else {
+                write_cstr(e, "*");
+            }
+            if (d->module_specifier) {
+                write_cstr(e, " from ");
+                emit(e, d->module_specifier);
+            }
+            write_char(e, ';');
+            return;
+        }
+        case CTSC_SK_NamedExports: {
+            const CtscNodeArray* el = &n->data.namedExports.elements;
+            if (el->len == 0) {
+                write_cstr(e, "{}");
+            } else {
+                write_cstr(e, "{ ");
+                emit_list(e, el, ", ");
+                write_cstr(e, " }");
+            }
+            return;
+        }
+        case CTSC_SK_ExportSpecifier:
+            if (n->data.exportSpecifier.propertyName) {
+                emit(e, n->data.exportSpecifier.propertyName);
+                write_cstr(e, " as ");
+            }
+            emit(e, n->data.exportSpecifier.name);
+            return;
+        case CTSC_SK_NamespaceExport:
+            write_char(e, '*');
+            write_cstr(e, " as ");
+            emit(e, n->data.namespaceExport.name);
+            return;
         default:
             return;
+    }
+}
+
+/*
+ * Mirrors transformers/ts.ts visitNamedImportBindings / visitImportSpecifier
+ * (~2301-2320): emit only value specifiers (strip `type` in `{ value, type T }`).
+ */
+static void emit_named_import_bindings_value_only(Emitter* e, const CtscNode* nb) {
+    if (nb->kind == CTSC_SK_NamespaceImport) {
+        emit(e, nb);
+        return;
+    }
+    const CtscNodeArray* el = &nb->data.namedImports.elements;
+    size_t count = 0;
+    for (size_t i = 0; i < el->len; i++) {
+        CtscNode* sp = el->items[i];
+        if (sp->kind == CTSC_SK_ImportSpecifier && !sp->data.importSpecifier.is_type_only) count++;
+    }
+    if (count == 0) {
+        write_cstr(e, "{}");
+        return;
+    }
+    write_cstr(e, "{ ");
+    bool first = true;
+    for (size_t i = 0; i < el->len; i++) {
+        CtscNode* sp = el->items[i];
+        if (sp->kind != CTSC_SK_ImportSpecifier || sp->data.importSpecifier.is_type_only) continue;
+        if (!first) write_cstr(e, ", ");
+        first = false;
+        emit(e, sp);
+    }
+    write_cstr(e, " }");
+}
+
+/* Mirrors emitter.ts emitImportClause (~3705) after the elision transformer. */
+static void emit_import_clause_js(Emitter* e, const CtscNode* clause) {
+    const CtscImportClauseData* c = &clause->data.importClause;
+    if (c->name) {
+        emit(e, c->name);
+        if (c->namedBindings) {
+            if (c->namedBindings->kind == CTSC_SK_NamedImports) {
+                size_t vc = 0;
+                const CtscNodeArray* el = &c->namedBindings->data.namedImports.elements;
+                for (size_t j = 0; j < el->len; j++) {
+                    CtscNode* sp = el->items[j];
+                    if (sp->kind == CTSC_SK_ImportSpecifier && !sp->data.importSpecifier.is_type_only) vc++;
+                }
+                if (vc > 0) {
+                    write_cstr(e, ", ");
+                    emit_named_import_bindings_value_only(e, c->namedBindings);
+                }
+            } else {
+                write_cstr(e, ", ");
+                emit(e, c->namedBindings);
+            }
+        }
+    } else if (c->namedBindings) {
+        emit_named_import_bindings_value_only(e, c->namedBindings);
     }
 }
 

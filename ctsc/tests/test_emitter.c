@@ -641,6 +641,23 @@ int test_emitter(void) {
     );
 
     /*
+     * parse_type_in_annotation_position: union of object type literals in a
+     * function return position must consume every `|` branch (parser.ts
+     * parseUnionType ~4876). Otherwise the `{` body is parsed as a top-level
+     * block (emitter/selfhost-derived/90_union_return_type_object.ts).
+     */
+    expect_emit(
+        "export function safeParse(s: string): { ok: true; value: number } | { ok: false; code: string } {\n"
+        "  return { ok: true, value: 1 };\n"
+        "}\n",
+        "export function safeParse(s) {\n"
+        "    return { ok: true, value: 1 };\n"
+        "}\n",
+        "return type union of object literals (90_union_return_type_object)",
+        &failed
+    );
+
+    /*
      * Object spread: parser.ts parseObjectLiteralElement (~6703) +
      * emitter.ts emitSpreadAssignment (~4081). Selfhost-derived 64_object_spread.ts.
      */
@@ -950,6 +967,169 @@ int test_emitter(void) {
         "    return s.kind === \"circle\" ? \"c:\" + s.r : \"s:\" + s.side;\n"
         "}\n",
         "type alias erase (89_type_alias_erase)",
+        &failed
+    );
+
+    /*
+     * emitter.ts emitSourceFile (~4299) → emitBodyWithDetachedComments →
+     * utilities.ts emitDetachedComments (~7012): a copyright-style `//` block
+     * separated by a blank line from the first statement is emitted even when
+     * intervening TypeAliasDeclaration nodes are elided. Matches
+     * fixtures/emitter/selfhost-derived/91_union_type_alias_object.ts.
+     */
+    expect_emit(
+        "// header a\n"
+        "// header b\n"
+        "\n"
+        "type T = number;\n"
+        "export function f() {}\n",
+        "// header a\n"
+        "// header b\n"
+        "\n"
+        "export function f() { }\n",
+        "detached comments before elided type alias (91 pattern)",
+        &failed
+    );
+
+    /*
+     * parser.ts parseImportDeclaration (~8384) + emitter.ts emitImportDeclaration
+     * (~3688). Matches fixtures/emitter/selfhost-derived/92_import_named.ts.
+     */
+    expect_emit(
+        "import { a, b } from \"./m.js\";\n"
+        "import { x, y as z } from \"./n.js\";\n"
+        "export function f(): void {}\n",
+        "import { a, b } from \"./m.js\";\n"
+        "import { x, y as z } from \"./n.js\";\n"
+        "export function f() { }\n",
+        "named imports from string literal (92_import_named)",
+        &failed
+    );
+
+    /*
+     * parser.ts parseImportDeclaration (~8384) + emitter.ts emitImportDeclaration
+     * (~3688), emitNamespaceImport (~3718). Matches
+     * fixtures/emitter/selfhost-derived/93_import_default.ts.
+     */
+    expect_emit(
+        "// Default import + side-effect import + namespace import.\n"
+        "// Each shape must be preserved verbatim under target=ES2020.\n"
+        "\n"
+        "import fs from \"node:fs\";\n"
+        "import * as path from \"node:path\";\n"
+        "import \"./polyfill.js\";\n"
+        "\n"
+        "export function readManifest(dir: string): string {\n"
+        "  return fs.readFileSync(path.join(dir, \"package.json\"), \"utf8\");\n"
+        "}\n",
+        "// Default import + side-effect import + namespace import.\n"
+        "// Each shape must be preserved verbatim under target=ES2020.\n"
+        "import fs from \"node:fs\";\n"
+        "import * as path from \"node:path\";\n"
+        "import \"./polyfill.js\";\n"
+        "export function readManifest(dir) {\n"
+        "    return fs.readFileSync(path.join(dir, \"package.json\"), \"utf8\");\n"
+        "}\n",
+        "default, namespace, and side-effect imports (93_import_default)",
+        &failed
+    );
+
+    /*
+     * parser.ts parseImportClause (~8501) + emitter.ts emitImportDeclaration
+     * (~3688). Matches fixtures/emitter/selfhost-derived/94_import_mixed.ts:
+     * default + named in one clause, and default + namespace import.
+     */
+    expect_emit(
+        "// Mixed default + named import (single declaration), and a separate\n"
+        "// renamed default. Both forms appear in real-world code.\n"
+        "\n"
+        "import React, { useState, useEffect as onEffect } from \"react\";\n"
+        "import defaultExport, * as ns from \"./mod.js\";\n"
+        "\n"
+        "export function init(): void {\n"
+        "  defaultExport();\n"
+        "  ns.boot();\n"
+        "  React.createElement(\"div\", null);\n"
+        "  useState(0);\n"
+        "  onEffect(() => {}, []);\n"
+        "}\n",
+        "// Mixed default + named import (single declaration), and a separate\n"
+        "// renamed default. Both forms appear in real-world code.\n"
+        "import React, { useState, useEffect as onEffect } from \"react\";\n"
+        "import defaultExport, * as ns from \"./mod.js\";\n"
+        "export function init() {\n"
+        "    defaultExport();\n"
+        "    ns.boot();\n"
+        "    React.createElement(\"div\", null);\n"
+        "    useState(0);\n"
+        "    onEffect(() => { }, []);\n"
+        "}\n",
+        "mixed default+named and default+namespace imports (94_import_mixed)",
+        &failed
+    );
+
+    /*
+     * transformers/ts.ts visitImportDeclaration (~2259) + visitImportSpecifier
+     * (~2319) + parser.ts parseImportOrExportSpecifier (~8604). Matches
+     * fixtures/emitter/selfhost-derived/95_import_type_erase.ts.
+     */
+    expect_emit(
+        "// `import type` and `import { type X }` MUST be erased entirely\n"
+        "// (they exist only for type checking). Mixed imports keep the value\n"
+        "// part and erase the type part.\n"
+        "//\n"
+        "// Expected emit (target=ES2020):\n"
+        "//   - line 1 entirely removed\n"
+        "//   - line 2: `import { value } from \"./mod.js\";`  (type Foo dropped)\n"
+        "//   - line 3 entirely removed (no .js side-effect remains either)\n"
+        "\n"
+        "import type { ConfigShape } from \"./types.js\";\n"
+        "import { value, type Helper } from \"./mod.js\";\n"
+        "import { type OnlyTypes } from \"./other.js\";\n"
+        "\n"
+        "export function get(): number {\n"
+        "  return value();\n"
+        "}\n"
+        "\n"
+        "export type Re = ConfigShape | Helper | OnlyTypes;\n",
+        "// `import type` and `import { type X }` MUST be erased entirely\n"
+        "// (they exist only for type checking). Mixed imports keep the value\n"
+        "// part and erase the type part.\n"
+        "//\n"
+        "// Expected emit (target=ES2020):\n"
+        "//   - line 1 entirely removed\n"
+        "//   - line 2: `import { value } from \"./mod.js\";`  (type Foo dropped)\n"
+        "//   - line 3 entirely removed (no .js side-effect remains either)\n"
+        "import { value } from \"./mod.js\";\n"
+        "export function get() {\n"
+        "    return value();\n"
+        "}\n",
+        "import type and inline type import specifiers erased (95_import_type_erase)",
+        &failed
+    );
+
+    /*
+     * parser.ts parseExportDeclaration (~8701) + emitter.ts emitExportDeclaration (~3753);
+     * `export * as ns from` matches transformers/module/esnextAnd2015.ts visitExportDeclaration
+     * (~331). fixtures/emitter/selfhost-derived/96_export_from.ts.
+     */
+    expect_emit(
+        "// Re-export shapes (export-from). All four forms must be preserved\n"
+        "// (only `export type` is erased).\n"
+        "\n"
+        "export { add, mul } from \"./math.js\";\n"
+        "export { default as Engine } from \"./engine.js\";\n"
+        "export * from \"./util.js\";\n"
+        "export * as fmt from \"./format.js\";\n"
+        "export type { Shape } from \"./shape.js\";\n",
+        "// Re-export shapes (export-from). All four forms must be preserved\n"
+        "// (only `export type` is erased).\n"
+        "export { add, mul } from \"./math.js\";\n"
+        "export { default as Engine } from \"./engine.js\";\n"
+        "export * from \"./util.js\";\n"
+        "import * as fmt_1 from \"./format.js\";\n"
+        "export { fmt_1 as fmt };\n",
+        "export-from re-exports + namespace export lowering (96_export_from)",
         &failed
     );
 

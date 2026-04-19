@@ -154,6 +154,7 @@ static CtscNode* parse_block(Parser* p);
 static CtscNode* parse_parameter(Parser* p);
 static CtscNode* parse_type_annotation(Parser* p);
 static void skip_type_in_type_parameter_position(Parser* p);
+static CtscNode* consume_type_via_fallback_scan(Parser* p, bool allow_multiline);
 static void consume_postfix_type_operators(Parser* p);
 static CtscNode* parse_class_declaration_or_expression(Parser* p, CtscSyntaxKind kind);
 static CtscNode* parse_class_declaration_or_expression_with_modifiers(
@@ -2703,6 +2704,57 @@ static void consume_postfix_type_operators(Parser* p) {
     }
 }
 
+/* Stop-set scan for types that are not modelled as full TypeNodes yet.
+ * Leading `{ ... }` unions call this after each `|` when the RHS is not an
+ * object type literal (mirrors parser.ts parseUnionType ~4876). */
+static CtscNode* consume_type_via_fallback_scan(Parser* p, bool allow_multiline) {
+    /* Unknown (e.g. a stray '\\') always terminates at any depth: mirrors tsc's
+     * parseTypeReference flow for `var v: X<T \\` (106_parserSkippedTokens20.ts). */
+    int fs = cur_full_start(p);
+    int brace_depth = 0;
+    int bracket_depth = 0;
+    int paren_depth = 0;
+    int angle_depth = 0;
+    bool after_top_level_bracket = false;
+    CtscSyntaxKind last_consumed_kind = CTSC_SK_Unknown;
+    while (cur(p) != CTSC_SK_EndOfFileToken) {
+        CtscSyntaxKind k = cur(p);
+        if (k == CTSC_SK_Unknown) break;
+        if (brace_depth == 0 && bracket_depth == 0 && paren_depth == 0 && angle_depth == 0) {
+            if (after_top_level_bracket && k == CTSC_SK_OpenBraceToken) {
+                break;
+            }
+            if (after_top_level_bracket && k != CTSC_SK_OpenBraceToken) {
+                after_top_level_bracket = false;
+            }
+            if (k == CTSC_SK_EqualsToken || k == CTSC_SK_CommaToken
+                || k == CTSC_SK_SemicolonToken
+                || k == CTSC_SK_CloseParenToken || k == CTSC_SK_CloseBracketToken
+                || k == CTSC_SK_CloseBraceToken
+                || (k == CTSC_SK_OpenBraceToken && last_consumed_kind != CTSC_SK_BarToken)) {
+                break;
+            }
+            if (p->scanner.current.has_preceding_line_break && !allow_multiline) break;
+        }
+        if (k == CTSC_SK_OpenBraceToken) brace_depth++;
+        else if (k == CTSC_SK_CloseBraceToken) { if (brace_depth == 0) break; brace_depth--; }
+        else if (k == CTSC_SK_OpenBracketToken) bracket_depth++;
+        else if (k == CTSC_SK_CloseBracketToken) {
+            if (bracket_depth == 0) break;
+            bracket_depth--;
+            if (bracket_depth == 0) after_top_level_bracket = true;
+        }
+        else if (k == CTSC_SK_OpenParenToken) paren_depth++;
+        else if (k == CTSC_SK_CloseParenToken) { if (paren_depth == 0) break; paren_depth--; }
+        else if (k == CTSC_SK_LessThanToken) angle_depth++;
+        else if (k == CTSC_SK_GreaterThanToken && angle_depth > 0) angle_depth--;
+        advance(p);
+        last_consumed_kind = k;
+    }
+    int end = cur_full_start(p);
+    return ctsc_node_new(p->arena, CTSC_SK_TypeReference, fs, end);
+}
+
 /*
  * Parses a Type after `:` (annotations) or `=` (type aliases). When
  * `allow_multiline` is false, a line break at the top level terminates the
@@ -2717,6 +2769,19 @@ static CtscNode* parse_type_in_annotation_position(Parser* p, bool allow_multili
     if (cur(p) == CTSC_SK_OpenBraceToken) {
         CtscNode* tl = parse_type_literal(p);
         consume_postfix_type_operators(p);
+        /* Union of object types (`{ a: 1 } | { b: 2 }`) — must not stop after
+         * the first `}` or the function `{` body is misparsed as a top-level
+         * block (emitter/selfhost-derived/90_union_return_type_object.ts). */
+        while (!p->scanner.current.has_preceding_line_break
+               && cur(p) == CTSC_SK_BarToken) {
+            advance(p); /* `|` */
+            if (cur(p) == CTSC_SK_OpenBraceToken) {
+                (void)parse_type_literal(p);
+                consume_postfix_type_operators(p);
+            } else {
+                (void)consume_type_via_fallback_scan(p, allow_multiline);
+            }
+        }
         tl->end = cur_full_start(p);
         return tl;
     }
@@ -2843,75 +2908,9 @@ static CtscNode* parse_type_in_annotation_position(Parser* p, bool allow_multili
         p->scanner = saved;
         ctsc_diag_truncate(p->diagnostics, saved_diag_count);
     }
-    /* Fallback: consume a minimal "type expression" by scanning a stop set.
-     * We advance until we hit a token that clearly terminates a type in the
-     * contexts we currently support (VariableDeclaration): `=` (initializer),
-     * `,` (next declaration), `;` (statement terminator), `)` / `]` (enclosing
-     * paren/bracket), EOF, or a preceding line break (ASI). Nested `{`/`[`
-     * are balance-tracked so inline inner braces don't terminate early.
-     * This is a conservative placeholder until ctsc grows a real type parser. */
-    int fs = cur_full_start(p);
-    int brace_depth = 0;
-    int bracket_depth = 0;
-    int paren_depth = 0;
-    int angle_depth = 0;
-    /* After a tuple/array type `[...]` at depth 0, the next `{` begins the
-     * function body, not a TypeLiteral — without this, the fallback swallows
-     * the body (emitter/selfhost-derived/57_generic_constraint.ts:
-     * `): [A, B] {`). */
-    bool after_top_level_bracket = false;
-    CtscSyntaxKind last_consumed_kind = CTSC_SK_Unknown;
-    while (cur(p) != CTSC_SK_EndOfFileToken) {
-        CtscSyntaxKind k = cur(p);
-        /* Unknown (e.g. a stray '\\') always terminates the type at any depth:
-         * mirrors tsc's parseTypeReference flow for `var v: X<T \\` (fixture
-         * 106_parserSkippedTokens20.ts) where parseBracketedList's
-         * parseDelimitedList(TypeArguments) treats any non-comma token as a
-         * list terminator (upstream parser.ts isListTerminator ~3038-3040),
-         * then parseExpected(GreaterThanToken) fails without advancing, so
-         * finishNode(TypeReference).end == scanner.getTokenFullStart() of the
-         * stray token (not past it). */
-        if (k == CTSC_SK_Unknown) break;
-        if (brace_depth == 0 && bracket_depth == 0 && paren_depth == 0 && angle_depth == 0) {
-            if (after_top_level_bracket && k == CTSC_SK_OpenBraceToken) {
-                break;
-            }
-            if (after_top_level_bracket && k != CTSC_SK_OpenBraceToken) {
-                after_top_level_bracket = false;
-            }
-            /* Do not stop at `=>`: parenthesised function types
-             * `(a: T) => U` must absorb the arrow and return type; stopping at
-             * `=>` left `void` unconsumed and the `{` body was misparsed
-             * (emitter/selfhost-derived/74_export_generic_rest.ts).
-             * Stop at `{` when it cannot start a union RHS object type — i.e.
-             * not immediately after `|` (`A | { b: number }` must keep `{`).
-             * Leading `{` after `:` uses parse_type_literal (~2634), not here. */
-            if (k == CTSC_SK_EqualsToken || k == CTSC_SK_CommaToken
-                || k == CTSC_SK_SemicolonToken
-                || k == CTSC_SK_CloseParenToken || k == CTSC_SK_CloseBracketToken
-                || k == CTSC_SK_CloseBraceToken
-                || (k == CTSC_SK_OpenBraceToken && last_consumed_kind != CTSC_SK_BarToken)) {
-                break;
-            }
-            if (p->scanner.current.has_preceding_line_break && !allow_multiline) break;
-        }
-        if (k == CTSC_SK_OpenBraceToken) brace_depth++;
-        else if (k == CTSC_SK_CloseBraceToken) { if (brace_depth == 0) break; brace_depth--; }
-        else if (k == CTSC_SK_OpenBracketToken) bracket_depth++;
-        else if (k == CTSC_SK_CloseBracketToken) {
-            if (bracket_depth == 0) break;
-            bracket_depth--;
-            if (bracket_depth == 0) after_top_level_bracket = true;
-        }
-        else if (k == CTSC_SK_OpenParenToken) paren_depth++;
-        else if (k == CTSC_SK_CloseParenToken) { if (paren_depth == 0) break; paren_depth--; }
-        else if (k == CTSC_SK_LessThanToken) angle_depth++;
-        else if (k == CTSC_SK_GreaterThanToken && angle_depth > 0) angle_depth--;
-        advance(p);
-        last_consumed_kind = k;
-    }
-    int end = cur_full_start(p);
-    return ctsc_node_new(p->arena, CTSC_SK_TypeReference, fs, end);
+    /* Fallback: consume a minimal "type expression" by scanning a stop set
+     * (nested `{`/`[` balanced; see consume_type_via_fallback_scan). */
+    return consume_type_via_fallback_scan(p, allow_multiline);
 }
 
 /*
@@ -5294,6 +5293,404 @@ static bool next_token_is_identifier_or_string_literal_on_same_line(Parser* p) {
     return ok;
 }
 
+/*
+ * Mirrors upstream/TypeScript/src/compiler/parser.ts parseImportSpecifier (~8600)
+ * / parseImportOrExportSpecifier (~8604).
+ */
+static CtscNode* parse_import_specifier_name(Parser* p) {
+    if (!token_is_identifier_or_keyword(cur(p))) {
+        ctsc_diag_push(p->diagnostics, CTSC_DIAG_ERROR, 1003, cur_start(p), cur_end(p) - cur_start(p),
+            "Identifier expected.");
+        return NULL;
+    }
+    return make_identifier_from_current(p);
+}
+
+static bool import_specifier_identifier_is_ascii_exact(const CtscNode* id, const char* ascii) {
+    if (!id || id->kind != CTSC_SK_Identifier) return false;
+    const uint16_t* t = id->data.identifier.text;
+    size_t len = id->data.identifier.text_len;
+    for (size_t i = 0;; ++i) {
+        unsigned char c = (unsigned char)ascii[i];
+        if (c == 0) return i == len;
+        if (i >= len || t[i] != (uint16_t)c) return false;
+    }
+}
+
+static bool can_parse_module_export_name_for_import(Parser* p) {
+    return token_is_identifier_or_keyword(cur(p)) || cur(p) == CTSC_SK_StringLiteral;
+}
+
+/*
+ * Mirrors upstream parser.ts parseImportOrExportSpecifier (~8604) for
+ * ImportSpecifier (including `type` / `type as` disambiguation).
+ */
+static CtscNode* parse_import_specifier(Parser* p) {
+    int fs = cur_full_start(p);
+    bool is_type_only = false;
+    CtscNode* property_name = NULL;
+    CtscNode* name = parse_import_specifier_name(p);
+    if (!name) return NULL;
+    bool can_parse_as_keyword = true;
+
+    if (import_specifier_identifier_is_ascii_exact(name, "type")) {
+        if (cur(p) == CTSC_SK_AsKeyword) {
+            CtscNode* first_as = parse_import_specifier_name(p);
+            if (!first_as) return NULL;
+            if (cur(p) == CTSC_SK_AsKeyword) {
+                CtscNode* second_as = parse_import_specifier_name(p);
+                if (!second_as) return NULL;
+                if (can_parse_module_export_name_for_import(p)) {
+                    is_type_only = true;
+                    property_name = first_as;
+                    name = parse_import_specifier_name(p);
+                    if (!name) return NULL;
+                    can_parse_as_keyword = false;
+                } else {
+                    property_name = name;
+                    name = second_as;
+                    can_parse_as_keyword = false;
+                }
+            } else if (can_parse_module_export_name_for_import(p)) {
+                property_name = name;
+                can_parse_as_keyword = false;
+                name = parse_import_specifier_name(p);
+                if (!name) return NULL;
+            } else {
+                is_type_only = true;
+                name = first_as;
+            }
+        } else if (can_parse_module_export_name_for_import(p)) {
+            is_type_only = true;
+            name = parse_import_specifier_name(p);
+            if (!name) return NULL;
+            can_parse_as_keyword = false;
+        }
+    }
+
+    if (can_parse_as_keyword && cur(p) == CTSC_SK_AsKeyword) {
+        property_name = name;
+        if (!expect(p, CTSC_SK_AsKeyword)) return NULL;
+        name = parse_import_specifier_name(p);
+        if (!name) return NULL;
+    }
+
+    int end = name->end;
+    CtscNode* n = ctsc_node_new(p->arena, CTSC_SK_ImportSpecifier, fs, end);
+    n->data.importSpecifier.is_type_only = is_type_only;
+    n->data.importSpecifier.propertyName = property_name;
+    n->data.importSpecifier.name = name;
+    return n;
+}
+
+/*
+ * Mirrors upstream parser.ts parseNamedImportsOrExports (~8578) for NamedImports.
+ */
+static CtscNode* parse_named_imports(Parser* p) {
+    int fs = cur_full_start(p);
+    expect(p, CTSC_SK_OpenBraceToken);
+    CtscNodeArray elements;
+    ctsc_node_array_init(&elements);
+    while (cur(p) != CTSC_SK_CloseBraceToken && cur(p) != CTSC_SK_EndOfFileToken) {
+        CtscNode* el = parse_import_specifier(p);
+        if (!el) break;
+        ctsc_node_array_push(&elements, p->arena, el);
+        if (accept(p, CTSC_SK_CommaToken)) continue;
+        break;
+    }
+    expect(p, CTSC_SK_CloseBraceToken);
+    int end = cur_full_start(p);
+    CtscNode* n = ctsc_node_new(p->arena, CTSC_SK_NamedImports, fs, end);
+    n->data.namedImports.elements = elements;
+    return n;
+}
+
+static CtscNode* parse_module_specifier_string(Parser* p) {
+    if (cur(p) != CTSC_SK_StringLiteral) {
+        ctsc_diag_push(p->diagnostics, CTSC_DIAG_ERROR, 1005, cur_start(p), cur_end(p) - cur_start(p),
+            "String literal expected.");
+        return NULL;
+    }
+    int fs = cur_full_start(p);
+    CtscNode* n = ctsc_node_new(p->arena, CTSC_SK_StringLiteral, fs, cur_end(p));
+    n->data.stringLiteral.text = p->scanner.current.text;
+    n->data.stringLiteral.text_len = p->scanner.current.text_len;
+    n->data.stringLiteral.value = p->scanner.current.value;
+    n->data.stringLiteral.value_len = p->scanner.current.value_len;
+    n->data.stringLiteral.single_quote = (p->scanner.current.text_len > 0 && p->scanner.current.text[0] == '\'');
+    advance(p);
+    return n;
+}
+
+/*
+ * Pre: scanner positioned at `{` opening named imports; parses through module specifier
+ * and optional semicolon. Mirrors parser.ts parseImportDeclaration (~8384) for
+ * `import { ... } from "..."`.
+ */
+static CtscNode* parse_import_declaration_named_from_brace(Parser* p, int decl_fs, bool clause_is_type_only) {
+    CtscNode* named = parse_named_imports(p);
+    if (!named) return NULL;
+    CtscNode* clause = ctsc_node_new(p->arena, CTSC_SK_ImportClause, named->pos, named->end);
+    clause->data.importClause.is_type_only = clause_is_type_only;
+    clause->data.importClause.name = NULL;
+    clause->data.importClause.namedBindings = named;
+    if (!expect(p, CTSC_SK_FromKeyword)) return NULL;
+    CtscNode* mod = parse_module_specifier_string(p);
+    if (!mod) return NULL;
+    int decl_end = mod->end;
+    if (cur(p) == CTSC_SK_SemicolonToken) {
+        decl_end = cur_end(p);
+        advance(p);
+    }
+    CtscNode* decl = ctsc_node_new(p->arena, CTSC_SK_ImportDeclaration, decl_fs, decl_end);
+    decl->data.importDeclaration.importClause = clause;
+    decl->data.importDeclaration.moduleSpecifier = mod;
+    return decl;
+}
+
+/*
+ * Pre: `import` keyword consumed. Mirrors parser.ts
+ * parseImportDeclarationOrImportEqualsDeclaration (~8384),
+ * tryParseImportClause (~8425), parseImportClause (~8501),
+ * parseNamespaceImport (~8558). Does not handle import equals or import attributes.
+ */
+static CtscNode* parse_import_declaration_after_import_keyword(Parser* p, int decl_fs) {
+    bool clause_is_type_only = false;
+    /* Mirrors upstream parser.ts parseImportDeclarationOrImportEqualsDeclaration
+     * (~8395-8402): `import type` sets ImportClause phase modifier / isTypeOnly. */
+    if (cur(p) == CTSC_SK_TypeKeyword && !p->scanner.current.has_preceding_line_break) {
+        advance(p);
+        clause_is_type_only = true;
+    }
+    if (cur(p) == CTSC_SK_OpenBraceToken) {
+        return parse_import_declaration_named_from_brace(p, decl_fs, clause_is_type_only);
+    }
+    if (cur(p) == CTSC_SK_StringLiteral) {
+        /* import ModuleSpecifier ; */
+        CtscNode* mod = parse_module_specifier_string(p);
+        if (!mod) return NULL;
+        int decl_end = mod->end;
+        if (cur(p) == CTSC_SK_SemicolonToken) {
+            decl_end = cur_end(p);
+            advance(p);
+        }
+        CtscNode* decl = ctsc_node_new(p->arena, CTSC_SK_ImportDeclaration, decl_fs, decl_end);
+        decl->data.importDeclaration.importClause = NULL;
+        decl->data.importDeclaration.moduleSpecifier = mod;
+        return decl;
+    }
+    if (cur(p) == CTSC_SK_AsteriskToken) {
+        int ns_fs = cur_full_start(p);
+        advance(p);
+        if (!expect(p, CTSC_SK_AsKeyword)) return NULL;
+        CtscNode* bind_name = parse_import_specifier_name(p);
+        if (!bind_name) return NULL;
+        CtscNode* ns = ctsc_node_new(p->arena, CTSC_SK_NamespaceImport, ns_fs, bind_name->end);
+        ns->data.namespaceImport.name = bind_name;
+        if (!expect(p, CTSC_SK_FromKeyword)) return NULL;
+        CtscNode* mod = parse_module_specifier_string(p);
+        if (!mod) return NULL;
+        int decl_end = mod->end;
+        if (cur(p) == CTSC_SK_SemicolonToken) {
+            decl_end = cur_end(p);
+            advance(p);
+        }
+        CtscNode* clause = ctsc_node_new(p->arena, CTSC_SK_ImportClause, ns->pos, ns->end);
+        clause->data.importClause.is_type_only = clause_is_type_only;
+        clause->data.importClause.name = NULL;
+        clause->data.importClause.namedBindings = ns;
+        CtscNode* decl = ctsc_node_new(p->arena, CTSC_SK_ImportDeclaration, decl_fs, decl_end);
+        decl->data.importDeclaration.importClause = clause;
+        decl->data.importDeclaration.moduleSpecifier = mod;
+        return decl;
+    }
+    if (token_is_identifier_or_keyword(cur(p))) {
+        /*
+         * ImportedDefaultBinding [`, ` (NameSpaceImport | NamedImports)] `from`
+         * ModuleSpecifier `;`
+         * Mirrors upstream parser.ts parseImportClause (~8501-8526): after an
+         * optional default binding, a comma introduces namespace or named imports.
+         */
+        CtscNode* def = parse_import_specifier_name(p);
+        if (!def) return NULL;
+        CtscNode* named_bindings = NULL;
+        if (accept(p, CTSC_SK_CommaToken)) {
+            if (cur(p) == CTSC_SK_AsteriskToken) {
+                int ns_fs = cur_full_start(p);
+                advance(p);
+                if (!expect(p, CTSC_SK_AsKeyword)) return NULL;
+                CtscNode* bind_name = parse_import_specifier_name(p);
+                if (!bind_name) return NULL;
+                CtscNode* ns = ctsc_node_new(p->arena, CTSC_SK_NamespaceImport, ns_fs, bind_name->end);
+                ns->data.namespaceImport.name = bind_name;
+                named_bindings = ns;
+            } else if (cur(p) == CTSC_SK_OpenBraceToken) {
+                named_bindings = parse_named_imports(p);
+                if (!named_bindings) return NULL;
+            } else {
+                ctsc_diag_push(p->diagnostics, CTSC_DIAG_ERROR, 1005, cur_start(p), cur_end(p) - cur_start(p),
+                    "'{' or '*' expected.");
+                return NULL;
+            }
+        }
+        if (!expect(p, CTSC_SK_FromKeyword)) return NULL;
+        CtscNode* mod = parse_module_specifier_string(p);
+        if (!mod) return NULL;
+        int decl_end = mod->end;
+        if (cur(p) == CTSC_SK_SemicolonToken) {
+            decl_end = cur_end(p);
+            advance(p);
+        }
+        int clause_end = named_bindings ? named_bindings->end : def->end;
+        CtscNode* clause = ctsc_node_new(p->arena, CTSC_SK_ImportClause, def->pos, clause_end);
+        clause->data.importClause.is_type_only = clause_is_type_only;
+        clause->data.importClause.name = def;
+        clause->data.importClause.namedBindings = named_bindings;
+        CtscNode* decl = ctsc_node_new(p->arena, CTSC_SK_ImportDeclaration, decl_fs, decl_end);
+        decl->data.importDeclaration.importClause = clause;
+        decl->data.importDeclaration.moduleSpecifier = mod;
+        return decl;
+    }
+    return NULL;
+}
+
+/*
+ * Same shape as parse_import_specifier (~5328) but ExportSpecifier
+ * (parser.ts parseImportOrExportSpecifier ~8604).
+ */
+static CtscNode* parse_export_specifier(Parser* p) {
+    int fs = cur_full_start(p);
+    bool is_type_only = false;
+    CtscNode* property_name = NULL;
+    CtscNode* name = parse_import_specifier_name(p);
+    if (!name) return NULL;
+    bool can_parse_as_keyword = true;
+
+    if (import_specifier_identifier_is_ascii_exact(name, "type")) {
+        if (cur(p) == CTSC_SK_AsKeyword) {
+            CtscNode* first_as = parse_import_specifier_name(p);
+            if (!first_as) return NULL;
+            if (cur(p) == CTSC_SK_AsKeyword) {
+                CtscNode* second_as = parse_import_specifier_name(p);
+                if (!second_as) return NULL;
+                if (can_parse_module_export_name_for_import(p)) {
+                    is_type_only = true;
+                    property_name = first_as;
+                    name = parse_import_specifier_name(p);
+                    if (!name) return NULL;
+                    can_parse_as_keyword = false;
+                } else {
+                    property_name = name;
+                    name = second_as;
+                    can_parse_as_keyword = false;
+                }
+            } else if (can_parse_module_export_name_for_import(p)) {
+                property_name = name;
+                can_parse_as_keyword = false;
+                name = parse_import_specifier_name(p);
+                if (!name) return NULL;
+            } else {
+                is_type_only = true;
+                name = first_as;
+            }
+        } else if (can_parse_module_export_name_for_import(p)) {
+            is_type_only = true;
+            name = parse_import_specifier_name(p);
+            if (!name) return NULL;
+            can_parse_as_keyword = false;
+        }
+    }
+
+    if (can_parse_as_keyword && cur(p) == CTSC_SK_AsKeyword) {
+        property_name = name;
+        if (!expect(p, CTSC_SK_AsKeyword)) return NULL;
+        name = parse_import_specifier_name(p);
+        if (!name) return NULL;
+    }
+
+    int end = name->end;
+    CtscNode* n = ctsc_node_new(p->arena, CTSC_SK_ExportSpecifier, fs, end);
+    n->data.exportSpecifier.is_type_only = is_type_only;
+    n->data.exportSpecifier.propertyName = property_name;
+    n->data.exportSpecifier.name = name;
+    return n;
+}
+
+/*
+ * Mirrors parser.ts parseNamedImportsOrExports (~8578) for NamedExports.
+ */
+static CtscNode* parse_named_exports(Parser* p) {
+    int fs = cur_full_start(p);
+    expect(p, CTSC_SK_OpenBraceToken);
+    CtscNodeArray elements;
+    ctsc_node_array_init(&elements);
+    while (cur(p) != CTSC_SK_CloseBraceToken && cur(p) != CTSC_SK_EndOfFileToken) {
+        CtscNode* el = parse_export_specifier(p);
+        if (!el) break;
+        ctsc_node_array_push(&elements, p->arena, el);
+        if (accept(p, CTSC_SK_CommaToken)) continue;
+        break;
+    }
+    expect(p, CTSC_SK_CloseBraceToken);
+    int end = cur_full_start(p);
+    CtscNode* n = ctsc_node_new(p->arena, CTSC_SK_NamedExports, fs, end);
+    n->data.namedExports.elements = elements;
+    return n;
+}
+
+/*
+ * Pre: `export` consumed; mirrors parser.ts parseExportDeclaration (~8701).
+ */
+static CtscNode* parse_export_declaration_after_export_keyword(Parser* p, int export_pos) {
+    bool is_type_only = false;
+    if (cur(p) == CTSC_SK_TypeKeyword && !p->scanner.current.has_preceding_line_break) {
+        advance(p);
+        is_type_only = true;
+    }
+
+    CtscNode* export_clause = NULL;
+    CtscNode* module_specifier = NULL;
+
+    if (cur(p) == CTSC_SK_AsteriskToken) {
+        int star_fs = cur_full_start(p);
+        advance(p);
+        if (cur(p) == CTSC_SK_AsKeyword && !p->scanner.current.has_preceding_line_break) {
+            advance(p);
+            CtscNode* bind_name = parse_import_specifier_name(p);
+            if (!bind_name) return NULL;
+            CtscNode* ns = ctsc_node_new(p->arena, CTSC_SK_NamespaceExport, star_fs, bind_name->end);
+            ns->data.namespaceExport.name = bind_name;
+            export_clause = ns;
+        }
+        if (!expect(p, CTSC_SK_FromKeyword)) return NULL;
+        module_specifier = parse_module_specifier_string(p);
+        if (!module_specifier) return NULL;
+    } else if (cur(p) == CTSC_SK_OpenBraceToken) {
+        export_clause = parse_named_exports(p);
+        if (!export_clause) return NULL;
+        if (cur(p) == CTSC_SK_FromKeyword
+            || (cur(p) == CTSC_SK_StringLiteral && !p->scanner.current.has_preceding_line_break)) {
+            if (!expect(p, CTSC_SK_FromKeyword)) return NULL;
+            module_specifier = parse_module_specifier_string(p);
+            if (!module_specifier) return NULL;
+        }
+    } else {
+        return NULL;
+    }
+
+    int decl_end = module_specifier ? module_specifier->end : export_clause->end;
+    if (cur(p) == CTSC_SK_SemicolonToken) {
+        decl_end = cur_end(p);
+        advance(p);
+    }
+
+    CtscNode* decl = ctsc_node_new(p->arena, CTSC_SK_ExportDeclaration, export_pos, decl_end);
+    decl->data.exportDeclaration.is_type_only = is_type_only;
+    decl->data.exportDeclaration.export_clause = export_clause;
+    decl->data.exportDeclaration.module_specifier = module_specifier;
+    return decl;
+}
+
 static CtscNode* parse_statement(Parser* p) {
     int fs = cur_full_start(p);
     switch (cur(p)) {
@@ -5418,15 +5815,28 @@ static CtscNode* parse_statement(Parser* p) {
                 }
                 return en;
             }
-            /* Mirrors upstream parser.ts parseDeclaration → parseTypeAliasDeclaration
-             * for `export type Name = ...`. */
+            /* `export type { ... } from` is ExportDeclaration, not TypeAliasDeclaration
+             * (parser.ts parseExportDeclaration ~8707). */
             if (cur(p) == CTSC_SK_TypeKeyword && !p->scanner.current.has_preceding_line_break) {
+                CtscScanner saved_before_type = p->scanner;
+                advance(p);
+                if (cur(p) == CTSC_SK_OpenBraceToken) {
+                    p->scanner = saved_before_type;
+                    CtscNode* ed = parse_export_declaration_after_export_keyword(p, export_pos);
+                    if (ed) return ed;
+                }
+                p->scanner = saved_before_type;
                 int type_kw_pos = cur_full_start(p);
                 CtscNodeArray export_mods;
                 ctsc_node_array_init(&export_mods);
                 CtscNode* ek = ctsc_node_new(p->arena, CTSC_SK_ExportKeyword, export_pos, type_kw_pos);
                 ctsc_node_array_push(&export_mods, p->arena, ek);
                 return parse_type_alias_declaration(p, export_pos, &export_mods);
+            }
+            /* export-from: `export { ... } from`, `export * from`, `export * as ns from` */
+            if (cur(p) == CTSC_SK_OpenBraceToken || cur(p) == CTSC_SK_AsteriskToken) {
+                CtscNode* ed = parse_export_declaration_after_export_keyword(p, export_pos);
+                if (ed) return ed;
             }
             p->scanner = saved;
             break;
@@ -5488,6 +5898,17 @@ static CtscNode* parse_statement(Parser* p) {
             return parse_break_or_continue_statement(p, CTSC_SK_ContinueStatement);
         case CTSC_SK_DebuggerKeyword:
             return parse_debugger_statement(p);
+        /* Mirrors upstream parser.ts parseImportDeclarationOrImportEqualsDeclaration
+         * (~8384). Unsupported forms fall through to the expression-statement path. */
+        case CTSC_SK_ImportKeyword: {
+            CtscScanner saved = p->scanner;
+            int decl_fs = cur_full_start(p);
+            advance(p);
+            CtscNode* imp = parse_import_declaration_after_import_keyword(p, decl_fs);
+            if (imp) return imp;
+            p->scanner = saved;
+            break;
+        }
         /* Mirrors upstream/TypeScript/src/compiler/parser.ts parseStatement
          * (~7427-7432): TryKeyword, CatchKeyword, FinallyKeyword all route
          * into parseTryStatement. The latter two are error-recovery entries

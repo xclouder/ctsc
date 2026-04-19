@@ -238,6 +238,17 @@ typedef enum {
     CTSC_SK_AwaitExpression,
     CTSC_SK_SpreadAssignment,
     CTSC_SK_SpreadElement,
+    CTSC_SK_ImportDeclaration,
+    CTSC_SK_ImportClause,
+    CTSC_SK_NamedImports,
+    CTSC_SK_NamespaceImport,
+    CTSC_SK_ImportSpecifier,
+    /* Mirrors ts.SyntaxKind.ExportDeclaration / NamedExports / ExportSpecifier /
+     * NamespaceExport (parser.ts parseExportDeclaration ~8701). */
+    CTSC_SK_ExportDeclaration,
+    CTSC_SK_NamedExports,
+    CTSC_SK_ExportSpecifier,
+    CTSC_SK_NamespaceExport,
     /* Mirrors ts.SyntaxKind.CatchClause (forEachChild: variableDeclaration, block). */
     CTSC_SK_CatchClause,
 

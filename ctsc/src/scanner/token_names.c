@@ -225,6 +225,15 @@ static const char* const k_names[CTSC_SK__COUNT] = {
     [CTSC_SK_AwaitExpression]                   = "AwaitExpression",
     [CTSC_SK_SpreadAssignment]                  = "SpreadAssignment",
     [CTSC_SK_SpreadElement]                     = "SpreadElement",
+    [CTSC_SK_ImportDeclaration]                 = "ImportDeclaration",
+    [CTSC_SK_ImportClause]                      = "ImportClause",
+    [CTSC_SK_NamedImports]                      = "NamedImports",
+    [CTSC_SK_NamespaceImport]                 = "NamespaceImport",
+    [CTSC_SK_ImportSpecifier]                   = "ImportSpecifier",
+    [CTSC_SK_ExportDeclaration]                 = "ExportDeclaration",
+    [CTSC_SK_NamedExports]                      = "NamedExports",
+    [CTSC_SK_ExportSpecifier]                   = "ExportSpecifier",
+    [CTSC_SK_NamespaceExport]                   = "NamespaceExport",
     [CTSC_SK_CatchClause]                       = "CatchClause",
 };
 

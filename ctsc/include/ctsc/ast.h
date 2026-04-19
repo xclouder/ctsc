@@ -1016,6 +1016,57 @@ typedef struct {
     CtscNode*   type;
 } CtscTypeAliasDeclarationData;
 
+/*
+ * Mirrors upstream/TypeScript/src/compiler/parser.ts parseImportDeclaration
+ * (~8384) / parseNamedImportsOrExports (~8578) / parseImportOrExportSpecifier
+ * (~8604) and types.ts ImportDeclaration / ImportClause / NamedImports /
+ * ImportSpecifier.
+ */
+typedef struct {
+    CtscNode* importClause;
+    CtscNode* moduleSpecifier;
+} CtscImportDeclarationData;
+
+typedef struct {
+    bool        is_type_only; /* `import type ...`; mirrors ImportClause.isTypeOnly / phaseModifier TypeKeyword */
+    CtscNode*   name;
+    CtscNode*   namedBindings;
+} CtscImportClauseData;
+
+typedef struct {
+    CtscNodeArray elements;
+} CtscNamedImportsData;
+
+/*
+ * Mirrors upstream types.ts NamespaceImport and parser.ts parseNamespaceImport
+ * (~8558): `* as ImportedBinding`.
+ */
+typedef struct {
+    CtscNode* name; /* Identifier */
+} CtscNamespaceImportData;
+
+typedef struct {
+    bool        is_type_only; /* `import { type X }`; mirrors ImportSpecifier.isTypeOnly */
+    CtscNode*   propertyName;
+    CtscNode*   name;
+} CtscImportSpecifierData;
+
+/*
+ * Mirrors upstream types.ts ExportDeclaration (parser.ts parseExportDeclaration ~8701,
+ * emitter.ts emitExportDeclaration ~3753).
+ */
+typedef struct {
+    bool      is_type_only; /* `export type { ... } from` */
+    CtscNode* export_clause; /* NamedExports | NamespaceExport | NULL for `export * from` */
+    CtscNode* module_specifier;
+} CtscExportDeclarationData;
+
+typedef struct {
+    CtscNodeArray elements;
+} CtscNamedExportsData;
+
+typedef CtscImportSpecifierData CtscExportSpecifierData;
+
 struct CtscNode {
     CtscSyntaxKind kind;
     int            pos;
@@ -1087,6 +1138,16 @@ struct CtscNode {
         CtscModuleDeclarationData       moduleDeclaration;
         CtscTypeAssertionExpressionData typeAssertionExpression;
         CtscTypeAliasDeclarationData    typeAliasDeclaration;
+        CtscImportDeclarationData       importDeclaration;
+        CtscImportClauseData            importClause;
+        CtscNamedImportsData            namedImports;
+        CtscNamespaceImportData         namespaceImport;
+        /* Same shape as NamespaceImport (`* as name` in export-from). */
+        CtscNamespaceImportData         namespaceExport;
+        CtscImportSpecifierData         importSpecifier;
+        CtscExportDeclarationData       exportDeclaration;
+        CtscNamedExportsData            namedExports;
+        CtscExportSpecifierData         exportSpecifier;
     } data;
 };
 

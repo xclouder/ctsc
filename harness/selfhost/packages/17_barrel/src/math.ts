@@ -1,0 +1,9 @@
+export function clamp(x: number, lo: number, hi: number): number {
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
+
+export function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
+}
