@@ -10,6 +10,7 @@ import { STATE_DIR, REPO_ROOT } from "./paths.js";
 import { listFixtures } from "./planner.js";
 import { runCtsc, findCtscExe } from "./runner.js";
 import { runSelfhost } from "./selfhost.js";
+import { runProjects } from "./project.js";
 import { loadProgress, ensureStateDir } from "./state.js";
 import type { FixtureStatus, Phase, ProgressState } from "./types.js";
 
@@ -92,6 +93,14 @@ Commands:
     transpile every *.ts with ctsc --emit, diff against ts.transpileModule
     (ES2020), then run the package's runtime.mjs under node to verify the
     emitted JS actually executes end-to-end. --pkg filters by substring.
+
+  project [--project NAME] [--no-run] [--ctsc-exe PATH]
+    M3 tsconfig-driven smoke test. For each project under
+    harness/selfhost/projects/ load tsconfig.json using ts's own parser,
+    enumerate source files honoring include/exclude/files, run
+    ctsc --emit per file, stage to the configured outDir, and diff vs
+    tsc transpileModule (run per file with parsed compilerOptions).
+    Then run runtime.mjs if present.
 `);
 }
 
@@ -232,6 +241,15 @@ async function main(): Promise<void> {
   if (cmd === "selfhost") {
     const rc = await runSelfhost({
       pkg: flags.pkg ? String(flags.pkg) : undefined,
+      noRun: !!flags["no-run"],
+      ctscExe: flags["ctsc-exe"] ? String(flags["ctsc-exe"]) : undefined,
+    });
+    process.exit(rc);
+  }
+
+  if (cmd === "project") {
+    const rc = await runProjects({
+      project: flags.project ? String(flags.project) : undefined,
       noRun: !!flags["no-run"],
       ctscExe: flags["ctsc-exe"] ? String(flags["ctsc-exe"]) : undefined,
     });

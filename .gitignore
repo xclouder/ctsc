@@ -45,6 +45,8 @@ upstream/TypeScript/built/
 
 # Selfhost smoke test: emitted JS per package (regenerable)
 harness/selfhost/packages/*/dist/
+harness/selfhost/projects/*/dist/
+harness/selfhost/projects/*/dist-*/
 .npm/
 .yarn/
 .pnp.*
