@@ -939,6 +939,19 @@ int test_parser(void) {
     EXPECT(idecl->data.classDeclaration.members.len == 0);
     ctsc_arena_free(&a);
 
+    /* `export interface` — parser.ts parseDeclaration (~7467) + ExportKeyword
+     * arm routing to parseInterfaceDeclaration. Selfhost-derived
+     * 97_empty_module_marker.ts. */
+    ctsc_arena_init(&a, 4096);
+    src = "export interface I {}";
+    r = ctsc_parse(src, strlen(src), &a);
+    EXPECT(r.sourceFile->data.sourceFile.statements.len == 1);
+    idecl = r.sourceFile->data.sourceFile.statements.items[0];
+    EXPECT(idecl->kind == CTSC_SK_InterfaceDeclaration);
+    EXPECT(idecl->data.classDeclaration.modifiers.len == 1);
+    EXPECT(idecl->data.classDeclaration.modifiers.items[0]->kind == CTSC_SK_ExportKeyword);
+    ctsc_arena_free(&a);
+
     /* Mirrors upstream parser.ts parseObjectBindingPattern (~7612) +
      * parseObjectBindingElement (~7594) for the
      * 108_parserForOfStatement13.ts fixture (`for (let {a, b} of X) { }`).
@@ -1122,6 +1135,18 @@ int test_parser(void) {
     EXPECT(span2_0->data.templateSpan.literal->kind == CTSC_SK_TemplateMiddle);
     const CtscNode* span2_1 = te2->data.templateExpression.templateSpans.items[1];
     EXPECT(span2_1->data.templateSpan.literal->kind == CTSC_SK_TemplateTail);
+    ctsc_arena_free(&a);
+
+    /* parser.ts parseBinaryExpressionRest (~5649): `as` Type yields AsExpression. */
+    ctsc_arena_init(&a, 4096);
+    src = "x as unknown;";
+    r = ctsc_parse(src, strlen(src), &a);
+    EXPECT(r.sourceFile->data.sourceFile.statements.len == 1);
+    s = r.sourceFile->data.sourceFile.statements.items[0];
+    EXPECT(s->kind == CTSC_SK_ExpressionStatement);
+    EXPECT(s->data.expressionStatement.expression->kind == CTSC_SK_AsExpression);
+    EXPECT(s->data.expressionStatement.expression->data.asExpression.expression->kind == CTSC_SK_Identifier);
+    EXPECT(s->data.expressionStatement.expression->data.asExpression.type != NULL);
     ctsc_arena_free(&a);
 
     return failed;

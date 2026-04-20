@@ -40,6 +40,9 @@ static int expect_emit(const char* src, const char* expected, const char* label,
 int test_emitter(void) {
     int failed = 0;
 
+    /* AsExpression erases to the value under ts.transpileModule (selfhost 98). */
+    expect_emit("x as unknown;", "x;\n", "as expression erase", &failed);
+
     /*
      * Mirrors upstream transformers/ts.ts visitEnumDeclaration (~1802) +
      * transformEnumBody (~1891). At SourceFile scope the lowering produces:
@@ -974,7 +977,9 @@ int test_emitter(void) {
      * emitter.ts emitSourceFile (~4299) → emitBodyWithDetachedComments →
      * utilities.ts emitDetachedComments (~7012): a copyright-style `//` block
      * separated by a blank line from the first statement is emitted even when
-     * intervening TypeAliasDeclaration nodes are elided. Matches
+     * intervening TypeAliasDeclaration nodes are elided. transpileModule does
+     * not insert an extra blank line between that header and the first emitted
+     * JS (mirrors tsc). Matches
      * fixtures/emitter/selfhost-derived/91_union_type_alias_object.ts.
      */
     expect_emit(
@@ -985,7 +990,6 @@ int test_emitter(void) {
         "export function f() {}\n",
         "// header a\n"
         "// header b\n"
-        "\n"
         "export function f() { }\n",
         "detached comments before elided type alias (91 pattern)",
         &failed
@@ -1130,6 +1134,19 @@ int test_emitter(void) {
         "import * as fmt_1 from \"./format.js\";\n"
         "export { fmt_1 as fmt };\n",
         "export-from re-exports + namespace export lowering (96_export_from)",
+        &failed
+    );
+
+    /*
+     * transformers/module/esnextAnd2015.ts transformECMAScriptModule (~114-119) +
+     * factory/utilities.ts createEmptyExports (~183). When a source file is an
+     * ES module but every statement is type-erased, tsc appends `export {};`.
+     * fixtures/emitter/selfhost-derived/97_empty_module_marker.ts.
+     */
+    expect_emit(
+        "export interface A { x: number; }\n",
+        "export {};\n",
+        "synthetic export {} for type-only ES module (97 pattern)",
         &failed
     );
 

@@ -893,6 +893,14 @@ static void emit_node(CtscJson* j, const CtscNode* n) {
             ctsc_json_end_arr(j);
             break;
         }
+        case CTSC_SK_AsExpression:
+            /* forEachChildInAsExpression (~788): expression, then type. */
+            ctsc_json_key(j, "children");
+            ctsc_json_begin_arr(j);
+            emit_node(j, n->data.asExpression.expression);
+            emit_node(j, n->data.asExpression.type);
+            ctsc_json_end_arr(j);
+            break;
         case CTSC_SK_TryStatement: {
             /* Mirrors upstream/TypeScript/src/compiler/parser.ts
              * forEachChildInTryStatement (~890): visits tryBlock, catchClause,

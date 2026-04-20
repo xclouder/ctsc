@@ -222,6 +222,7 @@ static const char* const k_names[CTSC_SK__COUNT] = {
     [CTSC_SK_ModuleDeclaration]                 = "ModuleDeclaration",
     [CTSC_SK_ModuleBlock]                       = "ModuleBlock",
     [CTSC_SK_TypeAssertionExpression]           = "TypeAssertionExpression",
+    [CTSC_SK_AsExpression]                      = "AsExpression",
     [CTSC_SK_AwaitExpression]                   = "AwaitExpression",
     [CTSC_SK_SpreadAssignment]                  = "SpreadAssignment",
     [CTSC_SK_SpreadElement]                     = "SpreadElement",

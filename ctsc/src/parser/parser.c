@@ -153,6 +153,7 @@ static CtscNode* parse_object_literal_expression(Parser* p);
 static CtscNode* parse_block(Parser* p);
 static CtscNode* parse_parameter(Parser* p);
 static CtscNode* parse_type_annotation(Parser* p);
+static CtscNode* parse_type_in_annotation_position(Parser* p, bool allow_multiline);
 static void skip_type_in_type_parameter_position(Parser* p);
 static CtscNode* consume_type_via_fallback_scan(Parser* p, bool allow_multiline);
 static void consume_postfix_type_operators(Parser* p);
@@ -1409,7 +1410,53 @@ static CtscNode* parse_binary_level(Parser* p, CtscNode* (*down)(Parser*), bool 
 static CtscNode* parse_multiplicative(Parser* p) { return parse_binary_level(p, parse_unary,          is_multiplicative_op); }
 static CtscNode* parse_additive(Parser* p)       { return parse_binary_level(p, parse_multiplicative, is_additive_op); }
 static CtscNode* parse_shift(Parser* p)          { return parse_binary_level(p, parse_additive,       is_shift_op); }
-static CtscNode* parse_relational(Parser* p)     { return parse_binary_level(p, parse_shift,          is_relational_op); }
+/*
+ * Mirrors upstream/TypeScript/src/compiler/parser.ts parseBinaryExpressionRest (~5608):
+ * relational operators plus same-line `as Type` (parser.ts ~5649-5662).
+ */
+static CtscNode* parse_relational(Parser* p) {
+    CtscNode* left = parse_shift(p);
+    if (!left) {
+        if (cur(p) == CTSC_SK_GreaterThanToken) {
+            ctsc_scanner_re_scan_greater_token(&p->scanner);
+        }
+        if (!is_relational_op(cur(p))) return NULL;
+        ctsc_diag_push(p->diagnostics, CTSC_DIAG_ERROR, 1109,
+            cur_start(p), cur_end(p) - cur_start(p),
+            "Expression expected.");
+        left = make_missing_identifier(p);
+    }
+    for (;;) {
+        if (cur(p) == CTSC_SK_GreaterThanToken) {
+            ctsc_scanner_re_scan_greater_token(&p->scanner);
+        }
+        if (cur(p) == CTSC_SK_AsKeyword && !p->scanner.current.has_preceding_line_break) {
+            advance(p);
+            CtscNode* type = parse_type_in_annotation_position(p, true);
+            CtscNode* asx = ctsc_node_new(p->arena, CTSC_SK_AsExpression, left->pos, type->end);
+            asx->data.asExpression.expression = left;
+            asx->data.asExpression.type = type;
+            left = asx;
+            continue;
+        }
+        if (!is_relational_op(cur(p))) break;
+        CtscSyntaxKind op = cur(p);
+        advance(p);
+        CtscNode* right = parse_shift(p);
+        if (!right) {
+            ctsc_diag_push(p->diagnostics, CTSC_DIAG_ERROR, 1109,
+                cur_start(p), cur_end(p) - cur_start(p),
+                "Expression expected.");
+            right = make_missing_identifier(p);
+        }
+        CtscNode* bin = ctsc_node_new(p->arena, CTSC_SK_BinaryExpression, left->pos, right->end);
+        bin->data.binaryExpression.left = left;
+        bin->data.binaryExpression.operator_kind = op;
+        bin->data.binaryExpression.right = right;
+        left = bin;
+    }
+    return left;
+}
 static CtscNode* parse_equality(Parser* p)       { return parse_binary_level(p, parse_relational,     is_equality_op); }
 static CtscNode* parse_logical_and(Parser* p)    { return parse_binary_level(p, parse_equality,       is_logical_and_op); }
 /*
@@ -5814,6 +5861,16 @@ static CtscNode* parse_statement(Parser* p) {
                     en->pos = export_pos;
                 }
                 return en;
+            }
+            /* Mirrors upstream parser.ts parseDeclaration (~7467): `export interface`
+             * (parseInterfaceDeclaration with ExportKeyword in modifiers). */
+            if (cur(p) == CTSC_SK_InterfaceKeyword) {
+                int iface_kw_pos = cur_full_start(p);
+                CtscNodeArray export_mods;
+                ctsc_node_array_init(&export_mods);
+                CtscNode* ek = ctsc_node_new(p->arena, CTSC_SK_ExportKeyword, export_pos, iface_kw_pos);
+                ctsc_node_array_push(&export_mods, p->arena, ek);
+                return parse_interface_declaration_with_modifiers(p, export_pos, &export_mods);
             }
             /* `export type { ... } from` is ExportDeclaration, not TypeAliasDeclaration
              * (parser.ts parseExportDeclaration ~8707). */

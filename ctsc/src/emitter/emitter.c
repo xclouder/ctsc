@@ -650,6 +650,90 @@ static bool source_file_statement_is_dropped(const CtscNode* s) {
     return false;
 }
 
+/*
+ * Mirrors upstream parser.ts isAnExternalModuleIndicatorNode (~476) /
+ * isFileProbablyExternalModule (~469): any top-level import/export shape
+ * means the SourceFile is an ES module (parser.ts externalModuleIndicator).
+ */
+static bool modifier_array_has_export_keyword(const CtscNodeArray* mods) {
+    if (!mods) return false;
+    for (size_t i = 0; i < mods->len; i++) {
+        const CtscNode* m = mods->items[i];
+        if (m && m->kind == CTSC_SK_ExportKeyword) return true;
+    }
+    return false;
+}
+
+static bool statement_indicates_source_file_is_external_module(const CtscNode* s) {
+    if (!s) return false;
+    switch (s->kind) {
+        case CTSC_SK_ImportDeclaration:
+        case CTSC_SK_ExportDeclaration:
+            return true;
+        case CTSC_SK_VariableStatement:
+            return s->data.variableStatement.has_export;
+        case CTSC_SK_FunctionDeclaration:
+            return s->data.functionDeclaration.has_export || s->data.functionDeclaration.has_export_default;
+        case CTSC_SK_ClassDeclaration:
+            return s->data.classDeclaration.has_export;
+        case CTSC_SK_EnumDeclaration:
+            return s->data.enumDeclaration.has_export;
+        case CTSC_SK_InterfaceDeclaration:
+            return modifier_array_has_export_keyword(&s->data.classDeclaration.modifiers);
+        case CTSC_SK_TypeAliasDeclaration:
+            return modifier_array_has_export_keyword(&s->data.typeAliasDeclaration.modifiers);
+        default:
+            return false;
+    }
+}
+
+static bool source_file_is_external_module(const CtscNode* sf) {
+    if (!sf || sf->kind != CTSC_SK_SourceFile) return false;
+    const CtscNodeArray* ss = &sf->data.sourceFile.statements;
+    for (size_t i = 0; i < ss->len; i++) {
+        if (statement_indicates_source_file_is_external_module(ss->items[i])) return true;
+    }
+    return false;
+}
+
+/*
+ * Mirrors upstream utilitiesPublic.ts isExternalModuleIndicator (~2148) on
+ * statements that survive TS-to-JS elision (transformers/module/esnextAnd2015.ts
+ * ~114: some(result.statements, isExternalModuleIndicator)).
+ */
+static bool source_file_emitted_statement_is_external_module_indicator(const CtscNode* s) {
+    if (!s || source_file_statement_is_dropped(s)) return false;
+    switch (s->kind) {
+        case CTSC_SK_ImportDeclaration:
+            return !source_file_import_declaration_is_elided(s);
+        case CTSC_SK_ExportDeclaration:
+            return !s->data.exportDeclaration.is_type_only;
+        case CTSC_SK_VariableStatement:
+            return s->data.variableStatement.has_export;
+        case CTSC_SK_FunctionDeclaration:
+            return s->data.functionDeclaration.has_export || s->data.functionDeclaration.has_export_default;
+        case CTSC_SK_ClassDeclaration:
+            return s->data.classDeclaration.has_export;
+        case CTSC_SK_EnumDeclaration:
+            return s->data.enumDeclaration.has_export;
+        default:
+            return false;
+    }
+}
+
+/*
+ * createEmptyExports (factory/utilities.ts ~183) appended by
+ * transformECMAScriptModule (esnextAnd2015.ts ~114-119) when the module
+ * has no remaining import/export surface after type erasure.
+ */
+static bool source_file_needs_synthetic_empty_export(const CtscNode* sf, const CtscNodeArray* ss) {
+    if (!source_file_is_external_module(sf)) return false;
+    for (size_t i = 0; i < ss->len; i++) {
+        if (source_file_emitted_statement_is_external_module_indicator(ss->items[i])) return false;
+    }
+    return true;
+}
+
 static void emit_list(Emitter* e, const CtscNodeArray* arr, const char* sep) {
     for (size_t i = 0; i < arr->len; ++i) {
         if (i) write_cstr(e, sep);
@@ -1216,62 +1300,67 @@ static void emit(Emitter* e, const CtscNode* n) {
                    && source_file_statement_is_dropped(ss->items[first_emitted])) {
                 first_emitted++;
             }
-            if (first_emitted < ss->len) {
-                size_t leading_pos = (size_t)ss->items[first_emitted]->pos;
-                /*
-                 * When the first emitted node spans pos=0 (leading trivia of its
-                 * first token starts at the beginning of the file), the detached
-                 * pass and emit_source_file_leading_comments would both replay
-                 * the same header (utilities.ts emitDetachedComments vs
-                 * emitLeadingComments). Skip the second pass if detached already
-                 * wrote (selfhost-derived 92_import_named.ts). When leading_pos > 0
-                 * (e.g. elided type aliases before `export` in 91_union_type_alias_object.ts)
-                 * the leading replay is still needed for the non-detached case.
-                 */
-                if (!detached_wrote || leading_pos != 0) {
-                    emit_source_file_leading_comments(e, leading_pos);
-                } else if (e->source) {
+            /*
+             * Leading trivia replay uses the first *emitted* statement when one
+             * exists. When every statement is elided, tsc normally suppresses
+             * non-`///` leading comments (overload-only file — from-upstream
+             * 106_parserFunctionDeclaration3.ts). The exception is an ES
+             * module whose only surface was type-only exports: the file stays a
+             * module and still replays header comments before the synthetic
+             * `export {};` (selfhost-derived 97_empty_module_marker.ts).
+             */
+            if (ss->len > 0) {
+                bool replay_leading;
+                size_t idx;
+                if (first_emitted < ss->len) {
+                    replay_leading = true;
+                    idx = first_emitted;
+                } else if (source_file_is_external_module(n)) {
+                    replay_leading = true;
+                    idx = 0;
+                } else {
+                    replay_leading = false;
+                    idx = 0;
+                }
+                if (replay_leading) {
+                    size_t leading_pos = (size_t)ss->items[idx]->pos;
                     /*
-                     * Detached comments at pos 0 suppress emit_source_file_leading_comments
-                     * to avoid duplicate headers (selfhost-derived 92_import_named.ts).
-                     * Mirror forEachLeadingCommentWithoutDetachedComments (emitter.ts ~6128):
-                     * resume leading-comment iteration from last(detachedComments).end.
-                     * iterateCommentRanges consumes intervening line breaks without writing
-                     * them (scanner.ts ~850), so a blank line in the source between the
-                     * detached header and the first statement is not replayed (tsc
-                     * transpileModule output for selfhost-derived 93_import_default.ts).
+                     * When the first emitted node spans pos=0 (leading trivia of its
+                     * first token starts at the beginning of the file), the detached
+                     * pass and emit_source_file_leading_comments would both replay
+                     * the same header (utilities.ts emitDetachedComments vs
+                     * emitLeadingComments). Skip the second pass if detached already
+                     * wrote (selfhost-derived 92_import_named.ts). When leading_pos > 0
+                     * (e.g. elided type aliases before `export` in 91_union_type_alias_object.ts)
+                     * the leading replay is still needed for the non-detached case.
                      */
-                    emit_source_file_leading_comments(e, last_detached_comment_src_end);
+                    if (!detached_wrote || leading_pos != 0) {
+                        emit_source_file_leading_comments(e, leading_pos);
+                    } else if (e->source) {
+                        /*
+                         * Detached comments at pos 0 suppress emit_source_file_leading_comments
+                         * to avoid duplicate headers (selfhost-derived 92_import_named.ts).
+                         * Mirror forEachLeadingCommentWithoutDetachedComments (emitter.ts ~6128):
+                         * resume leading-comment iteration from last(detachedComments).end.
+                         * iterateCommentRanges consumes intervening line breaks without writing
+                         * them (scanner.ts ~850), so a blank line in the source between the
+                         * detached header and the first statement is not replayed (tsc
+                         * transpileModule output for selfhost-derived 93_import_default.ts).
+                         */
+                        emit_source_file_leading_comments(e, last_detached_comment_src_end);
+                    }
                 }
             } else if (ss->len == 0) {
                 emit_source_file_leading_comments(
                     e, (size_t)n->data.sourceFile.statements_end);
             }
-            /* After utilities.ts emitDetachedComments, tsc's emitList still
-             * inserts a line break before the first emitted JS when every
-             * intervening statement is an elided type alias (the printer's
-             * writeLine chain collapses while skipping NotEmittedStatement
-             * nodes, but the blank line before the first `export` must still
-             * appear once detached comments were emitted). Without this,
-             * selfhost-derived 91_union_type_alias_object.ts loses the blank
-             * line between the header and `export function`. Do not run when
-             * the prefix includes `interface` (61_optional_chain.ts) or when
-             * no detached block was written (89_type_alias_erase.ts). */
-            if (detached_wrote && first_emitted > 0) {
-                bool only_elided_type_aliases = true;
-                for (size_t j = 0; j < first_emitted; j++) {
-                    if (ss->items[j]->kind != CTSC_SK_TypeAliasDeclaration) {
-                        only_elided_type_aliases = false;
-                        break;
-                    }
-                }
-                if (only_elided_type_aliases) {
-                    write_raw_newline(e);
-                }
-            }
             for (size_t i = 0; i < ss->len; ++i) {
                 if (source_file_statement_is_dropped(ss->items[i])) continue;
                 emit(e, ss->items[i]);
+                write_raw_newline(e);
+            }
+            if (source_file_needs_synthetic_empty_export(n, ss)) {
+                write_cstr(e, "export {};");
                 write_raw_newline(e);
             }
             return;
@@ -1847,6 +1936,13 @@ static void emit(Emitter* e, const CtscNode* n) {
             write_char(e, '(');
             emit_list(e, &n->data.callExpression.arguments, ", ");
             write_char(e, ')');
+            return;
+        /*
+         * ts.transpileModule strips assertion types before print; emitted JS
+         * keeps only the value (mirrors transformers' erase of AsExpression).
+         */
+        case CTSC_SK_AsExpression:
+            emit(e, n->data.asExpression.expression);
             return;
         /*
          * Mirrors upstream/TypeScript/src/compiler/emitter.ts

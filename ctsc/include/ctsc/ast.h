@@ -493,6 +493,15 @@ typedef struct {
 } CtscTypeAssertionExpressionData;
 
 /*
+ * Mirrors upstream/TypeScript/src/compiler/parser.ts forEachChildInAsExpression (~788):
+ * visits `expression` then `type`.
+ */
+typedef struct {
+    CtscNode* expression;
+    CtscNode* type;
+} CtscAsExpressionData;
+
+/*
  * Mirrors upstream/TypeScript/src/compiler/parser.ts parseYieldExpression (~5169):
  *     YieldExpression[In] :
  *       yield
@@ -1137,6 +1146,7 @@ struct CtscNode {
         CtscModuleBlockData             moduleBlock;
         CtscModuleDeclarationData       moduleDeclaration;
         CtscTypeAssertionExpressionData typeAssertionExpression;
+        CtscAsExpressionData            asExpression;
         CtscTypeAliasDeclarationData    typeAliasDeclaration;
         CtscImportDeclarationData       importDeclaration;
         CtscImportClauseData            importClause;

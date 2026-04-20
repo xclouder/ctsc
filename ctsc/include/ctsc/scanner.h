@@ -235,6 +235,7 @@ typedef enum {
     CTSC_SK_ModuleDeclaration,
     CTSC_SK_ModuleBlock,
     CTSC_SK_TypeAssertionExpression,
+    CTSC_SK_AsExpression,
     CTSC_SK_AwaitExpression,
     CTSC_SK_SpreadAssignment,
     CTSC_SK_SpreadElement,
