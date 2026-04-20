@@ -88,7 +88,8 @@ add_executable(ctsc_tests
     tests/test_scanner.c
     tests/test_parser.c
     tests/test_binder.c
+    tests/test_checker.c
     tests/test_emitter.c
 )
-target_link_libraries(ctsc_tests PRIVATE ctsc_emitter ctsc_binder ctsc_parser ctsc_scanner ctsc_core)
+target_link_libraries(ctsc_tests PRIVATE ctsc_emitter ctsc_checker ctsc_binder ctsc_parser ctsc_scanner ctsc_core)
 add_test(NAME ctsc_tests COMMAND ctsc_tests)

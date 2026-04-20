@@ -54,6 +54,10 @@ static void emit_node(CtscJson* j, const CtscNode* n) {
             ctsc_json_key(j, "text");
             ctsc_json_str_utf16(j, n->data.numericLiteral.text, n->data.numericLiteral.text_len);
             break;
+        case CTSC_SK_BigIntLiteral:
+            ctsc_json_key(j, "text");
+            ctsc_json_str_utf16(j, n->data.numericLiteral.text, n->data.numericLiteral.text_len);
+            break;
         case CTSC_SK_StringLiteral:
             ctsc_json_key(j, "text");
             ctsc_json_str_utf16(j, n->data.stringLiteral.value, n->data.stringLiteral.value_len);

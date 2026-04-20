@@ -920,7 +920,8 @@ static void emit_this_property_initializer(Emitter* e, const CtscNode* prop) {
         write_char(e, '[');
         emit(e, name->data.computedPropertyName.expression);
         write_char(e, ']');
-    } else if (name->kind == CTSC_SK_StringLiteral || name->kind == CTSC_SK_NumericLiteral) {
+    } else if (name->kind == CTSC_SK_StringLiteral || name->kind == CTSC_SK_NumericLiteral
+        || name->kind == CTSC_SK_BigIntLiteral) {
         write_char(e, '[');
         emit(e, name);
         write_char(e, ']');
@@ -960,7 +961,8 @@ static void emit_static_property_initializer(Emitter* e, const CtscNode* class_n
         write_char(e, '[');
         emit(e, name->data.computedPropertyName.expression);
         write_char(e, ']');
-    } else if (name->kind == CTSC_SK_StringLiteral || name->kind == CTSC_SK_NumericLiteral) {
+    } else if (name->kind == CTSC_SK_StringLiteral || name->kind == CTSC_SK_NumericLiteral
+        || name->kind == CTSC_SK_BigIntLiteral) {
         write_char(e, '[');
         emit(e, name);
         write_char(e, ']');
@@ -1938,6 +1940,7 @@ static void emit(Emitter* e, const CtscNode* n) {
             write_cstr(e, "false");
             return;
         case CTSC_SK_NumericLiteral:
+        case CTSC_SK_BigIntLiteral:
             /* Mirrors upstream/TypeScript/src/compiler/utilities.ts getLiteralText
              * (~1980) → canUseOriginalText (~2036): when the numeric literal has
              * a parent, is not synthesized, and does not carry TokenFlags.IsInvalid

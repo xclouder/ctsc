@@ -101,10 +101,16 @@ typedef struct {
  * See emitter.ts emitLiteral (~2118) → getLiteralText (utilities.ts ~1980):
  * terminated template literals with a parent fall into the original-source
  * branch, so ctsc just copies the bytes back out.
+ *
+ * `value` / `value_len` mirror the scanner's decoded template fragment
+ * (checker.ts getFreshTypeOfTemplateLiteral / LiteralExpression text for
+ * NoSubstitutionTemplateLiteral — the cooked string without delimiters).
  */
 typedef struct {
     const uint16_t* text;
     size_t          text_len;
+    const uint16_t* value;
+    size_t          value_len;
 } CtscTemplateLiteralLikeData;
 
 /*

@@ -68,6 +68,12 @@ int test_scanner(void) {
     };
     failed += expect_kinds("const x = 42;", k1, sizeof(k1)/sizeof(k1[0]));
 
+    /* DecimalBigIntegerLiteral — one token (upstream scanner.ts checkBigIntSuffix ~1869). */
+    {
+        CtscSyntaxKind kb[] = { CTSC_SK_BigIntLiteral, CTSC_SK_EndOfFileToken };
+        failed += expect_kinds("42n", kb, sizeof(kb) / sizeof(kb[0]));
+    }
+
     CtscSyntaxKind k2[] = {
         CTSC_SK_LetKeyword, CTSC_SK_Identifier, CTSC_SK_EqualsToken,
         CTSC_SK_StringLiteral, CTSC_SK_SemicolonToken, CTSC_SK_EndOfFileToken

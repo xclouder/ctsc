@@ -7,6 +7,7 @@ int test_scanner(void);
 int test_parser(void);
 int test_binder(void);
 int test_emitter(void);
+int test_checker(void);
 
 int main(void) {
     int failed = 0;
@@ -15,6 +16,7 @@ int main(void) {
     failed += test_scanner();
     failed += test_parser();
     failed += test_binder();
+    failed += test_checker();
     failed += test_emitter();
     if (failed) {
         fprintf(stderr, "ctsc_tests: %d test(s) failed\n", failed);

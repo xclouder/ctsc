@@ -22,6 +22,9 @@
  *
  *   diag channel (→ ctsc_check_dump_diag_json):
  *     - TS2304 "Cannot find name '...'" for unresolved Identifier references
+ *     - TS2322 "Type '...' is not assignable to type '...'." when a
+ *       VariableDeclaration has a type annotation incompatible with its
+ *       initializer (span on the binding name, matching tsc)
  *     - TS2552 (basic) "Cannot find name '...'. Did you mean 'y'?" optional,
  *       guarded behind a Levenshtein <=2 suggestion against in-scope symbols
  *

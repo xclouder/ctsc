@@ -18,6 +18,10 @@
  *   - Diag channel: emit TS2304 ("Cannot find name '...'") for each bare
  *     Identifier in reference position whose name doesn't resolve against
  *     the binder-built scope chain.
+ *   - TS2322 when an annotated VariableDeclaration's initializer is not
+ *     assignable to the annotation (error on the binding name), mirroring
+ *     checker.ts checkVariableDeclaration / checkTypeAssignableTo
+ *     (~22686, Diagnostics.Type_0_is_not_assignable_to_type_1).
  *
  * The walker below is intentionally a tiny, switch-driven visitor that only
  * looks at the node fields relevant to M4.0. It is the canonical place the
@@ -115,6 +119,19 @@ static CtscType* type_of_type_node(CtscTypeRegistry* reg, const CtscNode* type_n
 
 static CtscType* type_of_expression(CtscTypeRegistry* reg, const CtscNode* expr);
 
+/*
+ * Numeric literal text → double for NumberLiteralType. Mirrors checker.ts
+ * getNumberLiteralType(parseFloat(text)) / checkPrefixUnaryExpression
+ * (~39990-39996) when the operand is a NumericLiteral.
+ */
+static double numeric_literal_to_double(const CtscNumericLiteralData* d) {
+    char buf[64];
+    size_t n = d->text_len < sizeof(buf) - 1 ? d->text_len : sizeof(buf) - 1;
+    for (size_t i = 0; i < n; ++i) buf[i] = (char)d->text[i];
+    buf[n] = '\0';
+    return strtod(buf, NULL);
+}
+
 static CtscType* type_of_expression(CtscTypeRegistry* reg, const CtscNode* expr) {
     if (!expr) return reg->t_any;
     switch (expr->kind) {
@@ -125,12 +142,7 @@ static CtscType* type_of_expression(CtscTypeRegistry* reg, const CtscNode* expr)
              * are simple integers, so a plain strtod with an ASCII copy is
              * sufficient.
              */
-            const CtscNumericLiteralData* d = &expr->data.numericLiteral;
-            char buf[64];
-            size_t n = d->text_len < sizeof(buf) - 1 ? d->text_len : sizeof(buf) - 1;
-            for (size_t i = 0; i < n; ++i) buf[i] = (char)d->text[i];
-            buf[n] = '\0';
-            double v = strtod(buf, NULL);
+            double v = numeric_literal_to_double(&expr->data.numericLiteral);
             return ctsc_type_number_literal(reg, v);
         }
         case CTSC_SK_StringLiteral: {
@@ -140,7 +152,8 @@ static CtscType* type_of_expression(CtscTypeRegistry* reg, const CtscNode* expr)
         }
         case CTSC_SK_NoSubstitutionTemplateLiteral: {
             const CtscTemplateLiteralLikeData* d = &expr->data.templateLiteralLike;
-            return ctsc_type_string_literal(reg, d->text, d->text_len);
+            return ctsc_type_string_literal(reg, d->value ? d->value : d->text,
+                                                 d->value ? d->value_len : d->text_len);
         }
         case CTSC_SK_TrueKeyword:  return reg->t_true;
         case CTSC_SK_FalseKeyword: return reg->t_false;
@@ -148,8 +161,32 @@ static CtscType* type_of_expression(CtscTypeRegistry* reg, const CtscNode* expr)
         case CTSC_SK_UndefinedKeyword: return reg->t_undefined;
         case CTSC_SK_BigIntLiteral: {
             const CtscNumericLiteralData* d = &expr->data.numericLiteral;
-            /* Scanner strips the trailing `n`; we pass the remaining digits. */
-            return ctsc_type_bigint_literal(reg, d->text, d->text_len);
+            /* Token text is the full lexeme (`42n`); literal type uses digits only
+             * (type_registry appends `n` for typeToString — checker.ts BigIntLiteralType). */
+            size_t len = d->text_len;
+            if (len > 0 && d->text[len - 1] == (uint16_t)'n') {
+                len--;
+            }
+            return ctsc_type_bigint_literal(reg, d->text, len);
+        }
+        case CTSC_SK_PrefixUnaryExpression: {
+            const CtscNode* op = expr->data.prefixUnaryExpression.operand;
+            CtscSyntaxKind oper = expr->data.prefixUnaryExpression.operator_kind;
+            /*
+             * checker.ts checkPrefixUnaryExpression (~39990-39997): for
+             * NumericLiteral operand, unary +/- yields a fresh number literal
+             * type from -(operand.text) / +(operand.text) as in ECMAScript.
+             */
+            if (op && op->kind == CTSC_SK_NumericLiteral) {
+                double v = numeric_literal_to_double(&op->data.numericLiteral);
+                if (oper == CTSC_SK_MinusToken) {
+                    return ctsc_type_number_literal(reg, -v);
+                }
+                if (oper == CTSC_SK_PlusToken) {
+                    return ctsc_type_number_literal(reg, v);
+                }
+            }
+            return reg->t_any;
         }
         default:
             /* All other expressions → any, for M4.0. */
@@ -157,13 +194,76 @@ static CtscType* type_of_expression(CtscTypeRegistry* reg, const CtscNode* expr)
     }
 }
 
-/* Emit either a widened (for let/var) or non-widened (for const) initializer type. */
+/*
+ * Structural assignability for the M4.0 subset. Mirrors the legacy
+ * strictNullChecks-off behaviour of the harness oracle (noLib / default
+ * compiler options in harness/src/oracle-checker-diag.ts).
+ */
+static bool is_assignable_to(CtscTypeRegistry* reg, CtscType* source, CtscType* target) {
+    if (!source || !target) return true;
+    if (source->kind == CTSC_TYPE_ANY || target->kind == CTSC_TYPE_ANY) return true;
+    if (source->kind == CTSC_TYPE_NEVER) return true;
+    if (target->kind == CTSC_TYPE_UNKNOWN_T) return true;
+    if (source->kind == CTSC_TYPE_UNKNOWN_T) {
+        return target->kind == CTSC_TYPE_ANY || target->kind == CTSC_TYPE_UNKNOWN_T;
+    }
+    if (target->kind == CTSC_TYPE_NEVER) return source->kind == CTSC_TYPE_NEVER;
+    if (source->kind == CTSC_TYPE_NULL || source->kind == CTSC_TYPE_UNDEFINED) return true;
+    {
+        CtscType* sw = ctsc_type_widen(reg, source);
+        CtscType* tw = ctsc_type_widen(reg, target);
+        return sw->kind == tw->kind;
+    }
+}
+
+static void emit_ts2322_on_binding_name(CtscCheckResult* r, CtscArena* arena, CtscTypeRegistry* reg,
+                                         const CtscNode* name_id, CtscType* source, CtscType* target) {
+    if (!name_id || name_id->kind != CTSC_SK_Identifier) return;
+    CtscBuffer msg;
+    ctsc_buf_init(&msg);
+    ctsc_buf_append_cstr(&msg, "Type '");
+    ctsc_type_to_string(ctsc_type_widen(reg, source), &msg);
+    ctsc_buf_append_cstr(&msg, "' is not assignable to type '");
+    ctsc_type_to_string(ctsc_type_widen(reg, target), &msg);
+    ctsc_buf_append_cstr(&msg, "'.");
+    char* msg_arena = (char*)ctsc_arena_alloc(arena, msg.len + 1);
+    memcpy(msg_arena, msg.data, msg.len);
+    msg_arena[msg.len] = '\0';
+    ctsc_buf_free(&msg);
+
+    CtscCheckDiagnostic d = {0};
+    d.code = 2322;
+    d.category = "Error";
+    d.length = (int)name_id->data.identifier.text_len;
+    d.start = name_id->end - d.length;
+    d.message = msg_arena;
+    diag_push(r, arena, d);
+}
+
+/*
+ * Mirrors checker.ts getWidenedTypeWithContext (~26021) when strictNullChecks
+ * is off: nullWideningType / undefinedWideningType carry RequiresWidening and
+ * TypeFlags.Nullable, so the nullable branch yields anyType (~26027-26028).
+ * ctsc models the harness default (no strictNullChecks) only for M4.0.
+ */
+static CtscType* widen_nullish_when_not_strict_null(CtscTypeRegistry* reg, CtscType* t) {
+    if (!t) return reg->t_any;
+    if (t->kind == CTSC_TYPE_NULL || t->kind == CTSC_TYPE_UNDEFINED) return reg->t_any;
+    return t;
+}
+
+/*
+ * Inferred variable type: getWidenedLiteralTypeForInitializer (~41455) then
+ * widenTypeForVariableLikeDeclaration → getWidenedType (~12480-12495).
+ * const keeps literal types except null/undefined widening (above).
+ */
 static CtscType* var_decl_type(CtscTypeRegistry* reg, const CtscNode* decl, bool is_const) {
     const CtscVariableDeclarationData* d = &decl->data.variableDeclaration;
     if (d->type) return type_of_type_node(reg, d->type);
     CtscType* init_t = type_of_expression(reg, d->initializer);
     if (!init_t) return reg->t_any;
-    return is_const ? init_t : ctsc_type_widen(reg, init_t);
+    CtscType* after_literal = is_const ? init_t : ctsc_type_widen(reg, init_t);
+    return widen_nullish_when_not_strict_null(reg, after_literal);
 }
 
 static const char* syntax_kind_cstr(CtscSyntaxKind k) { return ctsc_syntax_kind_name(k); }
@@ -276,6 +376,14 @@ static void visit_variable_statement(Walk* w, const CtscNode* n) {
         if (!d || d->kind != CTSC_SK_VariableDeclaration) continue;
         CtscType* t = var_decl_type(&w->r->registry, d, is_const);
         push_entry_for_name(w, d, d->data.variableDeclaration.name, t);
+        const CtscVariableDeclarationData* vd = &d->data.variableDeclaration;
+        if (vd->type && vd->initializer) {
+            CtscType* ann = type_of_type_node(&w->r->registry, vd->type);
+            CtscType* init_t = type_of_expression(&w->r->registry, vd->initializer);
+            if (!is_assignable_to(&w->r->registry, init_t, ann)) {
+                emit_ts2322_on_binding_name(w->r, w->arena, &w->r->registry, vd->name, init_t, ann);
+            }
+        }
         /* Still walk initializer so identifier references inside get checked. */
         if (d->data.variableDeclaration.initializer) {
             visit(w, d->data.variableDeclaration.initializer);

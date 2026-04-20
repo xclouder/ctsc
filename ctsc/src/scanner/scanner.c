@@ -103,6 +103,18 @@ static bool scan_number_fraction_and_exponent(CtscScanner* s) {
 }
 
 /*
+ * After scanning an integer with no fraction/exponent, a trailing `n` forms a
+ * DecimalBigIntegerLiteral (upstream scanner.ts checkBigIntSuffix ~1869).
+ */
+static void finish_bigint_literal_token(CtscScanner* s, size_t start) {
+    s->pos++; /* consume 'n' */
+    s->current.kind = CTSC_SK_BigIntLiteral;
+    s->current.text = s->source.data + start;
+    s->current.text_len = s->pos - start;
+    s->current.numeric_literal_is_invalid = false;
+}
+
+/*
  * Format `v` using ECMA-262 6.1.6.1.13 Number::toString (the "shortest
  * round-trip" decimal). We iterate k = 1..17 and take the first significand
  * length that strtod() reparses exactly to `v`. This mirrors the observable
@@ -808,25 +820,46 @@ static void scan_number(CtscScanner* s) {
         }
         /* Lone '0' before optional fraction/exponent. */
         bool coerce0 = scan_number_fraction_and_exponent(s);
+        if (coerce0) {
+            s->current.kind = CTSC_SK_NumericLiteral;
+            s->current.text = s->source.data + start;
+            s->current.text_len = s->pos - start;
+            set_numeric_coerced_value(s, start, s->pos);
+            return;
+        }
+        if (s->pos < s->source.len && s->source.data[s->pos] == 'n') {
+            finish_bigint_literal_token(s, start);
+            return;
+        }
         s->current.kind = CTSC_SK_NumericLiteral;
         s->current.text = s->source.data + start;
         s->current.text_len = s->pos - start;
-        if (coerce0) { set_numeric_coerced_value(s, start, s->pos); }
         return;
     }
 
     scan_number_digits_allow_separators(s);
     bool coerce = scan_number_fraction_and_exponent(s);
-    s->current.kind = CTSC_SK_NumericLiteral;
-    s->current.text = s->source.data + start;
-    s->current.text_len = s->pos - start;
+    if (coerce) {
+        s->current.kind = CTSC_SK_NumericLiteral;
+        s->current.text = s->source.data + start;
+        s->current.text_len = s->pos - start;
+        set_numeric_coerced_value(s, start, s->pos);
+        return;
+    }
     bool has_sep = false;
     for (size_t i = start; i < s->pos; i++) {
         if (s->source.data[i] == '_') { has_sep = true; break; }
     }
+    if (s->pos < s->source.len && s->source.data[s->pos] == 'n') {
+        finish_bigint_literal_token(s, start);
+        return;
+    }
+    s->current.kind = CTSC_SK_NumericLiteral;
+    s->current.text = s->source.data + start;
+    s->current.text_len = s->pos - start;
     /* Integer literals with `_` need coerced tokenValue (`60000`) even when
      * there is no fraction/exponent (scanner.ts ~1318-1319). */
-    if (coerce || has_sep) { set_numeric_coerced_value(s, start, s->pos); }
+    if (has_sep) { set_numeric_coerced_value(s, start, s->pos); }
 }
 
 /* Forward decl: escape helper is defined later alongside scan_template.

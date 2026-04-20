@@ -262,6 +262,24 @@ static CtscNode* parse_primary(Parser* p) {
         advance(p);
         return n;
     }
+    if (k == CTSC_SK_BigIntLiteral) {
+        CtscNode* n = ctsc_node_new(p->arena, CTSC_SK_BigIntLiteral, fs, cur_end(p));
+        n->data.numericLiteral.text = p->scanner.current.text;
+        n->data.numericLiteral.text_len = p->scanner.current.text_len;
+        bool has_numeric_sep = false;
+        for (size_t ti = 0; ti < p->scanner.current.text_len; ti++) {
+            if (p->scanner.current.text[ti] == '_') { has_numeric_sep = true; break; }
+        }
+        if (has_numeric_sep) {
+            n->data.numericLiteral.source_text = NULL;
+            n->data.numericLiteral.source_text_len = 0;
+        } else {
+            n->data.numericLiteral.source_text = p->scanner.current.text;
+            n->data.numericLiteral.source_text_len = p->scanner.current.text_len;
+        }
+        advance(p);
+        return n;
+    }
     if (k == CTSC_SK_StringLiteral) {
         CtscNode* n = ctsc_node_new(p->arena, CTSC_SK_StringLiteral, fs, cur_end(p));
         n->data.stringLiteral.text = p->scanner.current.text;
@@ -285,6 +303,8 @@ static CtscNode* parse_primary(Parser* p) {
          * covering the full token including both backticks. */
         n->data.templateLiteralLike.text = p->scanner.current.text;
         n->data.templateLiteralLike.text_len = p->scanner.current.text_len;
+        n->data.templateLiteralLike.value = p->scanner.current.value;
+        n->data.templateLiteralLike.value_len = p->scanner.current.value_len;
         advance(p);
         return n;
     }
@@ -301,6 +321,8 @@ static CtscNode* parse_primary(Parser* p) {
         CtscNode* head = ctsc_node_new(p->arena, CTSC_SK_TemplateHead, fs, cur_end(p));
         head->data.templateLiteralLike.text = p->scanner.current.text;
         head->data.templateLiteralLike.text_len = p->scanner.current.text_len;
+        head->data.templateLiteralLike.value = p->scanner.current.value;
+        head->data.templateLiteralLike.value_len = p->scanner.current.value_len;
         advance(p);
         return parse_template_expression_with_head(p, fs, head);
     }
@@ -713,16 +735,22 @@ static CtscNode* parse_template_expression_with_head(Parser* p, int fs, CtscNode
                 literal = ctsc_node_new(p->arena, lk, lit_fs, cur_end(p));
                 literal->data.templateLiteralLike.text = p->scanner.current.text;
                 literal->data.templateLiteralLike.text_len = p->scanner.current.text_len;
+                literal->data.templateLiteralLike.value = p->scanner.current.value;
+                literal->data.templateLiteralLike.value_len = p->scanner.current.value_len;
                 advance(p);
             } else {
                 literal = ctsc_node_new(p->arena, CTSC_SK_TemplateTail, lit_fs, lit_fs);
                 literal->data.templateLiteralLike.text = NULL;
                 literal->data.templateLiteralLike.text_len = 0;
+                literal->data.templateLiteralLike.value = NULL;
+                literal->data.templateLiteralLike.value_len = 0;
             }
         } else if (cur(p) == CTSC_SK_TemplateMiddle || cur(p) == CTSC_SK_TemplateTail) {
             literal = ctsc_node_new(p->arena, cur(p), lit_fs, cur_end(p));
             literal->data.templateLiteralLike.text = p->scanner.current.text;
             literal->data.templateLiteralLike.text_len = p->scanner.current.text_len;
+            literal->data.templateLiteralLike.value = p->scanner.current.value;
+            literal->data.templateLiteralLike.value_len = p->scanner.current.value_len;
             advance(p);
         } else {
             ctsc_diag_push(p->diagnostics, CTSC_DIAG_ERROR, 1005,
@@ -731,6 +759,8 @@ static CtscNode* parse_template_expression_with_head(Parser* p, int fs, CtscNode
             literal = ctsc_node_new(p->arena, CTSC_SK_TemplateTail, lit_fs, lit_fs);
             literal->data.templateLiteralLike.text = NULL;
             literal->data.templateLiteralLike.text_len = 0;
+            literal->data.templateLiteralLike.value = NULL;
+            literal->data.templateLiteralLike.value_len = 0;
         }
         int span_end = cur_full_start(p);
         CtscNode* span = ctsc_node_new(p->arena, CTSC_SK_TemplateSpan, span_fs, span_end);
@@ -756,12 +786,16 @@ static CtscNode* parse_tagged_template_rest(Parser* p, CtscNode* tag) {
         tmpl = ctsc_node_new(p->arena, CTSC_SK_NoSubstitutionTemplateLiteral, cur_start(p), cur_end(p));
         tmpl->data.templateLiteralLike.text = p->scanner.current.text;
         tmpl->data.templateLiteralLike.text_len = p->scanner.current.text_len;
+        tmpl->data.templateLiteralLike.value = p->scanner.current.value;
+        tmpl->data.templateLiteralLike.value_len = p->scanner.current.value_len;
         advance(p);
     } else if (cur(p) == CTSC_SK_TemplateHead) {
         int hfs = cur_full_start(p);
         CtscNode* head = ctsc_node_new(p->arena, CTSC_SK_TemplateHead, hfs, cur_end(p));
         head->data.templateLiteralLike.text = p->scanner.current.text;
         head->data.templateLiteralLike.text_len = p->scanner.current.text_len;
+        head->data.templateLiteralLike.value = p->scanner.current.value;
+        head->data.templateLiteralLike.value_len = p->scanner.current.value_len;
         advance(p);
         tmpl = parse_template_expression_with_head(p, hfs, head);
     } else {
@@ -2206,6 +2240,24 @@ static CtscNode* parse_property_name(Parser* p) {
             n->data.numericLiteral.text_len = p->scanner.current.text_len;
         }
         if (p->scanner.current.numeric_literal_is_invalid) {
+            n->data.numericLiteral.source_text = NULL;
+            n->data.numericLiteral.source_text_len = 0;
+        } else {
+            n->data.numericLiteral.source_text = p->scanner.current.text;
+            n->data.numericLiteral.source_text_len = p->scanner.current.text_len;
+        }
+        advance(p);
+        return n;
+    }
+    if (k == CTSC_SK_BigIntLiteral) {
+        CtscNode* n = ctsc_node_new(p->arena, CTSC_SK_BigIntLiteral, fs, cur_end(p));
+        n->data.numericLiteral.text = p->scanner.current.text;
+        n->data.numericLiteral.text_len = p->scanner.current.text_len;
+        bool has_numeric_sep = false;
+        for (size_t ti = 0; ti < p->scanner.current.text_len; ti++) {
+            if (p->scanner.current.text[ti] == '_') { has_numeric_sep = true; break; }
+        }
+        if (has_numeric_sep) {
             n->data.numericLiteral.source_text = NULL;
             n->data.numericLiteral.source_text_len = 0;
         } else {
