@@ -66,7 +66,10 @@ function difficultyHint(name: string): number {
  * produces a sensible routing. `undefined_refs` and `assignability` (M4.1)
  * are intrinsically about diagnostics; everything else defaults to types. */
 function stageDefaultChannel(stage: string): CheckerChannel {
-  if (stage === "undefined_refs" || stage === "assignability") return "diag";
+  if (stage === "undefined_refs" || stage === "assignability" ||
+      stage === "function_calls") {
+    return "diag";
+  }
   return "types";
 }
 
