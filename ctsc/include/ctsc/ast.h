@@ -283,6 +283,10 @@ typedef struct {
  */
 typedef struct {
     bool          has_async;
+    /* Mirrors parseParenthesizedArrowFunctionExpression (~5430): optional
+     * type parameters before `(`. Elided in JS emit; populated for generic
+     * arrows like `<T>(a) => ...`. */
+    CtscNodeArray type_parameters;
     CtscNodeArray parameters;
     int           equals_greater_than_pos;
     int           equals_greater_than_end;
@@ -665,6 +669,15 @@ typedef struct {
 typedef struct {
     CtscNode* label; /* nullable Identifier */
 } CtscBreakOrContinueStatementData;
+
+/*
+ * Mirrors upstream/TypeScript/src/compiler/parser.ts parseExpressionOrLabeledStatement
+ * (~7123) + factory.createLabeledStatement: IdentifierReference `:` Statement.
+ */
+typedef struct {
+    CtscNode* label;     /* Identifier */
+    CtscNode* statement; /* nullable on hard parse failure */
+} CtscLabeledStatementData;
 
 /*
  * Mirrors upstream/TypeScript/src/compiler/parser.ts parseTryStatement (~7078):
@@ -1124,6 +1137,7 @@ struct CtscNode {
         CtscComputedPropertyNameData    computedPropertyName;
         CtscArrayLiteralExpressionData  arrayLiteralExpression;
         CtscBreakOrContinueStatementData breakOrContinueStatement;
+        CtscLabeledStatementData        labeledStatement;
         CtscTryStatementData            tryStatement;
         CtscCatchClauseData             catchClause;
         CtscVoidExpressionData          voidExpression;

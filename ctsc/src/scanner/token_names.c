@@ -236,6 +236,7 @@ static const char* const k_names[CTSC_SK__COUNT] = {
     [CTSC_SK_ExportSpecifier]                   = "ExportSpecifier",
     [CTSC_SK_NamespaceExport]                   = "NamespaceExport",
     [CTSC_SK_CatchClause]                       = "CatchClause",
+    [CTSC_SK_LabeledStatement]                  = "LabeledStatement",
 };
 
 const char* ctsc_syntax_kind_name(CtscSyntaxKind k) {

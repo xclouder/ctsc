@@ -252,6 +252,8 @@ typedef enum {
     CTSC_SK_NamespaceExport,
     /* Mirrors ts.SyntaxKind.CatchClause (forEachChild: variableDeclaration, block). */
     CTSC_SK_CatchClause,
+    /* Mirrors ts.SyntaxKind.LabeledStatement (parser.ts parseExpressionOrLabeledStatement ~7123). */
+    CTSC_SK_LabeledStatement,
 
     CTSC_SK__COUNT
 } CtscSyntaxKind;

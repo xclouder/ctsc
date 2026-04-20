@@ -580,6 +580,8 @@ static bool emit_detached_comments(Emitter* e, size_t statements_node_pos, size_
 static void emit(Emitter* e, const CtscNode* n);
 static void emit_named_import_bindings_value_only(Emitter* e, const CtscNode* nb);
 static void emit_import_clause_js(Emitter* e, const CtscNode* clause);
+static bool block_function_body_should_emit_single_line(Emitter* e, const CtscNode* block);
+static void emit_function_like_block(Emitter* e, const CtscNode* block, bool allow_single_line_compact);
 
 /*
  * Mirrors upstream/TypeScript/src/compiler/transformers/ts.ts
@@ -1135,11 +1137,46 @@ static void emit_source_file_leading_comments(Emitter* e, size_t pos) {
 }
 
 /*
- * Mirrors upstream/TypeScript/src/compiler/emitter.ts emitCaseOrDefaultClauseRest
- * (~4007) when `emitAsSingleStatement` is false: colon then emitList with
- * ListFormat.CaseOrDefaultClauseStatements (Indented | MultiLine | ...).
+ * Mirrors upstream utilities.ts nodeIsSynthesized (~5625): synthesized nodes
+ * use negative or otherwise invalid TextRange positions.
  */
-static void emit_case_clause_statements(Emitter* e, const CtscNodeArray* stmts) {
+static bool ctsc_node_is_synthesized_for_emit(const CtscNode* n) {
+    return !n || n->pos < 0 || n->end < 0;
+}
+
+/*
+ * Mirrors upstream utilities.ts rangeStartPositionsAreOnSameLine (~7920) with
+ * getStartPositionOfRange (includeComments=false) implemented as skipTrivia
+ * on each node's pos (scanner.ts skipTrivia ~641).
+ */
+static bool range_start_positions_are_on_same_line(
+    const CtscUtf16Buf* src, const CtscNode* range1, const CtscNode* range2) {
+    if (!src) return true;
+    size_t p1 = skip_trivia_u16(src, (size_t)range1->pos);
+    size_t p2 = skip_trivia_u16(src, (size_t)range2->pos);
+    return line_of_position(src, p1) == line_of_position(src, p2);
+}
+
+/*
+ * Mirrors upstream/TypeScript/src/compiler/emitter.ts emitCaseOrDefaultClauseRest
+ * (~4007): one statement on the same source line as the clause uses
+ * ColonToken + space + emitList without MultiLine|Indented; otherwise colon
+ * then emitList with ListFormat.CaseOrDefaultClauseStatements.
+ */
+static void emit_case_clause_statements(Emitter* e, const CtscNode* parent_clause, const CtscNodeArray* stmts) {
+    if (stmts->len == 0) {
+        write_line(e);
+        return;
+    }
+    bool emit_as_single = stmts->len == 1
+        && (!e->source || ctsc_node_is_synthesized_for_emit(parent_clause)
+            || ctsc_node_is_synthesized_for_emit(stmts->items[0])
+            || range_start_positions_are_on_same_line(e->source, parent_clause, stmts->items[0]));
+    if (emit_as_single) {
+        write_char(e, ' ');
+        emit(e, stmts->items[0]);
+        return;
+    }
     write_line(e);
     e->indent++;
     for (size_t i = 0; i < stmts->len; ++i) {
@@ -1250,6 +1287,99 @@ static void emit_enum_member_value_and_bump_auto(Emitter* e, const CtscNode* ini
     if (enum_member_init_constant_integer(init, &v)) {
         *auto_num = v + 1;
     }
+}
+
+/*
+ * Mirrors upstream/TypeScript/src/compiler/emitter.ts
+ * shouldEmitBlockFunctionBodyOnSingleLine (~3476): function / arrow bodies
+ * use emitBlockFunctionBody (~3516) instead of emitBlock (~3036).
+ */
+static bool block_function_body_should_emit_single_line(Emitter* e, const CtscNode* block) {
+    if (!block || block->kind != CTSC_SK_Block) return false;
+    if (block->data.block.multi_line) return false;
+    const CtscNodeArray* ss = &block->data.block.statements;
+    if (ss->len == 0) return true;
+    if (!e->source) return ss->len == 1;
+    if (lines_between_positions(e->source, (size_t)block->pos, (size_t)block->end) > 0) {
+        return false;
+    }
+    for (size_t i = 1; i < ss->len; ++i) {
+        const CtscNode* prev = ss->items[i - 1];
+        const CtscNode* cur = ss->items[i];
+        if (lines_between_positions(e->source, (size_t)prev->end, (size_t)cur->pos) > 0) {
+            return false;
+        }
+    }
+    if (ss->len > 0) {
+        size_t open = skip_trivia_u16(e->source, (size_t)block->pos);
+        const uint16_t* t = e->source->data;
+        if (open < e->source->len && t[open] == (uint16_t)'{') {
+            open++;
+        }
+        if (lines_between_positions(e->source, open, (size_t)ss->items[0]->pos) > 0) {
+            return false;
+        }
+        const CtscNode* last = ss->items[ss->len - 1];
+        if (lines_between_positions(e->source, (size_t)last->end, (size_t)block->end) > 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * Mirrors upstream emitBlockFunctionBody (~3516) + emitBlockFunctionBodyWorker
+ * (~3538): leading `{`, then either SingleLineFunctionBodyStatements
+ * (~3543-3546) or MultiLineFunctionBodyStatements (~3549).
+ *
+ * `allow_single_line_compact` is true only for arrow-function bodies: tsc's
+ * shouldEmitBlockFunctionBodyOnSingleLine (~3476) also consults
+ * getLeadingLineTerminatorCount / getClosingLineTerminatorCount with
+ * PreserveLines, which keeps ordinary FunctionDeclaration bodies multi-line
+ * even when the source block is one line (see test_emitter throw/never case).
+ * Arrow callbacks still compact to `{ stmt; }` when the source block fits
+ * one line (selfhost-derived 101_inline_arrow_body.ts).
+ */
+static void emit_function_like_block(Emitter* e, const CtscNode* block, bool allow_single_line_compact) {
+    if (!block || block->kind != CTSC_SK_Block) return;
+    const CtscNodeArray* ss = &block->data.block.statements;
+    bool single = allow_single_line_compact && block_function_body_should_emit_single_line(e, block);
+    write_char(e, '{');
+    e->indent++;
+    if (ss->len == 0) {
+        if (block->data.block.multi_line) {
+            write_line(e);
+        } else {
+            write_char(e, ' ');
+        }
+        e->indent--;
+        write_char(e, '}');
+        return;
+    }
+    if (single) {
+        /* emitBlockFunctionBodyOnSingleLine (~3534): emitBlockFunctionBody
+         * already increased indent after `{`; the worker dips before the
+         * horizontal list so embedded statements (emitEmbeddedStatement ~4568)
+         * still indent one level past the outer statement. */
+        e->indent--;
+        write_char(e, ' ');
+        for (size_t i = 0; i < ss->len; ++i) {
+            if (i) write_char(e, ' ');
+            emit(e, ss->items[i]);
+        }
+        write_char(e, ' ');
+        e->indent++;
+        e->indent--;
+        write_char(e, '}');
+        return;
+    }
+    for (size_t i = 0; i < ss->len; ++i) {
+        write_line(e);
+        emit(e, ss->items[i]);
+    }
+    e->indent--;
+    write_line(e);
+    write_char(e, '}');
 }
 
 static void emit(Emitter* e, const CtscNode* n) {
@@ -1554,6 +1684,80 @@ static void emit(Emitter* e, const CtscNode* n) {
             return;
         }
         /*
+         * Mirrors upstream/TypeScript/src/compiler/emitter.ts emitDoStatement
+         * (~3101) + emitWhileClause (~3093):
+         *     writeKeyword("do"); emitEmbeddedStatement(node, node.statement);
+         *     if (isBlock(node.statement) && !preserveSourceNewlines) writeSpace();
+         *     else writeLineOrSpace(node, node.statement, node.expression);
+         *     emitWhileClause(node, node.statement.end);
+         *     writeTrailingSemicolon();
+         *
+         * emitEmbeddedStatement (~4568): space + Block; else newline + indent +
+         * emit (+ EmptyStatement pipeline). Under transpileModule,
+         * writeLineOrSpace (~4957) is writeLine when not SingleLine / no
+         * preserveSourceNewlines.
+         */
+        case CTSC_SK_DoStatement: {
+            const CtscNode* stmt = n->data.doStatement.statement;
+            const CtscNode* expr = n->data.doStatement.expression;
+            write_cstr(e, "do");
+            if (stmt && stmt->kind == CTSC_SK_Block) {
+                write_char(e, ' ');
+                emit(e, stmt);
+                write_char(e, ' ');
+            } else if (stmt && stmt->kind == CTSC_SK_EmptyStatement) {
+                write_line(e);
+                e->indent++;
+                emit(e, stmt);
+                e->indent--;
+                write_line(e);
+            } else {
+                write_line(e);
+                e->indent++;
+                emit(e, stmt);
+                e->indent--;
+                write_line(e);
+            }
+            write_cstr(e, "while (");
+            if (expr) emit(e, expr);
+            write_cstr(e, ");");
+            return;
+        }
+        /*
+         * Mirrors upstream/TypeScript/src/compiler/emitter.ts emitWhileClause
+         * (~3093) + emitWhileStatement (~3115):
+         *     writeKeyword("while"); writeSpace();
+         *     writePunctuation("(");
+         *     emitExpression(node.expression);
+         *     writePunctuation(")");
+         *     emitEmbeddedStatement(node, node.statement);
+         *
+         * emitEmbeddedStatement matches the ForStatement branch above: space
+         * before a Block body, newline + indent otherwise.
+         */
+        case CTSC_SK_WhileStatement: {
+            const CtscNode* cond = n->data.whileStatement.expression;
+            const CtscNode* body = n->data.whileStatement.statement;
+            write_cstr(e, "while (");
+            if (cond) emit(e, cond);
+            write_char(e, ')');
+            if (body && body->kind == CTSC_SK_Block) {
+                write_char(e, ' ');
+                emit(e, body);
+            } else if (body && body->kind == CTSC_SK_EmptyStatement) {
+                write_line(e);
+                e->indent++;
+                emit(e, body);
+                e->indent--;
+            } else {
+                write_line(e);
+                e->indent++;
+                emit(e, body);
+                e->indent--;
+            }
+            return;
+        }
+        /*
          * Mirrors upstream/TypeScript/src/compiler/emitter.ts emitDebuggerStatement
          * (~3393): writeToken(DebuggerKeyword) + writeTrailingSemicolon.
          */
@@ -1656,13 +1860,29 @@ static void emit(Emitter* e, const CtscNode* n) {
             write_cstr(e, "case ");
             emit(e, n->data.caseClause.expression);
             write_char(e, ':');
-            emit_case_clause_statements(e, &n->data.caseClause.statements);
+            emit_case_clause_statements(e, n, &n->data.caseClause.statements);
             return;
         }
         case CTSC_SK_DefaultClause: {
             write_cstr(e, "default");
             write_char(e, ':');
-            emit_case_clause_statements(e, &n->data.defaultClause.statements);
+            emit_case_clause_statements(e, n, &n->data.defaultClause.statements);
+            return;
+        }
+        /*
+         * Mirrors upstream/TypeScript/src/compiler/emitter.ts emitLabeledStatement (~3364):
+         *     emit(node.label);
+         *     emitTokenWithComment(SyntaxKind.ColonToken, node.label.end, writePunctuation, node);
+         *     writeSpace();
+         *     emit(node.statement);
+         */
+        case CTSC_SK_LabeledStatement: {
+            const CtscNode* lab = n->data.labeledStatement.label;
+            const CtscNode* stmt = n->data.labeledStatement.statement;
+            if (lab) emit(e, lab);
+            write_char(e, ':');
+            write_char(e, ' ');
+            if (stmt) emit(e, stmt);
             return;
         }
         case CTSC_SK_ExpressionStatement:
@@ -2175,7 +2395,7 @@ static void emit(Emitter* e, const CtscNode* n) {
             write_char(e, '(');
             emit_parameter_list_for_js(e, &n->data.functionDeclaration.parameters);
             write_cstr(e, ") ");
-            emit(e, n->data.functionDeclaration.body);
+            emit_function_like_block(e, n->data.functionDeclaration.body, false);
             return;
         }
         /*
@@ -2292,7 +2512,7 @@ static void emit(Emitter* e, const CtscNode* n) {
             write_cstr(e, ") => ");
             const CtscNode* body = n->data.arrowFunction.body;
             if (body && body->kind == CTSC_SK_Block) {
-                emit(e, body);
+                emit_function_like_block(e, body, true);
             } else if (body) {
                 emit(e, body);
             }
@@ -2506,7 +2726,7 @@ static void emit(Emitter* e, const CtscNode* n) {
             write_char(e, ')');
             if (n->data.accessorDeclaration.body) {
                 write_char(e, ' ');
-                emit(e, n->data.accessorDeclaration.body);
+                emit_function_like_block(e, n->data.accessorDeclaration.body, false);
             }
             return;
         }
@@ -2547,7 +2767,7 @@ static void emit(Emitter* e, const CtscNode* n) {
             write_char(e, ')');
             if (n->data.methodDeclaration.body) {
                 write_char(e, ' ');
-                emit(e, n->data.methodDeclaration.body);
+                emit_function_like_block(e, n->data.methodDeclaration.body, false);
             }
             return;
         }

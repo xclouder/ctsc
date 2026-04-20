@@ -103,6 +103,15 @@ static void emit_node(CtscJson* j, const CtscNode* n) {
                 ctsc_json_end_arr(j);
             }
             break;
+        case CTSC_SK_LabeledStatement:
+            /* forEachChildInLabeledStatement (~880): label, statement. */
+            ctsc_json_key(j, "label");
+            emit_node(j, n->data.labeledStatement.label);
+            if (n->data.labeledStatement.statement) {
+                ctsc_json_key(j, "statement");
+                emit_node(j, n->data.labeledStatement.statement);
+            }
+            break;
         case CTSC_SK_VariableStatement:
             ctsc_json_key(j, "declarationList");
             emit_node(j, n->data.variableStatement.declarationList);
@@ -959,20 +968,24 @@ static void emit_node(CtscJson* j, const CtscNode* n) {
              * explicit case for ArrowFunction, so it falls through to the
              * default branch which serialises forEachChild's visits as a
              * single `children` array (only when non-empty). ctsc currently
-             * models `parameters`, `equalsGreaterThanToken`, and `body`;
-             * modifiers / typeParameters / return-type annotation are
-             * skipped until a fixture demands them.
+             * models `typeParameters` (when present), `parameters`,
+             * `equalsGreaterThanToken`, and `body`; modifiers / return-type
+             * annotation are still omitted from JSON until needed.
              *
              * equalsGreaterThanToken is a token leaf emitted as
              * {kind,pos,end}, mirroring tsc's parseExpectedToken +
              * finishNode path (parser.ts parseParenthesizedArrowFunctionExpression
              * ~5498 / parseSimpleArrowFunctionExpression ~5210).
              */
-            size_t child_count = n->data.arrowFunction.parameters.len + 1 /* => */
+            size_t child_count = n->data.arrowFunction.type_parameters.len
+                + n->data.arrowFunction.parameters.len + 1 /* => */
                 + (n->data.arrowFunction.body ? 1 : 0);
             if (child_count > 0) {
                 ctsc_json_key(j, "children");
                 ctsc_json_begin_arr(j);
+                for (size_t i = 0; i < n->data.arrowFunction.type_parameters.len; ++i) {
+                    emit_node(j, n->data.arrowFunction.type_parameters.items[i]);
+                }
                 for (size_t i = 0; i < n->data.arrowFunction.parameters.len; ++i) {
                     emit_node(j, n->data.arrowFunction.parameters.items[i]);
                 }

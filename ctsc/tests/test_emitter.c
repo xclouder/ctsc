@@ -346,6 +346,33 @@ int test_emitter(void) {
     );
 
     /*
+     * emitter.ts emitBlockFunctionBody (~3516) + shouldEmitBlockFunctionBodyOnSingleLine
+     * (~3476), parser.ts parseParenthesizedArrowFunctionExpression (~5430) with
+     * leading typeParameters. Matches selfhost-derived 101_inline_arrow_body.ts.
+     */
+    expect_emit(
+        "export const incAll = (xs: number[]): number[] => xs.map((x) => { return x + 1; });\n"
+        "export function register(on: (fn: (e: number) => void) => void): void {\n"
+        "  on((e) => { console.log(e); });\n"
+        "  on((e) => { if (e > 0) console.log(\"+\"); });\n"
+        "}\n"
+        "export const pick = <T>(arr: T[], i: number): T | undefined => {\n"
+        "  return arr[i];\n"
+        "};\n",
+        "export const incAll = (xs) => xs.map((x) => { return x + 1; });\n"
+        "export function register(on) {\n"
+        "    on((e) => { console.log(e); });\n"
+        "    on((e) => { if (e > 0)\n"
+        "        console.log(\"+\"); });\n"
+        "}\n"
+        "export const pick = (arr, i) => {\n"
+        "    return arr[i];\n"
+        "};\n",
+        "inline arrow block bodies + generic arrow (101_inline_arrow_body)",
+        &failed
+    );
+
+    /*
      * Mirrors upstream parser.ts isStartOfParameter (~3993 DotDotDotToken) +
      * parseDelimitedList Parameters: the function-declaration parameter loop
      * must use the same predicate as the parenthesized-arrow loop so
@@ -386,6 +413,27 @@ int test_emitter(void) {
         "// @target: es2015\npublic break;\n",
         "break;\n",
         "public-modifier-before-break recovery (parserPublicBreak1)",
+        &failed
+    );
+
+    /*
+     * Labeled for + labeled continue (fixtures/emitter/selfhost-derived/
+     * 105_break_continue_label.ts). Mirrors parser.ts parseExpressionOrLabeledStatement
+     * (~7123) + emitter.ts emitLabeledStatement (~3364).
+     */
+    expect_emit(
+        "export function f(xs: number[], target: number): void {\n"
+        "  outer: for (let i = 0; i < xs.length; i++) {\n"
+        "    if (0) continue outer;\n"
+        "  }\n"
+        "}\n",
+        "export function f(xs, target) {\n"
+        "    outer: for (let i = 0; i < xs.length; i++) {\n"
+        "        if (0)\n"
+        "            continue outer;\n"
+        "    }\n"
+        "}\n",
+        "labeled for + continue outer",
         &failed
     );
 
@@ -503,6 +551,32 @@ int test_emitter(void) {
         "    }\n"
         "}\n",
         "switch statement + numeric separators",
+        &failed
+    );
+
+    /*
+     * emitter.ts emitCaseOrDefaultClauseRest (~4007): single short statement on
+     * the same line as `case` / `default` stays inline (fixtures/emitter/
+     * selfhost-derived/99_inline_case_body.ts).
+     */
+    expect_emit(
+        "export function spell(n: number): string {\n"
+        "  switch (n) {\n"
+        "    case 1: return \"one\";\n"
+        "    case 2: return \"two\";\n"
+        "    case 3: return \"three\";\n"
+        "    default: return \"?\";\n"
+        "  }\n"
+        "}\n",
+        "export function spell(n) {\n"
+        "    switch (n) {\n"
+        "        case 1: return \"one\";\n"
+        "        case 2: return \"two\";\n"
+        "        case 3: return \"three\";\n"
+        "        default: return \"?\";\n"
+        "    }\n"
+        "}\n",
+        "switch case inline single statement",
         &failed
     );
 
@@ -694,6 +768,71 @@ int test_emitter(void) {
         "    return out;\n"
         "}\n",
         "object literal spread (SpreadAssignment)",
+        &failed
+    );
+
+    /*
+     * Mirrors upstream emitter.ts emitWhileClause (~3093) + emitWhileStatement
+     * (~3115). Selfhost-derived 103_while_loop.ts.
+     */
+    expect_emit(
+        "function f(n: number): number {\n"
+        "  while (n > 0) {\n"
+        "    n--;\n"
+        "  }\n"
+        "  return n;\n"
+        "}\n",
+        "function f(n) {\n"
+        "    while (n > 0) {\n"
+        "        n--;\n"
+        "    }\n"
+        "    return n;\n"
+        "}\n",
+        "while statement with block body",
+        &failed
+    );
+
+    /*
+     * Mirrors upstream emitter.ts emitDoStatement (~3101) + emitWhileClause
+     * (~3093). Selfhost-derived 104_do_while.ts.
+     */
+    expect_emit(
+        "export function rollUntil(target: number, rng: () => number): number {\n"
+        "  let v: number;\n"
+        "  let tries = 0;\n"
+        "  do {\n"
+        "    v = Math.floor(rng() * 100);\n"
+        "    tries++;\n"
+        "  } while (v !== target && tries < 1000);\n"
+        "  return tries;\n"
+        "}\n"
+        "\n"
+        "export function drain<T>(arr: T[], take: (x: T) => void): void {\n"
+        "  if (arr.length === 0) return;\n"
+        "  do {\n"
+        "    const x = arr.pop();\n"
+        "    if (x !== undefined) take(x);\n"
+        "  } while (arr.length > 0);\n"
+        "}\n",
+        "export function rollUntil(target, rng) {\n"
+        "    let v;\n"
+        "    let tries = 0;\n"
+        "    do {\n"
+        "        v = Math.floor(rng() * 100);\n"
+        "        tries++;\n"
+        "    } while (v !== target && tries < 1000);\n"
+        "    return tries;\n"
+        "}\n"
+        "export function drain(arr, take) {\n"
+        "    if (arr.length === 0)\n"
+        "        return;\n"
+        "    do {\n"
+        "        const x = arr.pop();\n"
+        "        if (x !== undefined)\n"
+        "            take(x);\n"
+        "    } while (arr.length > 0);\n"
+        "}\n",
+        "do-while statement (104_do_while)",
         &failed
     );
 

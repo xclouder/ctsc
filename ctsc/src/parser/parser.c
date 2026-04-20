@@ -152,6 +152,7 @@ static CtscNode* parse_yield_expression(Parser* p);
 static CtscNode* parse_object_literal_expression(Parser* p);
 static CtscNode* parse_block(Parser* p);
 static CtscNode* parse_parameter(Parser* p);
+static bool parse_type_parameters(Parser* p, CtscNodeArray* out);
 static CtscNode* parse_type_annotation(Parser* p);
 static CtscNode* parse_type_in_annotation_position(Parser* p, bool allow_multiline);
 static void skip_type_in_type_parameter_position(Parser* p);
@@ -1764,8 +1765,23 @@ static bool is_start_of_parameter(const Parser* p) {
     return is_binding_identifier_kind(k);
 }
 
-static CtscNode* parse_parenthesized_arrow_function(Parser* p, bool is_async_arrow) {
-    int fs = cur_full_start(p);
+/*
+ * Parses `( ParameterList ) ReturnType? => Body` after the opening `(` has
+ * been verified. `arrow_pos` is the ArrowFunction node `pos` (full start of
+ * `<` for a generic arrow, or of `(` for a plain parenthesized arrow).
+ * `type_parameters` is moved into the ArrowFunction on success (cleared).
+ * When `speculative` is true and the token after the signature is neither
+ * `=>` nor `{`, returns NULL so callers can roll back (mirrors upstream
+ * parseParenthesizedArrowFunctionExpression ~5490 with allowAmbiguity false).
+ */
+static CtscNode* parse_arrow_from_open_paren(
+    Parser* p,
+    bool is_async_arrow,
+    int arrow_pos,
+    CtscNodeArray* type_parameters,
+    bool speculative)
+{
+    int fs = arrow_pos;
     expect(p, CTSC_SK_OpenParenToken);
     CtscNodeArray params; ctsc_node_array_init(&params);
     /* Mirrors upstream/TypeScript/src/compiler/parser.ts parseDelimitedList
@@ -1827,6 +1843,11 @@ static CtscNode* parse_parenthesized_arrow_function(Parser* p, bool is_async_arr
     if (cur(p) == CTSC_SK_ColonToken) {
         (void)parse_type_annotation(p);
     }
+    CtscSyntaxKind last_token = cur(p);
+    if (speculative && last_token != CTSC_SK_EqualsGreaterThanToken
+        && last_token != CTSC_SK_OpenBraceToken) {
+        return NULL;
+    }
     /* parser.ts ~5497:
      *     const lastToken = token();
      *     const equalsGreaterThanToken = parseExpectedToken(EqualsGreaterThanToken);
@@ -1841,7 +1862,6 @@ static CtscNode* parse_parenthesized_arrow_function(Parser* p, bool is_async_arr
      * 107_parserErrorRecovery_ParameterList5.ts fixture expects:
      *     EqualsGreaterThanToken pos=35 end=35, Identifier pos=35 end=35
      *     escapedText="". */
-    CtscSyntaxKind last_token = cur(p);
     int eg_pos, eg_end;
     if (cur(p) == CTSC_SK_EqualsGreaterThanToken) {
         eg_pos = cur_full_start(p);
@@ -1875,11 +1895,20 @@ static CtscNode* parse_parenthesized_arrow_function(Parser* p, bool is_async_arr
     int end = body ? body->end : cur_full_start(p);
     CtscNode* af = ctsc_node_new(p->arena, CTSC_SK_ArrowFunction, fs, end);
     af->data.arrowFunction.has_async = is_async_arrow;
+    af->data.arrowFunction.type_parameters = *type_parameters;
+    ctsc_node_array_init(type_parameters);
     af->data.arrowFunction.parameters = params;
     af->data.arrowFunction.equals_greater_than_pos = eg_pos;
     af->data.arrowFunction.equals_greater_than_end = eg_end;
     af->data.arrowFunction.body = body;
     return af;
+}
+
+static CtscNode* parse_parenthesized_arrow_function(Parser* p, bool is_async_arrow) {
+    CtscNodeArray empty_tps;
+    ctsc_node_array_init(&empty_tps);
+    return parse_arrow_from_open_paren(
+        p, is_async_arrow, cur_full_start(p), &empty_tps, false);
 }
 
 static CtscNode* parse_async_parenthesized_arrow_function(Parser* p) {
@@ -1954,6 +1983,28 @@ static CtscNode* parse_assignment_expression(Parser* p) {
         if (ok) {
             return parse_async_parenthesized_arrow_function(p);
         }
+    }
+    /*
+     * Mirrors upstream parser.ts isParenthesizedArrowFunctionExpression (~5236):
+     * the worker treats LessThanToken like OpenParenToken for generic arrow
+     * heads (`<T>(a) => ...`). parsePossibleParenthesizedArrowFunctionExpression
+     * (~5381) speculatively parses; we mirror the rollback with a saved
+     * scanner + diagnostic checkpoint (see parseParenthesizedArrowFunctionExpression
+     * ~5430 + ~5490 allowAmbiguity false).
+     */
+    if (cur(p) == CTSC_SK_LessThanToken) {
+        CtscScanner saved = p->scanner;
+        size_t saved_diag_count = p->diagnostics->count;
+        int arrow_fs = cur_full_start(p);
+        CtscNodeArray tps;
+        ctsc_node_array_init(&tps);
+        (void)parse_type_parameters(p, &tps);
+        if (cur(p) == CTSC_SK_OpenParenToken && looks_like_parenthesized_arrow_function(p)) {
+            CtscNode* af = parse_arrow_from_open_paren(p, false, arrow_fs, &tps, true);
+            if (af) return af;
+        }
+        p->scanner = saved;
+        ctsc_diag_truncate(p->diagnostics, saved_diag_count);
     }
     /* Production 4: parenthesized ArrowFunctionExpression. Mirrors parser.ts
      * tryParseParenthesizedArrowFunctionExpression (~5216). We commit only
@@ -3251,6 +3302,7 @@ static CtscNode* parse_variable_statement(Parser* p) {
 }
 
 static CtscNode* parse_statement(Parser* p);
+static CtscNode* parse_expression_or_labeled_statement(Parser* p, int stmt_start);
 
 /*
  * Mirrors upstream/TypeScript/src/compiler/parser.ts parseClassElement
@@ -6106,18 +6158,33 @@ static CtscNode* parse_statement(Parser* p) {
         }
         default: break;
     }
-    /* Expression statement */
-    CtscNode* expr = parse_expression(p);
-    if (!expr) {
+    return parse_expression_or_labeled_statement(p, fs);
+}
+
+/*
+ * Mirrors upstream/TypeScript/src/compiler/parser.ts parseExpressionOrLabeledStatement (~7123).
+ */
+static CtscNode* parse_expression_or_labeled_statement(Parser* p, int stmt_start) {
+    CtscNode* expression = parse_expression(p);
+    if (!expression) {
         ctsc_diag_push(p->diagnostics, CTSC_DIAG_ERROR, 9000, cur_start(p), cur_end(p) - cur_start(p),
             "ctsc parser: unrecognized statement start (token %s).", ctsc_syntax_kind_name(cur(p)));
         advance(p);
         return NULL;
     }
-    int end = expr->end;
+    if (expression->kind == CTSC_SK_Identifier && cur(p) == CTSC_SK_ColonToken) {
+        advance(p);
+        CtscNode* body = parse_statement(p);
+        int end = body ? body->end : expression->end;
+        CtscNode* lab = ctsc_node_new(p->arena, CTSC_SK_LabeledStatement, stmt_start, end);
+        lab->data.labeledStatement.label = expression;
+        lab->data.labeledStatement.statement = body;
+        return lab;
+    }
+    int end = expression->end;
     if (cur(p) == CTSC_SK_SemicolonToken) { end = cur_end(p); advance(p); }
-    CtscNode* stmt = ctsc_node_new(p->arena, CTSC_SK_ExpressionStatement, fs, end);
-    stmt->data.expressionStatement.expression = expr;
+    CtscNode* stmt = ctsc_node_new(p->arena, CTSC_SK_ExpressionStatement, stmt_start, end);
+    stmt->data.expressionStatement.expression = expression;
     return stmt;
 }
 
