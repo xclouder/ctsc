@@ -37,6 +37,7 @@ void ctsc_type_registry_init(CtscTypeRegistry* reg, CtscArena* arena) {
     reg->t_boolean   = primitive(reg, CTSC_TYPE_BOOLEAN);
     reg->t_symbol    = primitive(reg, CTSC_TYPE_SYMBOL);
     reg->t_object    = primitive(reg, CTSC_TYPE_OBJECT);
+    reg->t_empty_object = primitive(reg, CTSC_TYPE_EMPTY_OBJECT);
 
     reg->t_true = (CtscType*)ctsc_arena_calloc(reg->arena, 1, sizeof(CtscType));
     reg->t_true->kind = CTSC_TYPE_BOOLEAN_LITERAL;
@@ -167,6 +168,7 @@ void ctsc_type_to_string(const CtscType* t, CtscBuffer* out) {
         case CTSC_TYPE_BOOLEAN:     ctsc_buf_append_cstr(out, "boolean");   return;
         case CTSC_TYPE_SYMBOL:      ctsc_buf_append_cstr(out, "symbol");    return;
         case CTSC_TYPE_OBJECT:      ctsc_buf_append_cstr(out, "object");    return;
+        case CTSC_TYPE_EMPTY_OBJECT: ctsc_buf_append_cstr(out, "{}");       return;
         case CTSC_TYPE_NUMBER_LITERAL:  emit_number_literal(out, t->number_value); return;
         case CTSC_TYPE_STRING_LITERAL:  emit_utf16_escaped_for_string_literal(out, t->text, t->text_len); return;
         case CTSC_TYPE_BOOLEAN_LITERAL: ctsc_buf_append_cstr(out, t->boolean_value ? "true" : "false"); return;

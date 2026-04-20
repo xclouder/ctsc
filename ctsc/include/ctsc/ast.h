@@ -35,6 +35,14 @@ typedef struct {
      * emitBodyWithDetachedComments + the trailing emitLeadingComments call).
      */
     int           statements_end;
+    /*
+     * Full source as UTF-16 code units (arena copy of the parser scanner
+     * buffer). Used by the checker for postfix `T[]` detection: under noLib,
+     * getTypeAtLocation stringifies intrinsic `T[]` as `{}` while function
+     * signatures still print `T[]` (checker.ts / typeToString paths).
+     */
+    const uint16_t* text_utf16;
+    size_t          text_utf16_len;
 } CtscSourceFileData;
 
 typedef struct {

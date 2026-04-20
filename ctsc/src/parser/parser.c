@@ -3032,6 +3032,86 @@ static CtscNode* parse_type_in_annotation_position(Parser* p, bool allow_multili
             }
         }
     }
+    /*
+     * String literal type (`const x: "a" = "b"`). Mirrors upstream
+     * parser.ts parseLiteralTypeNode / LiteralType (~4610-4612) as consumed
+     * from parseNonArrayType.
+     */
+    if (cur(p) == CTSC_SK_StringLiteral) {
+        int fs = cur_full_start(p);
+        const uint16_t* lit_text = p->scanner.current.text;
+        size_t lit_text_len = p->scanner.current.text_len;
+        const uint16_t* lit_value = p->scanner.current.value;
+        size_t lit_value_len = p->scanner.current.value_len;
+        bool lit_sq = (lit_text_len > 0 && lit_text[0] == '\'');
+        CtscScanner saved = p->scanner;
+        advance(p);
+        /*
+         * Union (`"a" | "b"`) must fall through to the stop-set fallback so
+         * `| ...` is absorbed (same pattern as keyword types above).
+         */
+        if (cur(p) == CTSC_SK_BarToken) {
+            p->scanner = saved;
+        } else {
+            consume_postfix_type_operators(p);
+            if (cur(p) == CTSC_SK_BarToken) {
+                p->scanner = saved;
+            } else {
+                int end = cur_full_start(p);
+                CtscNode* n = ctsc_node_new(p->arena, CTSC_SK_StringLiteral, fs, end);
+                n->data.stringLiteral.text = lit_text;
+                n->data.stringLiteral.text_len = lit_text_len;
+                n->data.stringLiteral.value = lit_value;
+                n->data.stringLiteral.value_len = lit_value_len;
+                n->data.stringLiteral.single_quote = lit_sq;
+                return n;
+            }
+        }
+    }
+    /*
+     * Numeric literal type (`const x: 1 = 2`). Mirrors upstream
+     * parser.ts parseNonArrayType / LiteralTypeNode for NumericLiteral (~4610).
+     */
+    if (cur(p) == CTSC_SK_NumericLiteral) {
+        int fs = cur_full_start(p);
+        const uint16_t* tok_text = p->scanner.current.text;
+        size_t tok_text_len = p->scanner.current.text_len;
+        const uint16_t* tok_value = p->scanner.current.value;
+        size_t tok_value_len = p->scanner.current.value_len;
+        bool numeric_invalid = p->scanner.current.numeric_literal_is_invalid;
+        CtscScanner saved = p->scanner;
+        advance(p);
+        if (cur(p) == CTSC_SK_BarToken) {
+            p->scanner = saved;
+        } else {
+            consume_postfix_type_operators(p);
+            if (cur(p) == CTSC_SK_BarToken) {
+                p->scanner = saved;
+            } else {
+                int end = cur_full_start(p);
+                CtscNode* n = ctsc_node_new(p->arena, CTSC_SK_NumericLiteral, fs, end);
+                if (tok_value && tok_value_len) {
+                    n->data.numericLiteral.text = tok_value;
+                    n->data.numericLiteral.text_len = tok_value_len;
+                } else {
+                    n->data.numericLiteral.text = tok_text;
+                    n->data.numericLiteral.text_len = tok_text_len;
+                }
+                bool has_numeric_sep = false;
+                for (size_t ti = 0; ti < tok_text_len; ti++) {
+                    if (tok_text[ti] == '_') { has_numeric_sep = true; break; }
+                }
+                if (numeric_invalid || has_numeric_sep) {
+                    n->data.numericLiteral.source_text = NULL;
+                    n->data.numericLiteral.source_text_len = 0;
+                } else {
+                    n->data.numericLiteral.source_text = tok_text;
+                    n->data.numericLiteral.source_text_len = tok_text_len;
+                }
+                return n;
+            }
+        }
+    }
     /* Identifier-led TypeReference: mirror upstream parser.ts parseTypeReference
      * (~4577) → parseEntityNameOfTypeReference + parseTypeArgumentsOfTypeReference.
      * parse_type_node already produces a CTSC_SK_TypeReference carrying
@@ -6283,6 +6363,14 @@ CtscParseResult ctsc_parse(const char* src, size_t len, CtscArena* arena) {
     /* cur is EndOfFileToken: its full_start is scanner.getTokenFullStart(),
      * which tsc assigns to the surrounding statements NodeArray .end. */
     sf->data.sourceFile.statements_end = cur_full_start(&p);
+
+    /*
+     * Borrow the scanner's UTF-16 buffer for the SourceFile lifetime. AST
+     * nodes already point into this allocation (Identifier text, literals);
+     * we must not ctsc_scanner_free() it here or those pointers would dangle.
+     */
+    sf->data.sourceFile.text_utf16 = p.scanner.source.data;
+    sf->data.sourceFile.text_utf16_len = p.scanner.source.len;
 
     r.sourceFile = sf;
     return r;

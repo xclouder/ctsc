@@ -37,6 +37,9 @@ typedef enum {
     CTSC_TYPE_BOOLEAN,
     CTSC_TYPE_SYMBOL,
     CTSC_TYPE_OBJECT,      /* the keyword/intrinsic `object` */
+    /* Empty object type `{}` (TypeFlags.Object). With noLib, array literals
+     * infer to this (checker.ts checkArrayLiteral → createArrayType ~33399). */
+    CTSC_TYPE_EMPTY_OBJECT,
 
     /* Literal types (types.ts LiteralType). */
     CTSC_TYPE_NUMBER_LITERAL,
@@ -88,6 +91,7 @@ typedef struct CtscTypeRegistry {
     CtscType* t_boolean;
     CtscType* t_symbol;
     CtscType* t_object;
+    CtscType* t_empty_object;
     CtscType* t_true;
     CtscType* t_false;
 } CtscTypeRegistry;
