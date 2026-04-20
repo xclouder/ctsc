@@ -56,6 +56,13 @@ typedef enum {
      */
     CTSC_TYPE_OBJECT_LITERAL,
 
+    /*
+     * Nominal reference to a named class (instance type). typeToString is the
+     * class identifier (checker.ts getTypeOfSymbol / class instance ~12537).
+     * Payload uses `text` / `text_len` (UTF-16), same storage as literals.
+     */
+    CTSC_TYPE_REFERENCE,
+
     /* Reserved for M4.1+ (kept here so switch tables compile without churn). */
     CTSC_TYPE_FUNCTION
 } CtscTypeKind;
@@ -88,6 +95,16 @@ struct CtscType {
     /* OBJECT_LITERAL */
     CtscObjectProperty* object_properties;
     size_t                object_properties_len;
+
+    /*
+     * Optional alias name for typeToString when a TypeReference resolved
+     * through a local type alias (checker.ts typeToTypeNodeWorker ~6916:
+     * type.aliasSymbol + !shouldExpandType → symbolToTypeNode).
+     * Assignability still uses union_members / object_properties; only
+     * ctsc_type_to_string prefers this when set.
+     */
+    const uint16_t* alias_symbol_name;
+    size_t          alias_symbol_name_len;
 };
 
 struct CtscArena;
@@ -126,6 +143,9 @@ CtscType* ctsc_type_bigint_literal(CtscTypeRegistry* reg, const uint16_t* text, 
 
 /* Anonymous object literal type: `props` must live in `reg`'s arena. */
 CtscType* ctsc_type_object_literal(CtscTypeRegistry* reg, CtscObjectProperty* props, size_t prop_count);
+
+/* Class instance / nominal named type: typeToString is the identifier text. */
+CtscType* ctsc_type_reference(CtscTypeRegistry* reg, const uint16_t* name, size_t name_len);
 
 /* Widening rules (types.ts getWidenedLiteralType): narrow literal -> base. */
 CtscType* ctsc_type_widen(CtscTypeRegistry* reg, const CtscType* t);

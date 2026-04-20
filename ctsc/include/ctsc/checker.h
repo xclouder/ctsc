@@ -33,6 +33,10 @@
  *       FunctionDeclaration supplies fewer than the minimum arity (span on
  *       the callee expression; mirrors checker.ts getArgumentArityError
  *       ~36410-36477 and getDiagnosticSpanForCallNode ~36359-36362)
+ *     - TS2339 "Property '...' does not exist on type '...'." when a property
+ *       access targets a missing member of an anonymous object literal type
+ *       (span on the property name; mirrors checker.ts checkPropertyAccessExpression
+ *       / reportNonexistentProperty path ~34948-34968)
  *     - TS2552 (basic) "Cannot find name '...'. Did you mean 'y'?" optional,
  *       guarded behind a Levenshtein <=2 suggestion against in-scope symbols
  *

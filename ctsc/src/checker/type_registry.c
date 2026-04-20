@@ -81,6 +81,13 @@ CtscType* ctsc_type_object_literal(CtscTypeRegistry* reg, CtscObjectProperty* pr
     return t;
 }
 
+CtscType* ctsc_type_reference(CtscTypeRegistry* reg, const uint16_t* name, size_t name_len) {
+    CtscType* t = ctsc_type_new(reg, CTSC_TYPE_REFERENCE);
+    t->text = name;
+    t->text_len = name_len;
+    return t;
+}
+
 /*
  * Literal → base widening (types.ts getWidenedLiteralType ~35395):
  *   42 → number,  "hi" → string,  true/false → boolean,  42n → bigint.
@@ -93,6 +100,7 @@ CtscType* ctsc_type_widen(CtscTypeRegistry* reg, const CtscType* t) {
         case CTSC_TYPE_STRING_LITERAL:  return reg->t_string;
         case CTSC_TYPE_BOOLEAN_LITERAL: return reg->t_boolean;
         case CTSC_TYPE_BIGINT_LITERAL:  return reg->t_bigint;
+        case CTSC_TYPE_REFERENCE:       return (CtscType*)t;
         default: return (CtscType*)t;
     }
 }
@@ -198,6 +206,10 @@ void ctsc_type_to_string(const CtscType* t, CtscBuffer* out) {
             return;
         }
         case CTSC_TYPE_UNION: {
+            if (t->alias_symbol_name && t->alias_symbol_name_len > 0) {
+                append_utf16_ascii_identifier_prop_name(out, t->alias_symbol_name, t->alias_symbol_name_len);
+                return;
+            }
             for (size_t i = 0; i < t->union_members_len; ++i) {
                 if (i > 0) ctsc_buf_append_cstr(out, " | ");
                 ctsc_type_to_string(t->union_members[i], out);
@@ -205,6 +217,10 @@ void ctsc_type_to_string(const CtscType* t, CtscBuffer* out) {
             return;
         }
         case CTSC_TYPE_OBJECT_LITERAL: {
+            if (t->alias_symbol_name && t->alias_symbol_name_len > 0) {
+                append_utf16_ascii_identifier_prop_name(out, t->alias_symbol_name, t->alias_symbol_name_len);
+                return;
+            }
             ctsc_buf_append_cstr(out, "{ ");
             for (size_t i = 0; i < t->object_properties_len; ++i) {
                 if (i > 0) ctsc_buf_append_cstr(out, "; ");
@@ -216,6 +232,9 @@ void ctsc_type_to_string(const CtscType* t, CtscBuffer* out) {
             ctsc_buf_append_cstr(out, "; }");
             return;
         }
+        case CTSC_TYPE_REFERENCE:
+            append_utf16_ascii_identifier_prop_name(out, t->text, t->text_len);
+            return;
         default:
             ctsc_buf_append_cstr(out, "any");
             return;

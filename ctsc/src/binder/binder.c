@@ -182,6 +182,35 @@ static void bind_node(CtscBindResult* r, CtscArena* a,
             bind_children(r, a, container_scope, block_scope,
                           &node->data.defaultClause.statements);
             break;
+        case CTSC_SK_ClassDeclaration: {
+            /* Mirrors binder.ts bindClassDeclaration (~3720): class name is a
+             * BlockLike / container-local value symbol (script top-level uses
+             * the SourceFile as container). */
+            const CtscNode* name = node->data.classDeclaration.name;
+            if (name) {
+                declare_symbol_in_scope(a, container_scope, name, CTSC_SYMBOL_FLAG_Class, node);
+            }
+            break;
+        }
+        case CTSC_SK_InterfaceDeclaration: {
+            /* Mirrors binder.ts bindInterfaceDeclaration (~3726): interface name
+             * is a type symbol in the enclosing container (parser.ts shares
+             * CtscClassDeclarationData shape with InterfaceDeclaration). */
+            const CtscNode* name = node->data.classDeclaration.name;
+            if (name) {
+                declare_symbol_in_scope(a, container_scope, name, CTSC_SYMBOL_FLAG_Interface, node);
+            }
+            break;
+        }
+        case CTSC_SK_TypeAliasDeclaration: {
+            /* Mirrors binder.ts bindTypeAliasDeclaration (~3732): alias name is
+             * SymbolFlags.TypeAlias in the enclosing container. */
+            const CtscNode* name = node->data.typeAliasDeclaration.name;
+            if (name) {
+                declare_symbol_in_scope(a, container_scope, name, CTSC_SYMBOL_FLAG_TypeAlias, node);
+            }
+            break;
+        }
         case CTSC_SK_VariableStatement: {
             /* Mirrors binder.ts bindVariableDeclarationOrBindingElement (~3648):
              * each VariableDeclaration contributes a symbol. `let`/`const`

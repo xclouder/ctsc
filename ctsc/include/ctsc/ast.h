@@ -751,9 +751,9 @@ typedef struct {
  * `children` array. forEachChild for MethodDeclaration visits, in order:
  *   modifiers, asteriskToken, name, questionToken, exclamationToken,
  *   typeParameters, parameters, type, body.
- * ctsc currently only models the subset the 106_FunctionPropertyAssignments3
- * fixture exercises (`*{ } }` → asteriskToken + missing name + Block body);
- * additional fields will be grown alongside fixtures that require them.
+ * ctsc models modifiers, asteriskToken, name, typeParameters, parameters,
+ * optional return-type `type`, and body; questionToken / exclamationToken
+ * are omitted until fixtures require them.
  *
  * `has_asterisk` tracks whether the `*` token was present so the JSON
  * emitter can include an AsteriskToken child leaf with the recorded pos/end
@@ -779,6 +779,8 @@ typedef struct {
     CtscNode*     name;           /* Identifier (possibly missing, zero-width) */
     CtscNodeArray type_parameters;
     CtscNodeArray parameters;
+    /* Nullable `:` ReturnType from parseMethodDeclaration (parser.ts ~7796). */
+    CtscNode*     type;
     CtscNode*     body;           /* nullable Block */
 } CtscMethodDeclarationData;
 

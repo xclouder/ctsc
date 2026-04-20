@@ -2392,13 +2392,10 @@ static CtscNode* parse_method_declaration_rest(
             cur_start(p), cur_end(p) - cur_start(p),
             "'%s' expected.", ctsc_syntax_kind_name(CTSC_SK_OpenParenToken));
     }
-    /* Skip optional ":" ReturnType — none of the currently-unlocked fixtures
-     * exercise a typed method in an object literal, so we only consume the
-     * colon when present and delegate to parse_type_annotation which handles
-     * its own stop set (variables declared inside an object literal use the
-     * same stop tokens). Do NOT consume when there is no colon. */
+    /* Optional ":" ReturnType (parser.ts parseMethodDeclaration ~7796). */
+    CtscNode* return_type = NULL;
     if (cur(p) == CTSC_SK_ColonToken) {
-        (void)parse_type_annotation(p);
+        return_type = parse_type_annotation(p);
     }
     CtscNode* body = NULL;
     if (cur(p) == CTSC_SK_OpenBraceToken) {
@@ -2419,6 +2416,7 @@ static CtscNode* parse_method_declaration_rest(
     m->data.methodDeclaration.name = name;
     m->data.methodDeclaration.type_parameters = type_parameters;
     m->data.methodDeclaration.parameters = params;
+    m->data.methodDeclaration.type = return_type;
     m->data.methodDeclaration.body = body;
     return m;
 }

@@ -687,9 +687,8 @@ static void emit_node(CtscJson* j, const CtscNode* n) {
              * to the default branch which serializes forEachChild's visits as
              * a single `children` array (only when non-empty).
              *
-             * ctsc currently models the subset exercised by fixtures:
-             * asteriskToken, name, parameters (each a Parameter), and the
-             * body. Undefined visits (no asteriskToken / no body) are skipped
+             * ctsc models: modifiers, asteriskToken, name, typeParameters,
+             * parameters, optional return `type`, body. Undefined visits are skipped
              * the way ts.forEachChild / visitNode skip undefined, so the
              * `{kind,pos,end}` only shape is emitted when all four are absent
              * (currently impossible because name is always at least the zero-
@@ -700,6 +699,7 @@ static void emit_node(CtscJson* j, const CtscNode* n) {
             if (n->data.methodDeclaration.name) child_count++;
             child_count += n->data.methodDeclaration.type_parameters.len;
             child_count += n->data.methodDeclaration.parameters.len;
+            if (n->data.methodDeclaration.type) child_count++;
             if (n->data.methodDeclaration.body) child_count++;
             if (child_count > 0) {
                 ctsc_json_key(j, "children");
@@ -728,6 +728,9 @@ static void emit_node(CtscJson* j, const CtscNode* n) {
                 }
                 for (size_t i = 0; i < n->data.methodDeclaration.parameters.len; ++i) {
                     emit_node(j, n->data.methodDeclaration.parameters.items[i]);
+                }
+                if (n->data.methodDeclaration.type) {
+                    emit_node(j, n->data.methodDeclaration.type);
                 }
                 if (n->data.methodDeclaration.body) {
                     emit_node(j, n->data.methodDeclaration.body);
