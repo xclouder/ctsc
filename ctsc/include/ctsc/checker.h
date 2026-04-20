@@ -25,6 +25,14 @@
  *     - TS2322 "Type '...' is not assignable to type '...'." when a
  *       VariableDeclaration has a type annotation incompatible with its
  *       initializer (span on the binding name, matching tsc)
+ *     - TS2345 "Argument of type '...' is not assignable to parameter of type
+ *       '...'." for a simple call to a FunctionDeclaration when an argument
+ *       expression is not assignable (span on the argument node; mirrors
+ *       checker.ts getSignatureApplicabilityError ~36181)
+ *     - TS2554 "Expected N arguments, but got M." when a call to a resolved
+ *       FunctionDeclaration supplies fewer than the minimum arity (span on
+ *       the callee expression; mirrors checker.ts getArgumentArityError
+ *       ~36410-36477 and getDiagnosticSpanForCallNode ~36359-36362)
  *     - TS2552 (basic) "Cannot find name '...'. Did you mean 'y'?" optional,
  *       guarded behind a Levenshtein <=2 suggestion against in-scope symbols
  *

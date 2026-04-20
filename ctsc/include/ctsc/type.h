@@ -10,9 +10,8 @@
  * Minimal subset of TypeScript's internal Type hierarchy, designed to grow.
  * Mirrors upstream/TypeScript/src/compiler/types.ts `TypeFlags` / `Type` in
  * spirit, but only the kinds currently needed by ctsc's checker. Additional
- * kinds (Object literal types, Tuple, Union variants, Generic TypeParameter,
- * Class/Interface declaration types, ...) will be added as M4.1+ fixtures
- * unlock them.
+ * kinds (Tuple, Generic TypeParameter, Class/Interface declaration types,
+ * ...) will be added as M4.1+ fixtures unlock them.
  *
  * Serialisation rule: ctsc_type_to_string() produces the exact string that
  * tsc's `TypeChecker.typeToString()` emits for the same type in default
@@ -50,11 +49,25 @@ typedef enum {
     /* Union type (types.ts UnionType). Stored flattened / deduped. */
     CTSC_TYPE_UNION,
 
+    /*
+     * Anonymous object literal type (checker.ts checkObjectLiteral ~33527).
+     * typeToString matches `{ a: number; }` style (space after `{`, `; ` between
+     * properties, trailing `; ` before `}`).
+     */
+    CTSC_TYPE_OBJECT_LITERAL,
+
     /* Reserved for M4.1+ (kept here so switch tables compile without churn). */
     CTSC_TYPE_FUNCTION
 } CtscTypeKind;
 
 typedef struct CtscType CtscType;
+
+/* One named property on an OBJECT_LITERAL type (source order). */
+typedef struct {
+    const uint16_t* name;
+    size_t          name_len;
+    CtscType*       value_type;
+} CtscObjectProperty;
 
 struct CtscType {
     CtscTypeKind kind;
@@ -71,6 +84,10 @@ struct CtscType {
      * preserves the order types entered the union in most cases). */
     CtscType**  union_members;
     size_t      union_members_len;
+
+    /* OBJECT_LITERAL */
+    CtscObjectProperty* object_properties;
+    size_t                object_properties_len;
 };
 
 struct CtscArena;
@@ -106,6 +123,9 @@ CtscType* ctsc_type_new(CtscTypeRegistry* reg, CtscTypeKind kind);
 CtscType* ctsc_type_number_literal(CtscTypeRegistry* reg, double v);
 CtscType* ctsc_type_string_literal(CtscTypeRegistry* reg, const uint16_t* text, size_t len);
 CtscType* ctsc_type_bigint_literal(CtscTypeRegistry* reg, const uint16_t* text, size_t len);
+
+/* Anonymous object literal type: `props` must live in `reg`'s arena. */
+CtscType* ctsc_type_object_literal(CtscTypeRegistry* reg, CtscObjectProperty* props, size_t prop_count);
 
 /* Widening rules (types.ts getWidenedLiteralType): narrow literal -> base. */
 CtscType* ctsc_type_widen(CtscTypeRegistry* reg, const CtscType* t);

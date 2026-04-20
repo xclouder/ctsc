@@ -2,6 +2,7 @@
 #include "ctsc/arena.h"
 #include "ctsc/scanner.h"
 
+#include <limits.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -22,6 +23,15 @@
  *     assignable to the annotation (error on the binding name), mirroring
  *     checker.ts checkVariableDeclaration / checkTypeAssignableTo
  *     (~22686, Diagnostics.Type_0_is_not_assignable_to_type_1).
+ *   - TS2345 when a call argument is not assignable to the corresponding
+ *     parameter of a resolved FunctionDeclaration, mirroring checker.ts
+ *     getSignatureApplicabilityError (~36181,
+ *     Diagnostics.Argument_of_type_0_is_not_assignable_to_parameter_of_type_1).
+ *   - TS2554 when a call supplies fewer or more arguments than the callee's
+ *     arity allows (checker.ts getArgumentArityError ~36410-36494,
+ *     Diagnostics.Expected_0_arguments_but_got_1). Too few: span on the
+ *     callee via getDiagnosticSpanForCallNode ~36359-36362; too many: span on
+ *     excess argument expressions ~36479-36493.
  *
  * The walker below is intentionally a tiny, switch-driven visitor that only
  * looks at the node fields relevant to M4.0. It is the canonical place the
@@ -99,7 +109,45 @@ typedef struct {
     ScopeStack       scopes;
     const uint16_t* source_utf16;
     size_t           source_utf16_len;
+    /*
+     * VariableDeclaration* → whether its VariableDeclarationList was const.
+     * Populated before inferring types in each VariableStatement so
+     * `const a = 1, b = a` can resolve `a` with the correct const/let widening
+     * (checker.ts getTypeOfSymbol → getTypeOfVariableOrParameterOrPropertyWorker
+     * ~12537, getWidenedTypeForVariableLikeDeclaration ~12451).
+     */
+    const CtscNode** var_decl_const_keys;
+    bool*            var_decl_const_vals;
+    size_t           var_decl_const_len;
+    size_t           var_decl_const_cap;
 } Walk;
+
+static void var_decl_const_register(Walk* w, const CtscNode* decl, bool is_const) {
+    if (!w || !decl) return;
+    if (w->var_decl_const_len + 1 > w->var_decl_const_cap) {
+        size_t ncap = w->var_decl_const_cap ? w->var_decl_const_cap * 2 : 16;
+        const CtscNode** nk = (const CtscNode**)ctsc_arena_alloc(w->arena, ncap * sizeof(CtscNode*));
+        bool* nv = (bool*)ctsc_arena_alloc(w->arena, ncap * sizeof(bool));
+        if (w->var_decl_const_keys) {
+            memcpy(nk, w->var_decl_const_keys, w->var_decl_const_len * sizeof(CtscNode*));
+            memcpy(nv, w->var_decl_const_vals, w->var_decl_const_len * sizeof(bool));
+        }
+        w->var_decl_const_keys = nk;
+        w->var_decl_const_vals = nv;
+        w->var_decl_const_cap = ncap;
+    }
+    w->var_decl_const_keys[w->var_decl_const_len] = decl;
+    w->var_decl_const_vals[w->var_decl_const_len] = is_const;
+    w->var_decl_const_len++;
+}
+
+static bool var_decl_is_const(Walk* w, const CtscNode* decl) {
+    if (!w || !decl) return false;
+    for (size_t i = 0; i < w->var_decl_const_len; ++i) {
+        if (w->var_decl_const_keys[i] == decl) return w->var_decl_const_vals[i];
+    }
+    return false;
+}
 
 /* ----- type inference helpers ----- */
 
@@ -233,6 +281,371 @@ static void append_type_for_signature(CtscBuffer* out, const CtscNode* type_node
 
 static double numeric_literal_to_double(const CtscNumericLiteralData* d);
 
+/*
+ * Parser fallback for complex type annotations (e.g. `number | string`) yields a
+ * TypeReference with no typeName (parser.c parse_type_node ~571). Mirror
+ * checker.ts getTypeFromTypeNode (~15000+) by recovering a CtscType from the
+ * UTF-16 span between pos/end.
+ */
+static int u16_span_trim_bounds(const uint16_t* s, int pos, int end, int* out_end) {
+    while (pos < end && ctsc_is_ws_u16(s[pos])) pos++;
+    while (end > pos && ctsc_is_ws_u16(s[end - 1])) end--;
+    *out_end = end;
+    return pos;
+}
+
+static bool u16_span_eq_ascii(const uint16_t* s, int a, int b, const char* lit) {
+    size_t L = strlen(lit);
+    if (b - a != (int)L) return false;
+    for (size_t i = 0; i < L; i++) {
+        if (s[a + (int)i] != (uint16_t)(unsigned char)lit[i]) return false;
+    }
+    return true;
+}
+
+static CtscType* primitive_type_from_trimmed_span(CtscTypeRegistry* reg,
+                                                  const uint16_t* s, int a, int b) {
+    if (a >= b) return NULL;
+    if (u16_span_eq_ascii(s, a, b, "undefined")) return reg->t_undefined;
+    if (u16_span_eq_ascii(s, a, b, "boolean")) return reg->t_boolean;
+    if (u16_span_eq_ascii(s, a, b, "bigint")) return reg->t_bigint;
+    if (u16_span_eq_ascii(s, a, b, "number")) return reg->t_number;
+    if (u16_span_eq_ascii(s, a, b, "string")) return reg->t_string;
+    if (u16_span_eq_ascii(s, a, b, "symbol")) return reg->t_symbol;
+    if (u16_span_eq_ascii(s, a, b, "object")) return reg->t_object;
+    if (u16_span_eq_ascii(s, a, b, "unknown")) return reg->t_unknown;
+    if (u16_span_eq_ascii(s, a, b, "never")) return reg->t_never;
+    if (u16_span_eq_ascii(s, a, b, "any")) return reg->t_any;
+    if (u16_span_eq_ascii(s, a, b, "void")) return reg->t_void;
+    if (u16_span_eq_ascii(s, a, b, "null")) return reg->t_null;
+    return NULL;
+}
+
+/*
+ * Intrinsic-only unions are ordered for typeToString the same way tsc orders
+ * union constituents (checker.ts getUnionType ~14780+ / typeToString).
+ */
+static int intrinsic_union_emit_rank(const CtscType* t) {
+    switch (t->kind) {
+        case CTSC_TYPE_STRING:      return 10;
+        case CTSC_TYPE_NUMBER:      return 20;
+        case CTSC_TYPE_BOOLEAN:     return 30;
+        case CTSC_TYPE_BIGINT:      return 40;
+        case CTSC_TYPE_SYMBOL:      return 50;
+        case CTSC_TYPE_UNDEFINED:   return 60;
+        case CTSC_TYPE_NULL:        return 70;
+        case CTSC_TYPE_VOID:        return 80;
+        case CTSC_TYPE_OBJECT:      return 90;
+        case CTSC_TYPE_NEVER:       return 100;
+        case CTSC_TYPE_UNKNOWN_T:   return 110;
+        case CTSC_TYPE_ANY:         return 120;
+        default:                    return 9999;
+    }
+}
+
+static bool union_is_all_sortable_intrinsics(const CtscType* u) {
+    if (!u || u->kind != CTSC_TYPE_UNION) return false;
+    for (size_t i = 0; i < u->union_members_len; ++i) {
+        if (intrinsic_union_emit_rank(u->union_members[i]) >= 9999) return false;
+    }
+    return u->union_members_len > 1;
+}
+
+static void sort_intrinsic_union_members(CtscType* u) {
+    if (!union_is_all_sortable_intrinsics(u)) return;
+    for (size_t i = 1; i < u->union_members_len; ++i) {
+        CtscType* key = u->union_members[i];
+        int rk = intrinsic_union_emit_rank(key);
+        size_t j = i;
+        while (j > 0 && intrinsic_union_emit_rank(u->union_members[j - 1]) > rk) {
+            u->union_members[j] = u->union_members[j - 1];
+            j--;
+        }
+        u->union_members[j] = key;
+    }
+}
+
+static CtscType* type_from_annotation_fallback_span(CtscTypeRegistry* reg, const uint16_t* src, size_t src_len,
+                                                    int pos, int end) {
+    if (!src || pos < 0 || end < 0 || pos > (int)src_len || end > (int)src_len || pos >= end) {
+        return reg->t_any;
+    }
+    int te = end;
+    pos = u16_span_trim_bounds(src, pos, end, &te);
+    end = te;
+    if (pos >= end) return reg->t_any;
+
+    int span_starts[32];
+    int span_ends[32];
+    size_t nsp = 0;
+
+    int bd = 0, brd = 0, pd = 0, ad = 0;
+    bool in_dbl = false, in_sgl = false;
+    int seg0 = pos;
+
+    for (int i = pos; i < end; ++i) {
+        uint16_t c = src[i];
+        if (in_dbl) {
+            if (c == (uint16_t)'\\' && i + 1 < end) {
+                i++;
+                continue;
+            }
+            if (c == (uint16_t)'"') in_dbl = false;
+            continue;
+        }
+        if (in_sgl) {
+            if (c == (uint16_t)'\\' && i + 1 < end) {
+                i++;
+                continue;
+            }
+            if (c == (uint16_t)'\'') in_sgl = false;
+            continue;
+        }
+        if (c == (uint16_t)'"') {
+            in_dbl = true;
+            continue;
+        }
+        if (c == (uint16_t)'\'') {
+            in_sgl = true;
+            continue;
+        }
+
+        if (c == (uint16_t)'{') bd++;
+        else if (c == (uint16_t)'}' && bd > 0) bd--;
+        else if (c == (uint16_t)'[') brd++;
+        else if (c == (uint16_t)']' && brd > 0) brd--;
+        else if (c == (uint16_t)'(') pd++;
+        else if (c == (uint16_t)')' && pd > 0) pd--;
+        else if (c == (uint16_t)'<') ad++;
+        else if (c == (uint16_t)'>' && ad > 0) ad--;
+
+        if (c == (uint16_t)'|' && bd == 0 && brd == 0 && pd == 0 && ad == 0) {
+            if (nsp >= sizeof(span_starts) / sizeof(span_starts[0])) return reg->t_any;
+            int ss = u16_span_trim_bounds(src, seg0, i, &te);
+            span_starts[nsp] = ss;
+            span_ends[nsp] = te;
+            nsp++;
+            seg0 = i + 1;
+        }
+    }
+    if (nsp >= sizeof(span_starts) / sizeof(span_starts[0])) return reg->t_any;
+    {
+        int ss = u16_span_trim_bounds(src, seg0, end, &te);
+        span_starts[nsp] = ss;
+        span_ends[nsp] = te;
+        nsp++;
+    }
+
+    CtscType* parts[32];
+    size_t np = 0;
+    for (size_t si = 0; si < nsp; ++si) {
+        CtscType* p = primitive_type_from_trimmed_span(reg, src, span_starts[si], span_ends[si]);
+        if (!p) return reg->t_any;
+        parts[np++] = p;
+    }
+
+    size_t w = 0;
+    for (size_t i = 0; i < np; ++i) {
+        if (w == 0 || parts[w - 1] != parts[i]) parts[w++] = parts[i];
+    }
+    np = w;
+
+    if (np == 0) return reg->t_any;
+    if (np == 1) return parts[0];
+
+    CtscType* u = ctsc_type_new(reg, CTSC_TYPE_UNION);
+    u->union_members = (CtscType**)ctsc_arena_alloc(reg->arena, np * sizeof(CtscType*));
+    memcpy(u->union_members, parts, np * sizeof(CtscType*));
+    u->union_members_len = np;
+    sort_intrinsic_union_members(u);
+    return u;
+}
+
+/*
+ * TypeLiteral nodes carry only pos/end (parser.c parse_type_literal ~2810); the
+ * checker recovers PropertySignature types from the UTF-16 span as tsc does via
+ * getTypeFromTypeNode (checker.ts ~15000+).
+ */
+static bool u16_is_ident_start_ascii(uint16_t c) {
+    return (c >= (uint16_t)'a' && c <= (uint16_t)'z')
+        || (c >= (uint16_t)'A' && c <= (uint16_t)'Z')
+        || c == (uint16_t)'_' || c == (uint16_t)'$';
+}
+
+static bool u16_is_ident_part_ascii(uint16_t c) {
+    return u16_is_ident_start_ascii(c) || (c >= (uint16_t)'0' && c <= (uint16_t)'9');
+}
+
+static int type_literal_find_matching_brace(const uint16_t* s, size_t src_len, int open_pos, int limit) {
+    if (!s || open_pos < 0 || open_pos >= (int)src_len || s[open_pos] != (uint16_t)'{') return -1;
+    if (limit > (int)src_len) limit = (int)src_len;
+    int depth = 0;
+    bool in_dbl = false, in_sgl = false;
+    for (int i = open_pos; i < limit; ++i) {
+        uint16_t c = s[i];
+        if (in_dbl) {
+            if (c == (uint16_t)'\\' && i + 1 < limit) {
+                i++;
+                continue;
+            }
+            if (c == (uint16_t)'"') in_dbl = false;
+            continue;
+        }
+        if (in_sgl) {
+            if (c == (uint16_t)'\\' && i + 1 < limit) {
+                i++;
+                continue;
+            }
+            if (c == (uint16_t)'\'') in_sgl = false;
+            continue;
+        }
+        if (c == (uint16_t)'"') {
+            in_dbl = true;
+            continue;
+        }
+        if (c == (uint16_t)'\'') {
+            in_sgl = true;
+            continue;
+        }
+        if (c == (uint16_t)'{') depth++;
+        else if (c == (uint16_t)'}') {
+            depth--;
+            if (depth == 0) return i;
+        }
+    }
+    return -1;
+}
+
+/*
+ * End of the type in `Name : Type` inside a TypeLiteral body [body_start, body_end).
+ * Stops at a top-level `,` or at body_end.
+ */
+static int type_literal_scan_member_type_end(const uint16_t* s, int type_start, int body_end) {
+    int bd = 0, brd = 0, pd = 0, ad = 0;
+    bool in_dbl = false, in_sgl = false;
+    for (int i = type_start; i < body_end; ++i) {
+        uint16_t c = s[i];
+        if (in_dbl) {
+            if (c == (uint16_t)'\\' && i + 1 < body_end) {
+                i++;
+                continue;
+            }
+            if (c == (uint16_t)'"') in_dbl = false;
+            continue;
+        }
+        if (in_sgl) {
+            if (c == (uint16_t)'\\' && i + 1 < body_end) {
+                i++;
+                continue;
+            }
+            if (c == (uint16_t)'\'') in_sgl = false;
+            continue;
+        }
+        if (c == (uint16_t)'"') {
+            in_dbl = true;
+            continue;
+        }
+        if (c == (uint16_t)'\'') {
+            in_sgl = true;
+            continue;
+        }
+        if (c == (uint16_t)'{') bd++;
+        else if (c == (uint16_t)'}' && bd > 0) bd--;
+        else if (c == (uint16_t)'[') brd++;
+        else if (c == (uint16_t)']' && brd > 0) brd--;
+        else if (c == (uint16_t)'(') pd++;
+        else if (c == (uint16_t)')' && pd > 0) pd--;
+        else if (c == (uint16_t)'<') ad++;
+        else if (c == (uint16_t)'>' && ad > 0) ad--;
+        if (c == (uint16_t)',' && bd == 0 && brd == 0 && pd == 0 && ad == 0) return i;
+    }
+    return body_end;
+}
+
+typedef struct {
+    int          name_pos;
+    int          name_end;
+    const uint16_t* name_ptr;
+    size_t       name_len;
+    CtscType*    value_type;
+} TypeLiteralMember;
+
+/* Returns NULL → caller uses t_any. */
+static CtscType* type_from_type_literal_span(CtscTypeRegistry* reg, const uint16_t* src,
+                                            size_t src_len, int pos, int end,
+                                            TypeLiteralMember* members_buf, size_t members_cap, size_t* out_n) {
+    *out_n = 0;
+    if (!src || pos < 0 || end < 0 || pos >= (int)src_len || end > (int)src_len || pos >= end) return NULL;
+    /*
+     * TypeLiteral.node.pos is token full_start (may include trivia before `{`);
+     * mirror getTypeFromTypeNode by locating the opening brace.
+     */
+    int brace_open = pos;
+    while (brace_open < end && ctsc_is_ws_u16(src[brace_open])) brace_open++;
+    if (brace_open >= end || src[brace_open] != (uint16_t)'{') return NULL;
+    int close = type_literal_find_matching_brace(src, src_len, brace_open, end);
+    if (close < 0 || close >= end) return NULL;
+    int inner_start = brace_open + 1;
+    int inner_end = close; /* exclusive; inner text is [inner_start, inner_end) */
+    int i = inner_start;
+    size_t count = 0;
+    while (i < inner_end) {
+        /*
+         * Property / type member names use Identifier nodes whose .pos is the
+         * token full start (scanner.getTokenFullStart), i.e. leading trivia
+         * before the identifier text is included (mirrors parser.ts createIdentifier
+         * ~2648–2657 and getNodePos ~2180–2181).
+         */
+        int name_token_full_start = i;
+        while (i < inner_end && ctsc_is_ws_u16(src[i])) i++;
+        if (i >= inner_end) break;
+        int name_start = i;
+        if (!u16_is_ident_start_ascii(src[i])) {
+            *out_n = 0;
+            return NULL;
+        }
+        i++;
+        while (i < inner_end && u16_is_ident_part_ascii(src[i])) i++;
+        int name_end = i;
+        if (name_start >= name_end) {
+            *out_n = 0;
+            return NULL;
+        }
+        while (i < inner_end && ctsc_is_ws_u16(src[i])) i++;
+        if (i >= inner_end || src[i] != (uint16_t)':') {
+            *out_n = 0;
+            return NULL;
+        }
+        i++; /* colon */
+        while (i < inner_end && ctsc_is_ws_u16(src[i])) i++;
+        int type_start = i;
+        int type_end = type_literal_scan_member_type_end(src, i, inner_end);
+        CtscType* pt = type_from_annotation_fallback_span(reg, src, src_len, type_start, type_end);
+        if (count >= members_cap) {
+            *out_n = 0;
+            return NULL;
+        }
+        members_buf[count].name_pos = name_token_full_start;
+        members_buf[count].name_end = name_end;
+        members_buf[count].name_ptr = src + name_start;
+        members_buf[count].name_len = (size_t)(name_end - name_start);
+        members_buf[count].value_type = pt;
+        count++;
+        i = type_end;
+        while (i < inner_end && ctsc_is_ws_u16(src[i])) i++;
+        if (i < inner_end && src[i] == (uint16_t)',') i++;
+    }
+    *out_n = count;
+    if (count == 0) return reg->t_empty_object;
+    CtscObjectProperty* props = (CtscObjectProperty*)ctsc_arena_alloc(reg->arena, count * sizeof(CtscObjectProperty));
+    for (size_t k = 0; k < count; ++k) {
+        props[k].name = members_buf[k].name_ptr;
+        props[k].name_len = members_buf[k].name_len;
+        props[k].value_type = members_buf[k].value_type;
+    }
+    return ctsc_type_object_literal(reg, props, count);
+}
+
 static CtscType* type_of_type_node(CtscTypeRegistry* reg, const uint16_t* src, size_t src_len,
                                   const CtscNode* type_node) {
     /* Maps TypeNode → CtscType for the M4.0 subset. Unknown types collapse
@@ -262,13 +675,33 @@ static CtscType* type_of_type_node(CtscTypeRegistry* reg, const uint16_t* src, s
             double v = numeric_literal_to_double(&type_node->data.numericLiteral);
             return ctsc_type_number_literal(reg, v);
         }
+        case CTSC_SK_TypeReference: {
+            const CtscTypeReferenceData* tr = &type_node->data.typeReference;
+            if (tr->typeName) {
+                /* Named / generic references: M4.0 → any. */
+                return reg->t_any;
+            }
+            return type_from_annotation_fallback_span(reg, src, src_len, type_node->pos, type_node->end);
+        }
+        case CTSC_SK_TypeLiteral: {
+            /* No TypeElement children in the AST yet — recover from source span. */
+            TypeLiteralMember tmp[32];
+            size_t n = 0;
+            CtscType* t = type_from_type_literal_span(reg, src, src_len, type_node->pos, type_node->end, tmp,
+                                                     sizeof(tmp) / sizeof(tmp[0]), &n);
+            return t ? t : reg->t_any;
+        }
         default:
-            /* TypeReference / generics / etc.: not handled in M4.0. */
+            /* Generics / etc.: not handled in M4.0. */
             return reg->t_any;
     }
 }
 
-static CtscType* type_of_expression(CtscTypeRegistry* reg, const CtscNode* expr);
+static CtscType* type_of_expression(Walk* w, CtscTypeRegistry* reg, const CtscNode* expr);
+static CtscType* type_of_object_literal_expression(Walk* w, CtscTypeRegistry* reg, const CtscNode* expr);
+static CtscType* variable_declaration_type(Walk* w, const CtscNode* decl, bool is_const);
+static CtscType* type_of_symbol_value(Walk* w, CtscSymbol* sym);
+static CtscType* param_type(Walk* w, const CtscNode* param);
 
 /* Operand classification for binary `+` / ordering (checker.ts ~40837-40848). */
 static bool type_is_number_like(const CtscType* t) {
@@ -296,9 +729,63 @@ static double numeric_literal_to_double(const CtscNumericLiteralData* d) {
     return strtod(buf, NULL);
 }
 
-static CtscType* type_of_expression(CtscTypeRegistry* reg, const CtscNode* expr) {
+/*
+ * True branch / false branch collapse when identical after subtype-style
+ * literal comparison (checker.ts getUnionType + UnionReduction.Subtype for
+ * the simple literal cases exercised by M4.0).
+ */
+static bool conditional_branch_types_identical(const CtscType* a, const CtscType* b) {
+    if (a == b) return true;
+    if (!a || !b) return false;
+    if (a->kind != b->kind) return false;
+    switch (a->kind) {
+        case CTSC_TYPE_NUMBER_LITERAL:
+            return a->number_value == b->number_value;
+        case CTSC_TYPE_STRING_LITERAL:
+        case CTSC_TYPE_BIGINT_LITERAL: {
+            if (a->text_len != b->text_len) return false;
+            if (a->text_len == 0) return true;
+            if (!a->text || !b->text) return a->text == b->text;
+            return memcmp(a->text, b->text, a->text_len * sizeof(uint16_t)) == 0;
+        }
+        case CTSC_TYPE_BOOLEAN_LITERAL:
+            return a->boolean_value == b->boolean_value;
+        default:
+            return false;
+    }
+}
+
+/* checkConditionalExpression → getUnionType([type1, type2], ...) (~41268-41273). */
+static CtscType* union_conditional_branch_types(CtscTypeRegistry* reg, CtscType* t1, CtscType* t2) {
+    if (!t1 || !t2) return reg->t_any;
+    if (t1->kind == CTSC_TYPE_ANY || t2->kind == CTSC_TYPE_ANY) return reg->t_any;
+    if (conditional_branch_types_identical(t1, t2)) return t1;
+    {
+        CtscType* u = ctsc_type_new(reg, CTSC_TYPE_UNION);
+        u->union_members = (CtscType**)ctsc_arena_alloc(reg->arena, 2 * sizeof(CtscType*));
+        u->union_members[0] = t1;
+        u->union_members[1] = t2;
+        u->union_members_len = 2;
+        return u;
+    }
+}
+
+static CtscType* type_of_expression(Walk* w, CtscTypeRegistry* reg, const CtscNode* expr) {
     if (!expr) return reg->t_any;
     switch (expr->kind) {
+        case CTSC_SK_Identifier: {
+            /*
+             * getTypeOfSymbol / checkIdentifier (checker.ts): reference to a
+             * declared value reads the symbol's type (not `any`).
+             */
+            if (!w) return reg->t_any;
+            const uint16_t* nm = expr->data.identifier.text;
+            size_t nl = expr->data.identifier.text_len;
+            if (!nm || nl == 0) return reg->t_any;
+            CtscSymbol* sym = resolve_name(&w->scopes, nm, nl);
+            if (!sym) return reg->t_any;
+            return type_of_symbol_value(w, sym);
+        }
         case CTSC_SK_NumericLiteral: {
             /*
              * ctsc stores NumericLiteral's text as UTF-16 code units; convert
@@ -359,10 +846,25 @@ static CtscType* type_of_expression(CtscTypeRegistry* reg, const CtscNode* expr)
              * checkArrayLiteral ~33329-33404, createArrayType).
              */
             return reg->t_empty_object;
+        case CTSC_SK_ObjectLiteralExpression:
+            /*
+             * checkObjectLiteral (~33527) + checkPropertyAssignment (~41503) /
+             * checkExpressionForMutableLocation (~41496): property initializers
+             * use widened literal types (e.g. `1` → number).
+             */
+            return type_of_object_literal_expression(w, reg, expr);
+        case CTSC_SK_ParenthesizedExpression:
+            return type_of_expression(w, reg, expr->data.parenthesizedExpression.expression);
+        case CTSC_SK_ConditionalExpression: {
+            const CtscConditionalExpressionData* ce = &expr->data.conditionalExpression;
+            CtscType* type_when_true = type_of_expression(w, reg, ce->whenTrue);
+            CtscType* type_when_false = type_of_expression(w, reg, ce->whenFalse);
+            return union_conditional_branch_types(reg, type_when_true, type_when_false);
+        }
         case CTSC_SK_BinaryExpression: {
             const CtscBinaryExpressionData* b = &expr->data.binaryExpression;
-            CtscType* lt = type_of_expression(reg, b->left);
-            CtscType* rt = type_of_expression(reg, b->right);
+            CtscType* lt = type_of_expression(w, reg, b->left);
+            CtscType* rt = type_of_expression(w, reg, b->right);
             switch (b->operator_kind) {
                 case CTSC_SK_PlusToken:
                     /*
@@ -405,6 +907,44 @@ static CtscType* type_of_expression(CtscTypeRegistry* reg, const CtscNode* expr)
 }
 
 /*
+ * Property names for OBJECT_LITERAL types: Identifier only until fixtures need
+ * string/numeric literal keys (typeToString parity).
+ */
+static bool object_literal_property_name_utf16(const CtscNode* name_node,
+                                               const uint16_t** name_out, size_t* len_out) {
+    if (!name_node || name_node->kind != CTSC_SK_Identifier) return false;
+    const CtscIdentifierData* id = &name_node->data.identifier;
+    *name_out = id->text;
+    *len_out = id->text_len;
+    return true;
+}
+
+static CtscType* type_of_object_literal_expression(Walk* w, CtscTypeRegistry* reg, const CtscNode* expr) {
+    const CtscObjectLiteralExpressionData* ol = &expr->data.objectLiteralExpression;
+    if (ol->properties.len == 0) return reg->t_empty_object;
+
+    CtscObjectProperty* props = (CtscObjectProperty*)ctsc_arena_alloc(
+        reg->arena, ol->properties.len * sizeof(CtscObjectProperty));
+    size_t count = 0;
+    for (size_t i = 0; i < ol->properties.len; ++i) {
+        CtscNode* prop = ol->properties.items[i];
+        if (!prop || prop->kind != CTSC_SK_PropertyAssignment) return reg->t_any;
+        const CtscPropertyAssignmentData* pa = &prop->data.propertyAssignment;
+        const uint16_t* pname;
+        size_t plen;
+        if (!object_literal_property_name_utf16(pa->name, &pname, &plen)) return reg->t_any;
+        if (!pa->initializer) return reg->t_any;
+        CtscType* vt = type_of_expression(w, reg, pa->initializer);
+        vt = ctsc_type_widen(reg, vt);
+        props[count].name = pname;
+        props[count].name_len = plen;
+        props[count].value_type = vt;
+        count++;
+    }
+    return ctsc_type_object_literal(reg, props, count);
+}
+
+/*
  * Structural assignability for the M4.0 subset. Mirrors the legacy
  * strictNullChecks-off behaviour of the harness oracle (noLib / default
  * compiler options in harness/src/oracle-checker-diag.ts).
@@ -441,6 +981,36 @@ static bool is_assignable_to(CtscTypeRegistry* reg, CtscType* source, CtscType* 
      */
     if (source->kind == CTSC_TYPE_NUMBER_LITERAL && target->kind == CTSC_TYPE_NUMBER_LITERAL) {
         return source->number_value == target->number_value;
+    }
+    if (target->kind == CTSC_TYPE_UNION) {
+        /* isTypeRelatedTo / union target: assignable if assignable to a member
+         * (checker.ts ~22000+). */
+        for (size_t i = 0; i < target->union_members_len; ++i) {
+            if (is_assignable_to(reg, source, target->union_members[i])) return true;
+        }
+        return false;
+    }
+    if (source->kind == CTSC_TYPE_OBJECT_LITERAL && target->kind == CTSC_TYPE_OBJECT_LITERAL) {
+        /*
+         * Structural assignability for anonymous object types (checker.ts
+         * checkTypeRelatedTo for object types ~22000+): each property in the
+         * target must be present in the source with an assignable type.
+         */
+        for (size_t ti = 0; ti < target->object_properties_len; ti++) {
+            const CtscObjectProperty* tp = &target->object_properties[ti];
+            CtscType* sp_val = NULL;
+            for (size_t si = 0; si < source->object_properties_len; si++) {
+                const CtscObjectProperty* sp = &source->object_properties[si];
+                if (sp->name_len == tp->name_len
+                    && utf16_type_text_equal(sp->name, sp->name_len, tp->name, tp->name_len)) {
+                    sp_val = sp->value_type;
+                    break;
+                }
+            }
+            if (!sp_val) return false;
+            if (!is_assignable_to(reg, sp_val, tp->value_type)) return false;
+        }
+        return true;
     }
     {
         CtscType* sw = ctsc_type_widen(reg, source);
@@ -481,6 +1051,149 @@ static void emit_ts2322_on_binding_name(CtscCheckResult* r, CtscArena* arena, Ct
     diag_push(r, arena, d);
 }
 
+static void emit_ts2345_on_argument(CtscCheckResult* r, CtscArena* arena, CtscTypeRegistry* reg,
+                                    const CtscNode* arg, CtscType* source, CtscType* target) {
+    if (!arg || arg->pos < 0 || arg->end < arg->pos) return;
+    const bool both_str_lit = source && target
+        && source->kind == CTSC_TYPE_STRING_LITERAL
+        && target->kind == CTSC_TYPE_STRING_LITERAL;
+    const bool both_num_lit = source && target
+        && source->kind == CTSC_TYPE_NUMBER_LITERAL
+        && target->kind == CTSC_TYPE_NUMBER_LITERAL;
+    CtscType* src_m = (both_str_lit || both_num_lit) ? source : ctsc_type_widen(reg, source);
+    CtscType* tgt_m = (both_str_lit || both_num_lit) ? target : ctsc_type_widen(reg, target);
+    CtscBuffer msg;
+    ctsc_buf_init(&msg);
+    ctsc_buf_append_cstr(&msg, "Argument of type '");
+    ctsc_type_to_string(src_m, &msg);
+    ctsc_buf_append_cstr(&msg, "' is not assignable to parameter of type '");
+    ctsc_type_to_string(tgt_m, &msg);
+    ctsc_buf_append_cstr(&msg, "'.");
+    char* msg_arena = (char*)ctsc_arena_alloc(arena, msg.len + 1);
+    memcpy(msg_arena, msg.data, msg.len);
+    msg_arena[msg.len] = '\0';
+    ctsc_buf_free(&msg);
+
+    CtscCheckDiagnostic d = {0};
+    d.code = 2345;
+    d.category = "Error";
+    d.start = arg->pos;
+    d.length = arg->end - arg->pos;
+    d.message = msg_arena;
+    diag_push(r, arena, d);
+}
+
+/*
+ * Minimum argument count for a FunctionDeclaration parameter list.
+ * Mirrors checker.ts getMinArgumentCount / signature.minArgumentCount for the
+ * simple cases we model: parameters after the first rest are ignored; a rest
+ * parameter does not consume a required slot; parameters with default
+ * initializers are optional from the right.
+ */
+static int function_declaration_min_arguments(const CtscNode* fn_decl) {
+    if (!fn_decl || fn_decl->kind != CTSC_SK_FunctionDeclaration) return 0;
+    const CtscNodeArray* params = &fn_decl->data.functionDeclaration.parameters;
+    if (params->len == 0) return 0;
+    int min = (int)params->len;
+    for (int i = (int)params->len - 1; i >= 0; --i) {
+        const CtscNode* p = params->items[i];
+        if (!p || p->kind != CTSC_SK_Parameter) {
+            min = i + 1;
+            break;
+        }
+        const CtscParameterData* pd = &p->data.parameter;
+        if (pd->has_dot_dot_dot) {
+            min = i;
+            continue;
+        }
+        if (pd->initializer) {
+            min = i;
+            continue;
+        }
+        min = i + 1;
+        break;
+    }
+    return min;
+}
+
+/*
+ * Maximum argument count for a FunctionDeclaration (no rest): parameter list
+ * length. Rest parameters absorb extra arguments, so max is unbounded
+ * (INT_MAX). Mirrors checker.ts getParameterCount (~38559-38567) for the
+ * non-tuple-rest cases we model.
+ */
+static int function_declaration_max_arguments(const CtscNode* fn_decl) {
+    if (!fn_decl || fn_decl->kind != CTSC_SK_FunctionDeclaration) return 0;
+    const CtscNodeArray* params = &fn_decl->data.functionDeclaration.parameters;
+    if (params->len == 0) return 0;
+    const CtscNode* last = params->items[params->len - 1];
+    if (last && last->kind == CTSC_SK_Parameter && last->data.parameter.has_dot_dot_dot) {
+        return INT_MAX;
+    }
+    return (int)params->len;
+}
+
+/*
+ * Span for TS2554/arity on CallExpression: same node as getDiagnosticSpanForCallNode
+ * (checker.ts ~36359-36362) — the callee expression, or the property name for
+ * `obj.m()`. M4.0 only supplies the Identifier callee path.
+ */
+static bool call_arity_error_span(const CtscNode* callee, int* out_start, int* out_len) {
+    if (!callee || callee->end < callee->pos) return false;
+    if (callee->kind == CTSC_SK_Identifier) {
+        /* Mirrors getErrorSpanForNode on Identifier: narrow to the name text,
+         * not parser Node.pos (full_start may include leading trivia; same
+         * adjustment as emit_ts2322_on_binding_name ~827-828). */
+        size_t tl = callee->data.identifier.text_len;
+        if (tl == 0 || callee->end < (int)tl) return false;
+        *out_len = (int)tl;
+        *out_start = callee->end - *out_len;
+        return *out_start >= 0;
+    }
+    if (callee->kind == CTSC_SK_PropertyAccessExpression) {
+        const CtscNode* name = callee->data.propertyAccessExpression.name;
+        if (name && name->kind == CTSC_SK_Identifier) {
+            size_t tl = name->data.identifier.text_len;
+            if (tl == 0 || name->end < (int)tl) return false;
+            *out_len = (int)tl;
+            *out_start = name->end - *out_len;
+            return *out_start >= 0;
+        }
+    }
+    return false;
+}
+
+static void emit_ts2554_arity(CtscCheckResult* r, CtscArena* arena, int start, int length,
+                              int expected, int got) {
+    CtscBuffer msg;
+    ctsc_buf_init(&msg);
+    ctsc_buf_append_cstr(&msg, "Expected ");
+    {
+        char nbuf[32];
+        snprintf(nbuf, sizeof(nbuf), "%d", expected);
+        ctsc_buf_append_cstr(&msg, nbuf);
+    }
+    ctsc_buf_append_cstr(&msg, " arguments, but got ");
+    {
+        char nbuf[32];
+        snprintf(nbuf, sizeof(nbuf), "%d", got);
+        ctsc_buf_append_cstr(&msg, nbuf);
+    }
+    ctsc_buf_append_cstr(&msg, ".");
+    char* msg_arena = (char*)ctsc_arena_alloc(arena, msg.len + 1);
+    memcpy(msg_arena, msg.data, msg.len);
+    msg_arena[msg.len] = '\0';
+    ctsc_buf_free(&msg);
+
+    CtscCheckDiagnostic d = {0};
+    d.code = 2554;
+    d.category = "Error";
+    d.start = start;
+    d.length = length;
+    d.message = msg_arena;
+    diag_push(r, arena, d);
+}
+
 /*
  * Mirrors checker.ts getWidenedTypeWithContext (~26021) when strictNullChecks
  * is off: nullWideningType / undefinedWideningType carry RequiresWidening and
@@ -498,10 +1211,10 @@ static CtscType* widen_nullish_when_not_strict_null(CtscTypeRegistry* reg, CtscT
  * widenTypeForVariableLikeDeclaration → getWidenedType (~12480-12495).
  * const keeps literal types except null/undefined widening (above).
  */
-static CtscType* var_decl_type(Walk* w, const CtscNode* decl, bool is_const) {
+static CtscType* variable_declaration_type(Walk* w, const CtscNode* decl, bool is_const) {
     const CtscVariableDeclarationData* d = &decl->data.variableDeclaration;
     if (d->type) return type_of_type_node(&w->r->registry, w->source_utf16, w->source_utf16_len, d->type);
-    CtscType* init_t = type_of_expression(&w->r->registry, d->initializer);
+    CtscType* init_t = type_of_expression(w, &w->r->registry, d->initializer);
     if (!init_t) return w->r->registry.t_any;
     CtscType* after_literal = is_const ? init_t : ctsc_type_widen(&w->r->registry, init_t);
     return widen_nullish_when_not_strict_null(&w->r->registry, after_literal);
@@ -582,6 +1295,24 @@ static void push_entry_for_name(Walk* w, const CtscNode* decl, const CtscNode* n
     entry_push(w->r, w->arena, e);
 }
 
+static void push_property_signatures_from_type_literal(Walk* w, const CtscNode* type_literal) {
+    if (!w || !type_literal || type_literal->kind != CTSC_SK_TypeLiteral) return;
+    TypeLiteralMember tmp[32];
+    size_t n = 0;
+    (void)type_from_type_literal_span(&w->r->registry, w->source_utf16, w->source_utf16_len, type_literal->pos,
+                                      type_literal->end, tmp, sizeof(tmp) / sizeof(tmp[0]), &n);
+    for (size_t i = 0; i < n; i++) {
+        CtscCheckTypeEntry e = {0};
+        e.name = tmp[i].name_ptr;
+        e.name_len = tmp[i].name_len;
+        e.decl_kind_name = syntax_kind_cstr(CTSC_SK_PropertySignature);
+        e.pos = tmp[i].name_pos;
+        e.end = tmp[i].name_end;
+        e.type = tmp[i].value_type ? tmp[i].value_type : w->r->registry.t_any;
+        entry_push(w->r, w->arena, e);
+    }
+}
+
 static bool is_const_decl_list(const CtscNode* list) {
     if (!list || list->kind != CTSC_SK_VariableDeclarationList) return false;
     int flags = list->data.variableDeclarationList.flags;
@@ -609,12 +1340,20 @@ static void visit_variable_statement(Walk* w, const CtscNode* n) {
     for (size_t i = 0; i < decls->len; ++i) {
         const CtscNode* d = decls->items[i];
         if (!d || d->kind != CTSC_SK_VariableDeclaration) continue;
-        CtscType* t = var_decl_type(w, d, is_const);
+        var_decl_const_register(w, d, is_const);
+    }
+    for (size_t i = 0; i < decls->len; ++i) {
+        const CtscNode* d = decls->items[i];
+        if (!d || d->kind != CTSC_SK_VariableDeclaration) continue;
+        CtscType* t = variable_declaration_type(w, d, is_const);
         push_entry_for_name(w, d, d->data.variableDeclaration.name, t);
         const CtscVariableDeclarationData* vd = &d->data.variableDeclaration;
+        if (vd->type && vd->type->kind == CTSC_SK_TypeLiteral) {
+            push_property_signatures_from_type_literal(w, vd->type);
+        }
         if (vd->type && vd->initializer) {
             CtscType* ann = type_of_type_node(&w->r->registry, w->source_utf16, w->source_utf16_len, vd->type);
-            CtscType* init_t = type_of_expression(&w->r->registry, vd->initializer);
+            CtscType* init_t = type_of_expression(w, &w->r->registry, vd->initializer);
             if (!is_assignable_to(&w->r->registry, init_t, ann)) {
                 emit_ts2322_on_binding_name(w->r, w->arena, &w->r->registry, vd->name, init_t, ann);
             }
@@ -629,6 +1368,23 @@ static void visit_variable_statement(Walk* w, const CtscNode* n) {
 static CtscType* param_type(Walk* w, const CtscNode* param) {
     const CtscParameterData* p = &param->data.parameter;
     if (p->type) return type_of_type_node(&w->r->registry, w->source_utf16, w->source_utf16_len, p->type);
+    return w->r->registry.t_any;
+}
+
+static CtscType* type_of_symbol_value(Walk* w, CtscSymbol* sym) {
+    if (!sym || sym->decls_len == 0) return w->r->registry.t_any;
+    for (size_t i = 0; i < sym->decls_len; ++i) {
+        CtscNode* d = sym->decls[i];
+        if (!d) continue;
+        switch (d->kind) {
+            case CTSC_SK_VariableDeclaration:
+                return variable_declaration_type(w, d, var_decl_is_const(w, d));
+            case CTSC_SK_Parameter:
+                return param_type(w, d);
+            default:
+                break;
+        }
+    }
     return w->r->registry.t_any;
 }
 
@@ -692,7 +1448,7 @@ static void collect_return_expression_types(RetCollector* c, const CtscNode* n) 
         }
         case CTSC_SK_ReturnStatement:
             if (n->data.returnStatement.expression) {
-                ret_collector_push(c, type_of_expression(c->reg, n->data.returnStatement.expression));
+                ret_collector_push(c, type_of_expression(NULL, c->reg, n->data.returnStatement.expression));
             }
             return;
         case CTSC_SK_FunctionDeclaration:
@@ -871,6 +1627,73 @@ static void visit_function_declaration(Walk* w, const CtscNode* n) {
     close_scope_if_container(w, n);
 }
 
+static const CtscNode* symbol_function_declaration_decl(CtscSymbol* sym) {
+    if (!sym) return NULL;
+    for (size_t i = 0; i < sym->decls_len; ++i) {
+        CtscNode* d = sym->decls[i];
+        if (d && d->kind == CTSC_SK_FunctionDeclaration) return d;
+    }
+    return NULL;
+}
+
+static void visit_call_expression(Walk* w, const CtscNode* n) {
+    const CtscCallExpressionData* ce = &n->data.callExpression;
+    const CtscNode* callee = ce->expression;
+    const CtscNodeArray* args = &ce->arguments;
+
+    visit(w, callee);
+
+    const CtscNode* fn_decl = NULL;
+    if (callee && callee->kind == CTSC_SK_Identifier) {
+        const uint16_t* nm = callee->data.identifier.text;
+        size_t nl = callee->data.identifier.text_len;
+        if (nm && nl > 0) {
+            CtscSymbol* sym = resolve_name(&w->scopes, nm, nl);
+            fn_decl = symbol_function_declaration_decl(sym);
+        }
+    }
+
+    bool skip_param_assignability = false;
+    if (fn_decl) {
+        int min_args = function_declaration_min_arguments(fn_decl);
+        int max_args = function_declaration_max_arguments(fn_decl);
+        if ((int)args->len < min_args) {
+            int es = 0, el = 0;
+            if (call_arity_error_span(callee, &es, &el)) {
+                emit_ts2554_arity(w->r, w->arena, es, el, min_args, (int)args->len);
+            }
+            skip_param_assignability = true;
+        } else if (max_args != INT_MAX && (int)args->len > max_args) {
+            /* Too many: span excess arguments (checker.ts ~36479-36493). */
+            const CtscNode* first_excess = args->items[(size_t)max_args];
+            const CtscNode* last_excess = args->items[args->len - 1];
+            if (first_excess && last_excess && last_excess->end >= first_excess->pos) {
+                int es = first_excess->pos;
+                int el = last_excess->end - first_excess->pos;
+                emit_ts2554_arity(w->r, w->arena, es, el, max_args, (int)args->len);
+            }
+        }
+    }
+
+    for (size_t i = 0; i < args->len; ++i) {
+        const CtscNode* arg = args->items[i];
+        if (!skip_param_assignability && fn_decl && arg) {
+            const CtscNodeArray* params = &fn_decl->data.functionDeclaration.parameters;
+            if (i < params->len) {
+                const CtscNode* param = params->items[i];
+                if (param && param->kind == CTSC_SK_Parameter) {
+                    CtscType* param_t = param_type(w, param);
+                    CtscType* arg_t = type_of_expression(w, &w->r->registry, arg);
+                    if (!is_assignable_to(&w->r->registry, arg_t, param_t)) {
+                        emit_ts2345_on_argument(w->r, w->arena, &w->r->registry, arg, arg_t, param_t);
+                    }
+                }
+            }
+        }
+        visit(w, arg);
+    }
+}
+
 /* Dispatch visitor: handles both scope management and reference checking. */
 static void visit(Walk* w, const CtscNode* n) {
     if (!n) return;
@@ -927,10 +1750,7 @@ static void visit(Walk* w, const CtscNode* n) {
             return;
 
         case CTSC_SK_CallExpression:
-            visit(w, n->data.callExpression.expression);
-            for (size_t i = 0; i < n->data.callExpression.arguments.len; ++i) {
-                visit(w, n->data.callExpression.arguments.items[i]);
-            }
+            visit_call_expression(w, n);
             return;
 
         case CTSC_SK_PropertyAccessExpression:

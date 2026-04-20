@@ -74,6 +74,13 @@ CtscType* ctsc_type_bigint_literal(CtscTypeRegistry* reg, const uint16_t* text, 
     return t;
 }
 
+CtscType* ctsc_type_object_literal(CtscTypeRegistry* reg, CtscObjectProperty* props, size_t prop_count) {
+    CtscType* t = ctsc_type_new(reg, CTSC_TYPE_OBJECT_LITERAL);
+    t->object_properties = props;
+    t->object_properties_len = prop_count;
+    return t;
+}
+
 /*
  * Literal → base widening (types.ts getWidenedLiteralType ~35395):
  *   42 → number,  "hi" → string,  true/false → boolean,  42n → bigint.
@@ -153,6 +160,14 @@ static void emit_utf16_escaped_for_string_literal(CtscBuffer* out, const uint16_
     ctsc_buf_append_char(out, '"');
 }
 
+static void append_utf16_ascii_identifier_prop_name(CtscBuffer* out, const uint16_t* t, size_t n) {
+    if (!t) return;
+    for (size_t i = 0; i < n; ++i) {
+        uint16_t u = t[i];
+        if (u < 0x80) ctsc_buf_append_char(out, (char)u);
+    }
+}
+
 void ctsc_type_to_string(const CtscType* t, CtscBuffer* out) {
     if (!t) { ctsc_buf_append_cstr(out, "any"); return; }
     switch (t->kind) {
@@ -187,6 +202,18 @@ void ctsc_type_to_string(const CtscType* t, CtscBuffer* out) {
                 if (i > 0) ctsc_buf_append_cstr(out, " | ");
                 ctsc_type_to_string(t->union_members[i], out);
             }
+            return;
+        }
+        case CTSC_TYPE_OBJECT_LITERAL: {
+            ctsc_buf_append_cstr(out, "{ ");
+            for (size_t i = 0; i < t->object_properties_len; ++i) {
+                if (i > 0) ctsc_buf_append_cstr(out, "; ");
+                CtscObjectProperty* p = &t->object_properties[i];
+                append_utf16_ascii_identifier_prop_name(out, p->name, p->name_len);
+                ctsc_buf_append_cstr(out, ": ");
+                ctsc_type_to_string(p->value_type, out);
+            }
+            ctsc_buf_append_cstr(out, "; }");
             return;
         }
         default:
