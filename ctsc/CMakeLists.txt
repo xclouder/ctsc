@@ -23,6 +23,7 @@ add_library(ctsc_core STATIC
     src/core/diagnostic.c
     src/core/utf8.c
     src/core/json_writer.c
+    src/core/json_parser.c
     src/core/buffer.c
 )
 target_include_directories(ctsc_core PUBLIC include)
@@ -54,6 +55,7 @@ target_link_libraries(ctsc_emitter PUBLIC ctsc_parser ctsc_core)
 
 add_executable(ctsc
     src/driver/main.c
+    src/driver/project.c
 )
 target_link_libraries(ctsc PRIVATE ctsc_emitter ctsc_binder ctsc_parser ctsc_scanner ctsc_core)
 

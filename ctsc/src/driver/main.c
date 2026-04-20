@@ -5,6 +5,7 @@
 #include "ctsc/arena.h"
 #include "ctsc/buffer.h"
 #include "ctsc/utf8.h"
+#include "ctsc/project.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,12 +24,16 @@ static void print_usage(FILE* f) {
         "\n"
         "Commands:\n"
         "  --dump-tokens     Dump scanner token stream as JSON\n"
-        "  --dump-ast        (not yet implemented)\n"
-        "  --emit            (not yet implemented)\n"
+        "  --dump-ast        Dump parser AST as JSON\n"
+        "  --dump-bindings   Dump binder output as JSON\n"
+        "  --emit            Emit JavaScript for a single source file (stdout)\n"
+        "  --project <path>  Compile a tsconfig-driven project (file or dir)\n"
         "\n"
         "Options:\n"
         "  --pretty          Pretty-print JSON\n"
         "  -o <path>         Write output to file instead of stdout\n"
+        "  --no-package-json Skip writing dist/package.json in --project mode\n"
+        "  --verbose         Print progress to stderr\n"
         "  -h, --help        Show this help\n"
     );
 }
@@ -39,7 +44,8 @@ typedef enum {
     CMD_DUMP_AST,
     CMD_DUMP_BINDINGS,
     CMD_DUMP_TYPES,
-    CMD_EMIT
+    CMD_EMIT,
+    CMD_PROJECT
 } Cmd;
 
 int main(int argc, char** argv) {
@@ -52,6 +58,8 @@ int main(int argc, char** argv) {
     const char* input = NULL;
     const char* output = NULL;
     bool pretty = false;
+    bool write_package_json = true;
+    bool verbose = false;
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -61,7 +69,15 @@ int main(int argc, char** argv) {
         if (strcmp(a, "--dump-bindings") == 0) { cmd = CMD_DUMP_BINDINGS; continue; }
         if (strcmp(a, "--dump-types") == 0)    { cmd = CMD_DUMP_TYPES;    continue; }
         if (strcmp(a, "--emit") == 0)          { cmd = CMD_EMIT;          continue; }
+        if (strcmp(a, "--project") == 0) {
+            cmd = CMD_PROJECT;
+            if (i + 1 >= argc) { fprintf(stderr, "error: --project requires a path\n"); return 2; }
+            input = argv[++i];
+            continue;
+        }
         if (strcmp(a, "--pretty") == 0)      { pretty = true;         continue; }
+        if (strcmp(a, "--no-package-json") == 0) { write_package_json = false; continue; }
+        if (strcmp(a, "--verbose") == 0)     { verbose = true;        continue; }
         if (strcmp(a, "-o") == 0)            { if (i + 1 >= argc) { fprintf(stderr, "error: -o requires a path\n"); return 2; } output = argv[++i]; continue; }
         if (a[0] == '-') { fprintf(stderr, "error: unknown option '%s'\n", a); return 2; }
         if (input) { fprintf(stderr, "error: multiple input files\n"); return 2; }
@@ -70,6 +86,11 @@ int main(int argc, char** argv) {
 
     if (cmd == CMD_NONE) { print_usage(stderr); return 2; }
     if (!input)          { fprintf(stderr, "error: missing input file\n"); return 2; }
+
+    if (cmd == CMD_PROJECT) {
+        CtscProjectOptions popts = { input, write_package_json, verbose };
+        return ctsc_run_project(&popts);
+    }
 
     size_t src_len = 0;
     char*  src = ctsc_read_file(input, &src_len);

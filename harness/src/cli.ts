@@ -252,6 +252,7 @@ async function main(): Promise<void> {
       project: flags.project ? String(flags.project) : undefined,
       noRun: !!flags["no-run"],
       ctscExe: flags["ctsc-exe"] ? String(flags["ctsc-exe"]) : undefined,
+      native: !!flags.native,
     });
     process.exit(rc);
   }

@@ -43,6 +43,14 @@ export interface ProjectOptions {
   project?: string;     // substring match against project dir name
   noRun?: boolean;      // skip node runtime.mjs step
   ctscExe?: string;     // explicit ctsc binary
+  /**
+   * When true, run `ctsc --project <dir>` natively (the C driver handles
+   * tsconfig + file enumeration + emit itself). We then diff each emitted
+   * file in outDir against the tsc-oracle output produced in-process.
+   * When false (default), the TypeScript harness enumerates source files
+   * itself and calls `ctsc --emit <file>` per file.
+   */
+  native?: boolean;
 }
 
 interface ProjectFile {
@@ -147,16 +155,37 @@ async function runProject(
   const rootDir = parsed.options.rootDir ?? join(projectDir, "src");
   const outDir = parsed.options.outDir ?? join(projectDir, "dist");
 
-  await rm(outDir, { recursive: true, force: true });
-  await mkdir(outDir, { recursive: true });
-  // ESM marker so node resolves relative `.js` imports between compiled files.
-  await writeFile(join(outDir, "package.json"), `{"type":"module"}\n`, "utf8");
+  if (!opts.native) {
+    // Non-native mode: the TS harness owns outDir lifecycle. In native
+    // mode, `ctsc --project` wipes/creates outDir and writes package.json
+    // itself, so we leave it alone and diff against what it produced.
+    await rm(outDir, { recursive: true, force: true });
+    await mkdir(outDir, { recursive: true });
+    await writeFile(join(outDir, "package.json"), `{"type":"module"}\n`, "utf8");
+  }
 
   // Drop type-check results; we only use the file list and options.
   const sources = parsed.fileNames.filter((f) => !f.endsWith(".d.ts")).sort();
 
   const files: ProjectFile[] = [];
   let allMatch = true;
+
+  // In native mode, invoke `ctsc --project <dir>` once: the C driver owns
+  // tsconfig parsing + file enumeration + emit. We then read every emitted
+  // .js out of outDir and diff against the in-process tsc oracle.
+  if (opts.native) {
+    const projectRc = await new Promise<{ exitCode: number; stderr: string }>((resolveP) => {
+      const child = spawn(ctscExe, ["--project", projectDir], { windowsHide: true });
+      let stderr = "";
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (c: string) => { stderr += c; });
+      child.on("close", (code) => resolveP({ exitCode: code ?? -1, stderr }));
+      child.on("error", (e) => resolveP({ exitCode: -1, stderr: stderr + "\n" + e.message }));
+    });
+    if (projectRc.exitCode !== 0) {
+      throw new Error(`ctsc --project exited ${projectRc.exitCode}: ${projectRc.stderr}`);
+    }
+  }
 
   for (const src of sources) {
     const rel = relative(projectDir, src).replaceAll("\\", "/");
@@ -165,10 +194,24 @@ async function runProject(
     const outRel = underRoot.replace(/\.tsx?$/, ".js");
     const destPath = join(outDir, outRel);
 
-    const r = await runCtscEmit(ctscExe, src);
-    const ctscOut = r.stdout;
-    const ctscExit = r.exitCode;
-    const ctscStderr = r.stderr;
+    let ctscOut = "";
+    let ctscExit = 0;
+    let ctscStderr = "";
+
+    if (opts.native) {
+      // `ctsc --project` already wrote destPath. Read it back.
+      try {
+        ctscOut = await readFile(destPath, "utf8");
+      } catch (e: any) {
+        ctscExit = -1;
+        ctscStderr = `ctsc --project did not emit ${outRel}: ${e?.message ?? e}`;
+      }
+    } else {
+      const r = await runCtscEmit(ctscExe, src);
+      ctscOut = r.stdout;
+      ctscExit = r.exitCode;
+      ctscStderr = r.stderr;
+    }
 
     let tscOut = "";
     try {
@@ -182,11 +225,12 @@ async function runProject(
     const match = ctscExit === 0 && ctscOut === tscOut;
     if (!match) allMatch = false;
 
-    // Always stage whatever ctsc emitted (truthful runtime probe);
-    // fall back to tsc output only if ctsc exit !=0.
-    const bytes = ctscExit === 0 && ctscOut ? ctscOut : tscOut;
-    await mkdir(dirname(destPath), { recursive: true });
-    await writeFile(destPath, bytes, "utf8");
+    if (!opts.native) {
+      // Non-native mode: TS harness stages output itself so runtime.mjs works.
+      const bytes = ctscExit === 0 && ctscOut ? ctscOut : tscOut;
+      await mkdir(dirname(destPath), { recursive: true });
+      await writeFile(destPath, bytes, "utf8");
+    }
 
     files.push({
       src,
