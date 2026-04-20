@@ -1,0 +1,3 @@
+// @checker: diag
+x;
+y;

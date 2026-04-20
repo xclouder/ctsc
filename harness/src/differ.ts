@@ -147,10 +147,96 @@ export function diffText(expected: string, actual: string): DiffResult {
   };
 }
 
-export function diffPhase(phase: string, expected: string, actual: string): DiffResult {
+/** Compare checker diagnostics JSON.
+ * Stable shape: { diagnostics:[{code,category,start,length,messageText}], tsVersion }.
+ * Reports the first diagnostic-level mismatch so the agent sees a pinpoint. */
+export function diffCheckerDiag(expected: string, actual: string): DiffResult {
+  let exp: any; let act: any;
+  try { exp = JSON.parse(expected); } catch (e: any) { return { equal: false, summary: `expected diagnostics JSON parse error: ${e.message}` }; }
+  try { act = JSON.parse(actual);   } catch (e: any) { return { equal: false, summary: `actual diagnostics JSON parse error: ${e.message}\n---\n${actual.slice(0, 400)}` }; }
+
+  const eList = Array.isArray(exp?.diagnostics) ? exp.diagnostics as any[] : null;
+  const aList = Array.isArray(act?.diagnostics) ? act.diagnostics as any[] : null;
+  if (!eList) return { equal: false, summary: "expected: missing .diagnostics array" };
+  if (!aList) return { equal: false, summary: "actual: missing .diagnostics array" };
+
+  const n = Math.max(eList.length, aList.length);
+  for (let i = 0; i < n; i++) {
+    const e = eList[i];
+    const a = aList[i];
+    if (!e) {
+      return { equal: false, summary: `extra diagnostic[${i}]: ${fmtDiag(a)}`,
+        firstMismatch: { path: `diagnostics[${i}]`, expected: "<none>", actual: fmtDiag(a) } };
+    }
+    if (!a) {
+      return { equal: false, summary: `missing diagnostic[${i}]: expected ${fmtDiag(e)}`,
+        firstMismatch: { path: `diagnostics[${i}]`, expected: fmtDiag(e), actual: "<none>" } };
+    }
+    for (const k of ["code", "category", "start", "length", "messageText"]) {
+      if ((e[k] ?? null) !== (a[k] ?? null)) {
+        return { equal: false,
+          summary: `diagnostic[${i}].${k} mismatch: expected ${JSON.stringify(e[k])} got ${JSON.stringify(a[k])}`,
+          firstMismatch: { path: `diagnostics[${i}].${k}`, expected: JSON.stringify(e[k] ?? null), actual: JSON.stringify(a[k] ?? null) } };
+      }
+    }
+  }
+  return { equal: true, summary: `OK (${eList.length} diagnostics)` };
+}
+
+function fmtDiag(d: any): string {
+  if (!d) return "<none>";
+  return `TS${d.code} @ ${d.start}..${(d.start ?? 0) + (d.length ?? 0)} ${JSON.stringify(d.messageText ?? "")}`;
+}
+
+/** Compare checker types JSON.
+ * Stable shape: { entries:[{name,kind,pos,end,type}], tsVersion }. */
+export function diffCheckerTypes(expected: string, actual: string): DiffResult {
+  let exp: any; let act: any;
+  try { exp = JSON.parse(expected); } catch (e: any) { return { equal: false, summary: `expected types JSON parse error: ${e.message}` }; }
+  try { act = JSON.parse(actual);   } catch (e: any) { return { equal: false, summary: `actual types JSON parse error: ${e.message}\n---\n${actual.slice(0, 400)}` }; }
+
+  const eList = Array.isArray(exp?.entries) ? exp.entries as any[] : null;
+  const aList = Array.isArray(act?.entries) ? act.entries as any[] : null;
+  if (!eList) return { equal: false, summary: "expected: missing .entries array" };
+  if (!aList) return { equal: false, summary: "actual: missing .entries array" };
+
+  const n = Math.max(eList.length, aList.length);
+  for (let i = 0; i < n; i++) {
+    const e = eList[i];
+    const a = aList[i];
+    if (!e) {
+      return { equal: false, summary: `extra entry[${i}]: ${fmtEntry(a)}`,
+        firstMismatch: { path: `entries[${i}]`, expected: "<none>", actual: fmtEntry(a) } };
+    }
+    if (!a) {
+      return { equal: false, summary: `missing entry[${i}]: expected ${fmtEntry(e)}`,
+        firstMismatch: { path: `entries[${i}]`, expected: fmtEntry(e), actual: "<none>" } };
+    }
+    for (const k of ["name", "kind", "pos", "end", "type"]) {
+      if ((e[k] ?? null) !== (a[k] ?? null)) {
+        return { equal: false,
+          summary: `entry[${i}].${k} mismatch for ${JSON.stringify(e.name)}: expected ${JSON.stringify(e[k])} got ${JSON.stringify(a[k])}`,
+          firstMismatch: { path: `entries[${i}].${k}`, expected: JSON.stringify(e[k] ?? null), actual: JSON.stringify(a[k] ?? null) } };
+      }
+    }
+  }
+  return { equal: true, summary: `OK (${eList.length} entries)` };
+}
+
+function fmtEntry(e: any): string {
+  if (!e) return "<none>";
+  return `${e.kind} ${JSON.stringify(e.name)}[${e.pos}..${e.end}]: ${JSON.stringify(e.type)}`;
+}
+
+export function diffPhase(phase: string, expected: string, actual: string, opts?: { checkerChannel?: "types" | "diag" | "both" }): DiffResult {
   if (phase === "scanner") return diffTokens(expected, actual);
   if (phase === "parser")  return diffAst(expected, actual);
-  if (phase === "binder" || phase === "checker") return diffAst(expected, actual);
+  if (phase === "binder") return diffAst(expected, actual);
+  if (phase === "checker") {
+    const ch = opts?.checkerChannel ?? "types";
+    if (ch === "diag") return diffCheckerDiag(expected, actual);
+    return diffCheckerTypes(expected, actual);
+  }
   if (phase === "emitter") return diffText(expected, actual);
   return { equal: false, summary: `differ for phase '${phase}' not implemented yet` };
 }

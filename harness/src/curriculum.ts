@@ -1,8 +1,8 @@
-import { readdir, stat } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import { join, relative, basename } from "node:path";
 
 import { FIXTURES_DIR } from "./paths.js";
-import type { Fixture, Phase } from "./types.js";
+import type { CheckerChannel, Fixture, Phase } from "./types.js";
 
 const PHASE_FILES: Record<Phase, string[]> = {
   scanner: [".ts", ".tsx"],
@@ -39,14 +39,18 @@ export async function loadCurriculum(onlyPhase?: Phase): Promise<Fixture[]> {
       const rel = relative(FIXTURES_DIR, f).replace(/\\/g, "/");
       const parts = rel.split("/");
       const stage = parts.length >= 3 ? parts[1] : "default";
-      out.push({
+      const fx: Fixture = {
         id: rel,
         phase,
         stage,
         sourcePath: f,
         relPath: rel,
         difficulty: difficultyHint(basename(f)),
-      });
+      };
+      if (phase === "checker") {
+        fx.checkerChannel = await resolveCheckerChannel(f, stage);
+      }
+      out.push(fx);
     }
   }
   return out;
@@ -56,6 +60,25 @@ function difficultyHint(name: string): number {
   const m = /^(\d+)_/.exec(name);
   if (m) return Number(m[1]);
   return 100;
+}
+
+/** Stage-based default so forgetting the `// @checker:` annotation still
+ * produces a sensible routing. `undefined_refs` and `assignability` (M4.1)
+ * are intrinsically about diagnostics; everything else defaults to types. */
+function stageDefaultChannel(stage: string): CheckerChannel {
+  if (stage === "undefined_refs" || stage === "assignability") return "diag";
+  return "types";
+}
+
+/** Scan the first ~512 bytes for a `// @checker: <channel>` line. */
+async function resolveCheckerChannel(file: string, stage: string): Promise<CheckerChannel> {
+  try {
+    const buf = await readFile(file, "utf8");
+    const head = buf.slice(0, 512);
+    const m = /^\s*\/\/\s*@checker:\s*(types|diag|both)\b/m.exec(head);
+    if (m) return m[1] as CheckerChannel;
+  } catch { /* fall through */ }
+  return stageDefaultChannel(stage);
 }
 
 export function sortCurriculum(fs: Fixture[]): Fixture[] {

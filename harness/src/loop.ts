@@ -21,12 +21,15 @@ import type { DiffResult, Fixture, OracleArtifacts, Phase, ProgressState } from 
 
 /** Pick the expected artifact for a phase; returns undefined only when the
  * phase has no oracle at all (not when the artifact is an empty string). */
-function pickExpected(phase: Phase, o: OracleArtifacts): string | undefined {
-  switch (phase) {
+function pickExpected(fx: Fixture, o: OracleArtifacts): string | undefined {
+  switch (fx.phase) {
     case "scanner": return o.tokensJson;
     case "parser":  return o.astJson;
-    case "binder":
-    case "checker": return o.tokensJson; // reuses the slot for stub JSON
+    case "binder":  return o.tokensJson; // reuses the slot for stub JSON
+    case "checker": {
+      const ch = fx.checkerChannel ?? "types";
+      return ch === "diag" ? o.checkerDiagJson : o.checkerTypesJson;
+    }
     case "emitter": return o.emitJs;
     default:        return undefined;
   }
@@ -118,7 +121,7 @@ export async function runLoop(partial: Partial<LoopOptions> = {}): Promise<void>
 
     const src = await readFile(fx.sourcePath, "utf8");
     const oracle = await getOracle(fx, src);
-    const expected = pickExpected(fx.phase, oracle);
+    const expected = pickExpected(fx, oracle);
     if (expected === undefined) {
       console.warn(`  [skip] no oracle for phase ${fx.phase}`);
       await deferFixture(status, `no oracle for phase ${fx.phase}`);
@@ -155,7 +158,7 @@ export async function runLoop(partial: Partial<LoopOptions> = {}): Promise<void>
       console.error(`  [runner] exit=${run.exitCode} stderr=${run.stderr.slice(0, 400)}`);
     }
 
-    const diff = diffPhase(fx.phase, expected, actual);
+    const diff = diffPhase(fx.phase, expected, actual, { checkerChannel: fx.checkerChannel });
     status.lastDiffSummary = diff.summary;
 
     if (diff.equal) {
@@ -238,7 +241,7 @@ export async function runLoop(partial: Partial<LoopOptions> = {}): Promise<void>
       }
     }
     const run2 = await runCtsc(fx, { dry: false });
-    verified = diffPhase(fx.phase, expected, run2.stdout);
+    verified = diffPhase(fx.phase, expected, run2.stdout, { checkerChannel: fx.checkerChannel });
     status.lastDiffSummary = verified.summary;
     if (verified.equal) {
       status.passed = true;

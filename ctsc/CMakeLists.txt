@@ -48,6 +48,27 @@ add_library(ctsc_binder STATIC
 )
 target_link_libraries(ctsc_binder PUBLIC ctsc_parser ctsc_core)
 
+add_library(ctsc_checker STATIC
+    src/checker/checker.c
+    src/checker/type_registry.c
+    src/checker/diag_dump.c
+)
+target_link_libraries(ctsc_checker PUBLIC ctsc_binder ctsc_parser ctsc_core)
+
+# Resolve the harness's TypeScript version at configure time so ctsc's
+# checker JSON envelope carries the same `tsVersion` string the oracle
+# attaches (harness/src/oracle-checker-*.ts emits ts.version). Falls back
+# to "0.0.0" if the harness is missing or doesn't expose typescript yet.
+set(CTSC_TS_VERSION "0.0.0")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../harness/node_modules/typescript/package.json")
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../harness/node_modules/typescript/package.json" _ts_pkg)
+    string(REGEX MATCH "\"version\"[ \t]*:[ \t]*\"([^\"]+)\"" _m "${_ts_pkg}")
+    if(CMAKE_MATCH_1)
+        set(CTSC_TS_VERSION "${CMAKE_MATCH_1}")
+    endif()
+endif()
+target_compile_definitions(ctsc_checker PRIVATE "CTSC_TS_VERSION=\"${CTSC_TS_VERSION}\"")
+
 add_library(ctsc_emitter STATIC
     src/emitter/emitter.c
 )
@@ -57,7 +78,7 @@ add_executable(ctsc
     src/driver/main.c
     src/driver/project.c
 )
-target_link_libraries(ctsc PRIVATE ctsc_emitter ctsc_binder ctsc_parser ctsc_scanner ctsc_core)
+target_link_libraries(ctsc PRIVATE ctsc_emitter ctsc_checker ctsc_binder ctsc_parser ctsc_scanner ctsc_core)
 
 enable_testing()
 add_executable(ctsc_tests

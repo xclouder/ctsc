@@ -1,6 +1,7 @@
 #include "ctsc/scanner.h"
 #include "ctsc/parser.h"
 #include "ctsc/binder.h"
+#include "ctsc/checker.h"
 #include "ctsc/emitter.h"
 #include "ctsc/arena.h"
 #include "ctsc/buffer.h"
@@ -26,6 +27,8 @@ static void print_usage(FILE* f) {
         "  --dump-tokens     Dump scanner token stream as JSON\n"
         "  --dump-ast        Dump parser AST as JSON\n"
         "  --dump-bindings   Dump binder output as JSON\n"
+        "  --dump-types      Dump checker type entries as JSON\n"
+        "  --check           Dump checker semantic diagnostics as JSON\n"
         "  --emit            Emit JavaScript for a single source file (stdout)\n"
         "  --project <path>  Compile a tsconfig-driven project (file or dir)\n"
         "\n"
@@ -44,6 +47,7 @@ typedef enum {
     CMD_DUMP_AST,
     CMD_DUMP_BINDINGS,
     CMD_DUMP_TYPES,
+    CMD_CHECK,
     CMD_EMIT,
     CMD_PROJECT
 } Cmd;
@@ -68,6 +72,7 @@ int main(int argc, char** argv) {
         if (strcmp(a, "--dump-ast") == 0)      { cmd = CMD_DUMP_AST;      continue; }
         if (strcmp(a, "--dump-bindings") == 0) { cmd = CMD_DUMP_BINDINGS; continue; }
         if (strcmp(a, "--dump-types") == 0)    { cmd = CMD_DUMP_TYPES;    continue; }
+        if (strcmp(a, "--check") == 0)         { cmd = CMD_CHECK;         continue; }
         if (strcmp(a, "--emit") == 0)          { cmd = CMD_EMIT;          continue; }
         if (strcmp(a, "--project") == 0) {
             cmd = CMD_PROJECT;
@@ -116,10 +121,24 @@ int main(int argc, char** argv) {
             ctsc_arena_free(&a);
             break;
         }
-        case CMD_DUMP_TYPES:
-            /* Phase 4 placeholder. */
-            ctsc_buf_append_cstr(&out, "{\"types\":[],\"diagnostics\":[]}");
+        case CMD_DUMP_TYPES: {
+            CtscArena a; ctsc_arena_init(&a, 64 * 1024);
+            CtscParseResult r = ctsc_parse(src, src_len, &a);
+            CtscBindResult* b = ctsc_bind(r.sourceFile, &a);
+            CtscCheckResult* c = ctsc_check(r.sourceFile, b, &a);
+            ctsc_check_dump_types_json(c, &out, pretty);
+            ctsc_arena_free(&a);
             break;
+        }
+        case CMD_CHECK: {
+            CtscArena a; ctsc_arena_init(&a, 64 * 1024);
+            CtscParseResult r = ctsc_parse(src, src_len, &a);
+            CtscBindResult* b = ctsc_bind(r.sourceFile, &a);
+            CtscCheckResult* c = ctsc_check(r.sourceFile, b, &a);
+            ctsc_check_dump_diag_json(c, &out, pretty);
+            ctsc_arena_free(&a);
+            break;
+        }
         case CMD_EMIT: {
             CtscArena a; ctsc_arena_init(&a, 64 * 1024);
             CtscParseResult r = ctsc_parse(src, src_len, &a);

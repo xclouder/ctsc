@@ -210,10 +210,11 @@ async function main(): Promise<void> {
     if (!fx) { console.error(`fixture not found: ${id}`); process.exit(2); }
     const src = await readFile(fx.sourcePath, "utf8");
     const oracle = await getOracle(fx, src);
-    const expected = oracle.tokensJson ?? oracle.astJson ?? oracle.emitJs ?? "";
+    const expected = oracle.tokensJson ?? oracle.astJson ?? oracle.emitJs
+      ?? oracle.checkerTypesJson ?? oracle.checkerDiagJson ?? "";
     const dry = !!flags.dry;
     const run = await runCtsc(fx, { dry });
-    const d = diffPhase(fx.phase, expected, run.stdout);
+    const d = diffPhase(fx.phase, expected, run.stdout, { checkerChannel: fx.checkerChannel });
     console.log(d.summary);
     if (!d.equal && d.firstMismatch) {
       console.log(`  expected: ${d.firstMismatch.expected}`);
@@ -234,7 +235,7 @@ async function main(): Promise<void> {
     if (!fx) { console.error(`fixture not found: ${id}`); process.exit(2); }
     const src = await readFile(fx.sourcePath, "utf8");
     const o = await getOracle(fx, src);
-    console.log(o.tokensJson ?? o.astJson ?? "(no oracle)");
+    console.log(o.tokensJson ?? o.astJson ?? o.emitJs ?? o.checkerTypesJson ?? o.checkerDiagJson ?? "(no oracle)");
     return;
   }
 

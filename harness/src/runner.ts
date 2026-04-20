@@ -85,8 +85,12 @@ export async function runCtsc(fx: Fixture, opts: RunnerOptions = {}): Promise<Ru
       return runProcess(exe, ["--dump-ast", fx.sourcePath], opts.timeoutMs);
     case "binder":
       return runProcess(exe, ["--dump-bindings", fx.sourcePath], opts.timeoutMs);
-    case "checker":
+    case "checker": {
+      /* Channel decides which CLI command we call; oracle picks matching JSON. */
+      const ch = fx.checkerChannel ?? "types";
+      if (ch === "diag") return runProcess(exe, ["--check", fx.sourcePath], opts.timeoutMs);
       return runProcess(exe, ["--dump-types", fx.sourcePath], opts.timeoutMs);
+    }
     case "emitter":
       return runProcess(exe, ["--emit", fx.sourcePath], opts.timeoutMs);
     default:

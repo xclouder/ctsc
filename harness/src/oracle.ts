@@ -7,6 +7,8 @@ import { ORACLE_CACHE_DIR } from "./paths.js";
 import type { Fixture, OracleArtifacts } from "./types.js";
 import { buildAstJson } from "./oracle-ast.js";
 import { buildBindingsJson } from "./oracle-binder.js";
+import { buildCheckerDiagJson } from "./oracle-checker-diag.js";
+import { buildCheckerTypesJson } from "./oracle-checker-types.js";
 
 /*
  * ts.SyntaxKind contains range-marker aliases (FirstAssignment, FirstKeyword,
@@ -162,8 +164,31 @@ export async function getOracle(fx: Fixture, src: string): Promise<OracleArtifac
     return out;
   }
   if (fx.phase === "checker") {
-    const json = JSON.stringify({ types: [], diagnostics: [] });
-    out.tokensJson = json;
+    /* Split channels. M4.0 fixture selects one via `// @checker:` comment
+     * (default inferred from stage subfolder). We cache both channels
+     * separately so re-running with a different channel is still fast. */
+    const channel = fx.checkerChannel ?? "types";
+    if (channel === "diag") {
+      const file = cachePath(key, "diagnostics.json");
+      if (await exists(file)) {
+        out.checkerDiagJson = await readFile(file, "utf8");
+      } else {
+        const json = buildCheckerDiagJson(src);
+        await mkdir(dirname(file), { recursive: true });
+        await writeFile(file, json, "utf8");
+        out.checkerDiagJson = json;
+      }
+    } else {
+      const file = cachePath(key, "types.json");
+      if (await exists(file)) {
+        out.checkerTypesJson = await readFile(file, "utf8");
+      } else {
+        const json = buildCheckerTypesJson(src);
+        await mkdir(dirname(file), { recursive: true });
+        await writeFile(file, json, "utf8");
+        out.checkerTypesJson = json;
+      }
+    }
     return out;
   }
   if (fx.phase === "emitter") {

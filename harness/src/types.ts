@@ -1,5 +1,11 @@
 export type Phase = "scanner" | "parser" | "binder" | "checker" | "emitter" | "cli";
 
+/** Which channel a checker-phase fixture aligns on.
+ *  - "types": compare `--dump-types` output vs ts.TypeChecker.typeToString dump
+ *  - "diag":  compare `--check` output vs ts.Program.getSemanticDiagnostics
+ *  - "both":  reserved for M4.1+; treated as "types" for now with a followup. */
+export type CheckerChannel = "types" | "diag" | "both";
+
 export interface Fixture {
   id: string;
   phase: Phase;
@@ -9,6 +15,8 @@ export interface Fixture {
   relPath: string;
   /** Optional difficulty score, higher is harder. */
   difficulty: number;
+  /** Populated only when phase==="checker"; resolved from fixture comment. */
+  checkerChannel?: CheckerChannel;
 }
 
 export interface OracleArtifacts {
@@ -17,6 +25,9 @@ export interface OracleArtifacts {
   emitJs?: string;
   emitDts?: string;
   diagnostics?: string;
+  /** Checker channel payloads; exactly one is populated for checker fixtures. */
+  checkerDiagJson?: string;
+  checkerTypesJson?: string;
 }
 
 export interface RunResult {

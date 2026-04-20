@@ -1,0 +1,2 @@
+// @checker: diag
+foo;
