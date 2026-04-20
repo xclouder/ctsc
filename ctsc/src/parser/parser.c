@@ -2660,6 +2660,9 @@ static bool is_object_literal_member_start(CtscSyntaxKind k) {
 static CtscNode* parse_object_literal_expression(Parser* p) {
     int fs = cur_full_start(p);
     advance(p); /* "{" */
+    /* Mirrors parser.ts parseObjectLiteralExpression (~6759). */
+    bool multi_line = p->scanner.current.has_preceding_line_break;
+    bool has_trailing_comma = false;
     CtscNodeArray properties; ctsc_node_array_init(&properties);
     while (cur(p) != CTSC_SK_EndOfFileToken && cur(p) != CTSC_SK_CloseBraceToken) {
         if (is_object_literal_member_start(cur(p))) {
@@ -2668,7 +2671,10 @@ static CtscNode* parse_object_literal_expression(Parser* p) {
             if (elt) {
                 ctsc_node_array_push(&properties, p->arena, elt);
             }
-            if (accept(p, CTSC_SK_CommaToken)) continue;
+            if (accept(p, CTSC_SK_CommaToken)) {
+                if (cur(p) == CTSC_SK_CloseBraceToken) has_trailing_comma = true;
+                continue;
+            }
             if (cur(p) == CTSC_SK_EndOfFileToken || cur(p) == CTSC_SK_CloseBraceToken) break;
             /* parseExpected(CommaToken): diagnostic, no consume. */
             ctsc_diag_push(p->diagnostics, CTSC_DIAG_ERROR, 1005,
@@ -2705,6 +2711,8 @@ static CtscNode* parse_object_literal_expression(Parser* p) {
     int end = cur_full_start(p);
     CtscNode* obj = ctsc_node_new(p->arena, CTSC_SK_ObjectLiteralExpression, fs, end);
     obj->data.objectLiteralExpression.properties = properties;
+    obj->data.objectLiteralExpression.multi_line = multi_line;
+    obj->data.objectLiteralExpression.has_trailing_comma = has_trailing_comma;
     return obj;
 }
 
@@ -6050,19 +6058,28 @@ static CtscNode* parse_statement(Parser* p) {
             /* parser.ts isDeclaration ~7222: ASI kicks in when a line break
              * separates `declare` from the next token, aborting the
              * declaration attempt. */
-            if (!p->scanner.current.has_preceding_line_break
-                && (cur(p) == CTSC_SK_VarKeyword
+            if (!p->scanner.current.has_preceding_line_break) {
+                if (cur(p) == CTSC_SK_VarKeyword
                     || cur(p) == CTSC_SK_ConstKeyword
-                    || (cur(p) == CTSC_SK_LetKeyword && is_let_declaration(p)))) {
-                CtscNode* stmt = parse_variable_statement(p);
-                if (stmt && stmt->kind == CTSC_SK_VariableStatement) {
-                    stmt->data.variableStatement.has_declare = true;
-                    /* parser.ts finishNode (~2600) positions the node at the
-                     * pre-modifier getNodePos(); mirror that here so the
-                     * VariableStatement span covers the `declare` keyword. */
-                    stmt->pos = fs;
+                    || (cur(p) == CTSC_SK_LetKeyword && is_let_declaration(p))) {
+                    CtscNode* stmt = parse_variable_statement(p);
+                    if (stmt && stmt->kind == CTSC_SK_VariableStatement) {
+                        stmt->data.variableStatement.has_declare = true;
+                        /* parser.ts finishNode (~2600) positions the node at the
+                         * pre-modifier getNodePos(); mirror that here so the
+                         * VariableStatement span covers the `declare` keyword. */
+                        stmt->pos = fs;
+                    }
+                    return stmt;
                 }
-                return stmt;
+                if (cur(p) == CTSC_SK_FunctionKeyword) {
+                    CtscNode* fn = parse_function_declaration(p, false);
+                    if (fn && fn->kind == CTSC_SK_FunctionDeclaration) {
+                        fn->data.functionDeclaration.has_declare = true;
+                        fn->pos = fs;
+                    }
+                    return fn;
+                }
             }
             /* Not a declaration we can parse; fall back to expression-statement
              * treatment of `declare` as a contextual identifier. */

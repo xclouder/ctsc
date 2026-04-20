@@ -67,6 +67,7 @@ harness/reports/
 scratch-*.js
 scratch-*.cjs
 scratch-*.mjs
+harness/scratch/
 
 # =====================================================================
 # Editor / IDE

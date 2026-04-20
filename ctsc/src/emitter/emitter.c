@@ -633,6 +633,8 @@ static bool source_file_statement_is_dropped(const CtscNode* s) {
     if (!s) return true;
     if (s->kind == CTSC_SK_FunctionDeclaration
         && s->data.functionDeclaration.body == NULL) return true;
+    if (s->kind == CTSC_SK_FunctionDeclaration
+        && s->data.functionDeclaration.has_declare) return true;
     if (s->kind == CTSC_SK_VariableStatement
         && s->data.variableStatement.has_declare) return true;
     /* Mirrors upstream/TypeScript/src/compiler/transformers/ts.ts
@@ -2668,10 +2670,9 @@ static void emit(Emitter* e, const CtscNode* n) {
          *     SpaceBetweenBraces | Indented | Braces | NoSpaceIfEmpty.
          * For a single-line literal with ≥1 property, the list format expands
          * to "{ p1, p2 }"; an empty properties list collapses to "{}" via
-         * NoSpaceIfEmpty (utilities.ts emitList ~4706). The `PreserveLines`
-         * bit only takes effect when the source spans multiple lines, which
-         * is not yet modelled here — the current fixtures all fit on one
-         * line in the emitted JS.
+         * NoSpaceIfEmpty (utilities.ts emitList ~4706). When `multi_line` is
+         * true (parser ~6759), PreferNewLine (~2627) emits each property on
+         * its own indented line with commas per `has_trailing_comma`.
          *
          * The ts.transpileModule pipeline runs the declaration transformer
          * before the printer, which drops body-less MethodDeclarations
@@ -2684,29 +2685,55 @@ static void emit(Emitter* e, const CtscNode* n) {
          */
         case CTSC_SK_ObjectLiteralExpression: {
             const CtscNodeArray* props = &n->data.objectLiteralExpression.properties;
+            bool multi_line = n->data.objectLiteralExpression.multi_line;
+            bool has_trailing_comma = n->data.objectLiteralExpression.has_trailing_comma;
             size_t emit_count = 0;
             for (size_t i = 0; i < props->len; ++i) {
-                const CtscNode* p = props->items[i];
-                if (p->kind == CTSC_SK_MethodDeclaration
-                    && p->data.methodDeclaration.body == NULL) continue;
-                if ((p->kind == CTSC_SK_GetAccessor || p->kind == CTSC_SK_SetAccessor)
-                    && p->data.accessorDeclaration.body == NULL) continue;
+                const CtscNode* prop = props->items[i];
+                if (prop->kind == CTSC_SK_MethodDeclaration
+                    && prop->data.methodDeclaration.body == NULL) continue;
+                if ((prop->kind == CTSC_SK_GetAccessor || prop->kind == CTSC_SK_SetAccessor)
+                    && prop->data.accessorDeclaration.body == NULL) continue;
                 emit_count++;
             }
             write_char(e, '{');
-            if (emit_count > 0) write_char(e, ' ');
-            bool first = true;
-            for (size_t i = 0; i < props->len; ++i) {
-                const CtscNode* p = props->items[i];
-                if (p->kind == CTSC_SK_MethodDeclaration
-                    && p->data.methodDeclaration.body == NULL) continue;
-                if ((p->kind == CTSC_SK_GetAccessor || p->kind == CTSC_SK_SetAccessor)
-                    && p->data.accessorDeclaration.body == NULL) continue;
-                if (!first) write_cstr(e, ", ");
-                first = false;
-                emit(e, p);
+            if (emit_count == 0) {
+                write_char(e, '}');
+                return;
             }
-            if (emit_count > 0) write_char(e, ' ');
+            if (!multi_line) {
+                write_char(e, ' ');
+                bool first = true;
+                for (size_t i = 0; i < props->len; ++i) {
+                    const CtscNode* prop = props->items[i];
+                    if (prop->kind == CTSC_SK_MethodDeclaration
+                        && prop->data.methodDeclaration.body == NULL) continue;
+                    if ((prop->kind == CTSC_SK_GetAccessor || prop->kind == CTSC_SK_SetAccessor)
+                        && prop->data.accessorDeclaration.body == NULL) continue;
+                    if (!first) write_cstr(e, ", ");
+                    first = false;
+                    emit(e, prop);
+                }
+                write_char(e, ' ');
+                write_char(e, '}');
+                return;
+            }
+            e->indent++;
+            size_t seen = 0;
+            for (size_t i = 0; i < props->len; ++i) {
+                const CtscNode* prop = props->items[i];
+                if (prop->kind == CTSC_SK_MethodDeclaration
+                    && prop->data.methodDeclaration.body == NULL) continue;
+                if ((prop->kind == CTSC_SK_GetAccessor || prop->kind == CTSC_SK_SetAccessor)
+                    && prop->data.accessorDeclaration.body == NULL) continue;
+                write_line(e);
+                emit(e, prop);
+                seen++;
+                bool is_last = (seen == emit_count);
+                if (!is_last || has_trailing_comma) write_char(e, ',');
+            }
+            e->indent--;
+            write_line(e);
             write_char(e, '}');
             return;
         }

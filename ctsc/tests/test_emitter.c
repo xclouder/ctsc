@@ -1289,5 +1289,32 @@ int test_emitter(void) {
         &failed
     );
 
+    /*
+     * emitter.ts emitObjectLiteralExpression (~2618) + ts.ts visitTypeScript (~643):
+     * multi-line object literals from source stay multi-line; `declare function`
+     * is elided. fixtures/emitter/selfhost-derived/106_multiline_object_literal.ts.
+     */
+    expect_emit(
+        "export const o = {\n"
+        "  a: 1,\n"
+        "};\n"
+        "declare function f(): void;\n"
+        "export function g() {\n"
+        "  return {\n"
+        "    x: 1,\n"
+        "  };\n"
+        "}\n",
+        "export const o = {\n"
+        "    a: 1,\n"
+        "};\n"
+        "export function g() {\n"
+        "    return {\n"
+        "        x: 1,\n"
+        "    };\n"
+        "}\n",
+        "multiline object literal + declare function elision (106)",
+        &failed
+    );
+
     return failed;
 }

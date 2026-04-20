@@ -255,6 +255,8 @@ typedef struct {
      * → parseExportAssignment ~8736, expression parsed as function). Mutually
      * exclusive with has_export in normal sources. */
     bool          has_export_default;
+    /* True for `declare function ...` (ModifierFlags.Ambient); elided in JS emit. */
+    bool          has_declare;
     CtscNode*     name;       /* Identifier nullable (anon) */
     /* Mirrors parseTypeParameters (~3987) between name and parseParameters. */
     CtscNodeArray type_parameters;
@@ -576,6 +578,11 @@ typedef struct {
 
 typedef struct {
     CtscNodeArray properties;
+    /* Mirrors parser.ts parseObjectLiteralExpression (~6759): multiLine =
+     * scanner.hasPrecedingLineBreak() after `{`; controls PreferNewLine in
+     * emitObjectLiteralExpression (~2627). */
+    bool          multi_line;
+    bool          has_trailing_comma;
 } CtscObjectLiteralExpressionData;
 
 /*
