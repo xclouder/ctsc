@@ -70,6 +70,9 @@ function stageDefaultChannel(stage: string): CheckerChannel {
       stage === "function_calls") {
     return "diag";
   }
+  /* property_access has a mix; each fixture specifies // @checker:
+   * explicitly, but default to types so a forgotten annotation on a
+   * read-shaped fixture still routes correctly. */
   return "types";
 }
 
