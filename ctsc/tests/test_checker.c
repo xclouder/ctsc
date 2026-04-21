@@ -268,6 +268,28 @@ int test_checker(void) {
         ctsc_arena_free(&a);
     }
 
+    /* `as` / angle assertion: expression type is the asserted type (checkAssertionWorker ~38110-38123;
+     * fixtures/checker/type_assertion/01_as_cast.ts). */
+    {
+        const char* src = "// @checker: types\nconst x = 1 as number;\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 8192);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 1);
+        if (cr->entries_len == 1 && cr->entries[0].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[0].type, &ts);
+            EXPECT(ts.len == 6 && memcmp(ts.data, "number", 6) == 0);
+            ctsc_buf_free(&ts);
+        }
+        ctsc_arena_free(&a);
+    }
+
     /* Identifier initializer reads prior const binding type (getTypeOfSymbol ~12537; fixture checker/references/01). */
     {
         const char* src = "// @checker: types\nconst a = 1;\nconst b = a;\n";
@@ -1161,6 +1183,42 @@ int test_checker(void) {
         ctsc_arena_free(&a);
     }
 
+    /* Static field + access on class identifier (fixtures/checker/static/01_static_field.ts;
+     * checker.ts getTypeOfSymbol staticType / getPropertyOfType ~10308, ~15893). */
+    {
+        const char* src =
+            "// @checker: types\nclass C {\n  static x: number = 1;\n}\nconst n = C.x;\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 2);
+        if (cr->entries_len == 2) {
+            EXPECT(cr->entries[0].decl_kind_name
+                   && strcmp(cr->entries[0].decl_kind_name, "PropertyDeclaration") == 0);
+            EXPECT(cr->entries[1].decl_kind_name
+                   && strcmp(cr->entries[1].decl_kind_name, "VariableDeclaration") == 0);
+            if (cr->entries[0].type) {
+                CtscBuffer t0;
+                ctsc_buf_init(&t0);
+                ctsc_type_to_string(cr->entries[0].type, &t0);
+                EXPECT(t0.len == 6 && memcmp(t0.data, "number", 6) == 0);
+                ctsc_buf_free(&t0);
+            }
+            if (cr->entries[1].type) {
+                CtscBuffer t1;
+                ctsc_buf_init(&t1);
+                ctsc_type_to_string(cr->entries[1].type, &t1);
+                EXPECT(t1.len == 6 && memcmp(t1.data, "number", 6) == 0);
+                ctsc_buf_free(&t1);
+            }
+        }
+        ctsc_arena_free(&a);
+    }
+
     /* Empty class: `new C()` instance type is `C` (checker.ts resolveNewExpression ~37131, checkCallExpression ~37826). */
     {
         const char* src = "// @checker: types\nclass C {}\nconst c = new C();\n";
@@ -1374,6 +1432,48 @@ int test_checker(void) {
             EXPECT(tn.len == 6 && memcmp(tn.data, "number", 6) == 0);
             ctsc_buf_free(&tb);
             ctsc_buf_free(&tn);
+        }
+        ctsc_arena_free(&a);
+    }
+
+    /*
+     * Array destructuring: tuple inference from array literal so references get
+     * element types (fixtures/checker/destructuring/02_array_destructure.ts;
+     * checker.ts getTypeFromBindingPattern ~12433).
+     */
+    {
+        const char* src = "// @checker: types\nconst [a, b] = [1, 2];\nconst c = a;\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 1);
+        if (cr->entries_len >= 1 && cr->entries[0].type) {
+            EXPECT(cr->entries[0].type->kind == CTSC_TYPE_NUMBER);
+        }
+        ctsc_arena_free(&a);
+    }
+
+    /*
+     * Object destructuring: inferred type of a binding flows to later references
+     * (fixtures/checker/destructuring/01_object_destructure.ts; checker.ts
+     * checkBindingElement / getTypeFromBindingPattern ~41400+).
+     */
+    {
+        const char* src = "// @checker: types\nconst { x } = { x: 1 };\nconst y = x;\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 1);
+        if (cr->entries_len >= 1 && cr->entries[0].type) {
+            EXPECT(cr->entries[0].type->kind == CTSC_TYPE_NUMBER);
         }
         ctsc_arena_free(&a);
     }

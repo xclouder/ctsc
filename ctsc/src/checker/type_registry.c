@@ -88,6 +88,13 @@ CtscType* ctsc_type_reference(CtscTypeRegistry* reg, const uint16_t* name, size_
     return t;
 }
 
+CtscType* ctsc_type_class_constructor(CtscTypeRegistry* reg, const uint16_t* name, size_t name_len) {
+    CtscType* t = ctsc_type_new(reg, CTSC_TYPE_CLASS_CONSTRUCTOR);
+    t->text = name;
+    t->text_len = name_len;
+    return t;
+}
+
 CtscType* ctsc_type_reference_with_type_args(CtscTypeRegistry* reg, const uint16_t* name, size_t name_len,
                                                CtscType** args, size_t arg_count) {
     CtscType* t = ctsc_type_new(reg, CTSC_TYPE_REFERENCE);
@@ -128,7 +135,9 @@ CtscType* ctsc_type_widen(CtscTypeRegistry* reg, const CtscType* t) {
         case CTSC_TYPE_STRING_LITERAL:  return reg->t_string;
         case CTSC_TYPE_BOOLEAN_LITERAL: return reg->t_boolean;
         case CTSC_TYPE_BIGINT_LITERAL:  return reg->t_bigint;
-        case CTSC_TYPE_REFERENCE:       return (CtscType*)t;
+        case CTSC_TYPE_REFERENCE:
+        case CTSC_TYPE_CLASS_CONSTRUCTOR:
+            return (CtscType*)t;
         default: return (CtscType*)t;
     }
 }
@@ -280,6 +289,10 @@ void ctsc_type_to_string(const CtscType* t, CtscBuffer* out) {
                 }
                 ctsc_buf_append_char(out, '>');
             }
+            return;
+        case CTSC_TYPE_CLASS_CONSTRUCTOR:
+            ctsc_buf_append_cstr(out, "typeof ");
+            append_utf16_ascii_identifier_prop_name(out, t->text, t->text_len);
             return;
         default:
             ctsc_buf_append_cstr(out, "any");

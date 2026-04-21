@@ -127,6 +127,14 @@ typedef struct {
     bool*            var_decl_const_vals;
     size_t           var_decl_const_len;
     size_t           var_decl_const_cap;
+    /*
+     * BindingElement* → inferred type for object/array destructuring (checker.ts
+     * getTypeFromBindingElement / checkBindingElement ~45289, getTypeFromBindingPattern ~12433).
+     */
+    const CtscNode** binding_elem_type_keys;
+    CtscType**       binding_elem_type_vals;
+    size_t           binding_elem_type_len;
+    size_t           binding_elem_type_cap;
 } Walk;
 
 static void var_decl_const_register(Walk* w, const CtscNode* decl, bool is_const) {
@@ -154,6 +162,33 @@ static bool var_decl_is_const(Walk* w, const CtscNode* decl) {
         if (w->var_decl_const_keys[i] == decl) return w->var_decl_const_vals[i];
     }
     return false;
+}
+
+static void binding_elem_type_register(Walk* w, const CtscNode* be, CtscType* t) {
+    if (!w || !be) return;
+    if (w->binding_elem_type_len + 1 > w->binding_elem_type_cap) {
+        size_t ncap = w->binding_elem_type_cap ? w->binding_elem_type_cap * 2 : 16;
+        const CtscNode** nk = (const CtscNode**)ctsc_arena_alloc(w->arena, ncap * sizeof(CtscNode*));
+        CtscType** nv = (CtscType**)ctsc_arena_alloc(w->arena, ncap * sizeof(CtscType*));
+        if (w->binding_elem_type_keys) {
+            memcpy(nk, w->binding_elem_type_keys, w->binding_elem_type_len * sizeof(CtscNode*));
+            memcpy(nv, w->binding_elem_type_vals, w->binding_elem_type_len * sizeof(CtscType*));
+        }
+        w->binding_elem_type_keys = nk;
+        w->binding_elem_type_vals = nv;
+        w->binding_elem_type_cap = ncap;
+    }
+    w->binding_elem_type_keys[w->binding_elem_type_len] = be;
+    w->binding_elem_type_vals[w->binding_elem_type_len] = t ? t : w->r->registry.t_any;
+    w->binding_elem_type_len++;
+}
+
+static CtscType* binding_elem_type_lookup(Walk* w, const CtscNode* be) {
+    if (!w || !be) return NULL;
+    for (size_t i = 0; i < w->binding_elem_type_len; ++i) {
+        if (w->binding_elem_type_keys[i] == be) return w->binding_elem_type_vals[i];
+    }
+    return NULL;
 }
 
 /* ----- type inference helpers ----- */
@@ -953,11 +988,11 @@ static CtscType* variable_declaration_type(Walk* w, const CtscNode* decl, bool i
 static CtscType* class_property_declaration_type(Walk* w, const CtscNode* decl);
 static CtscType* property_type_from_class_declaration(Walk* w, const CtscNode* class_node,
                                                       const uint16_t* prop_name, size_t prop_len,
-                                                      unsigned depth);
+                                                      unsigned depth, bool static_side);
 static CtscType* return_type_of_method_declaration(Walk* w, const CtscNode* method_node);
 static CtscType* method_return_type_from_class_declaration(Walk* w, const CtscNode* class_node,
                                                            const uint16_t* prop_name, size_t prop_len,
-                                                           unsigned depth);
+                                                           unsigned depth, bool static_side);
 static CtscType* return_type_of_function_declaration(Walk* w, const CtscNode* fn_decl);
 static const CtscNode* symbol_function_declaration_decl(CtscSymbol* sym);
 static CtscType* type_of_symbol_value(Walk* w, CtscSymbol* sym);
@@ -1040,6 +1075,12 @@ static bool conditional_branch_types_identical(const CtscType* a, const CtscType
                     return false;
             }
             return true;
+        }
+        case CTSC_TYPE_CLASS_CONSTRUCTOR: {
+            if (a->text_len != b->text_len) return false;
+            if (a->text_len == 0) return true;
+            if (!a->text || !b->text) return a->text == b->text;
+            return memcmp(a->text, b->text, a->text_len * sizeof(uint16_t)) == 0;
         }
         default:
             return false;
@@ -1279,7 +1320,8 @@ static CtscType* type_of_expression(Walk* w, CtscTypeRegistry* reg, const CtscNo
             if (callee && callee->kind == CTSC_SK_PropertyAccessExpression && w) {
                 const CtscPropertyAccessExpressionData* pa = &callee->data.propertyAccessExpression;
                 CtscType* obj_t = type_of_expression(w, reg, pa->expression);
-                if (obj_t && obj_t->kind == CTSC_TYPE_REFERENCE && pa->name
+                bool static_member = (obj_t && obj_t->kind == CTSC_TYPE_CLASS_CONSTRUCTOR);
+                if (obj_t && (obj_t->kind == CTSC_TYPE_REFERENCE || static_member) && pa->name
                     && pa->name->kind == CTSC_SK_Identifier) {
                     const CtscIdentifierData* id = &pa->name->data.identifier;
                     CtscSymbol* sym = resolve_name(&w->scopes, obj_t->text, obj_t->text_len);
@@ -1287,8 +1329,9 @@ static CtscType* type_of_expression(Walk* w, CtscTypeRegistry* reg, const CtscNo
                         for (size_t i = 0; i < sym->decls_len; ++i) {
                             CtscNode* d = sym->decls[i];
                             if (d && d->kind == CTSC_SK_ClassDeclaration) {
-                                CtscType* rt =
-                                    method_return_type_from_class_declaration(w, d, id->text, id->text_len, 0);
+                                CtscType* rt = method_return_type_from_class_declaration(w, d, id->text,
+                                                                                       id->text_len, 0,
+                                                                                       static_member);
                                 if (rt) return rt;
                             }
                         }
@@ -1331,6 +1374,19 @@ static CtscType* type_of_expression(Walk* w, CtscTypeRegistry* reg, const CtscNo
             if (idx >= obj_t->tuple_elements_len) return reg->t_any;
             CtscType* el = obj_t->tuple_elements[idx];
             return el ? el : reg->t_any;
+        }
+        case CTSC_SK_AsExpression: {
+            /* checkAssertionWorker → getTypeFromTypeNode(type) (checker.ts ~38110-38123). */
+            const CtscAsExpressionData* ae = &expr->data.asExpression;
+            CtscNode* tnode = ae->type;
+            if (!tnode || !w) return reg->t_any;
+            return type_of_type_node(w, reg, w->source_utf16, w->source_utf16_len, tnode, 0);
+        }
+        case CTSC_SK_TypeAssertionExpression: {
+            const CtscTypeAssertionExpressionData* ta = &expr->data.typeAssertionExpression;
+            CtscNode* tnode = ta->type;
+            if (!tnode || !w) return reg->t_any;
+            return type_of_type_node(w, reg, w->source_utf16, w->source_utf16_len, tnode, 0);
         }
         default:
             /* All other expressions → any, for M4.0. */
@@ -1401,7 +1457,25 @@ static CtscType* type_of_property_of_object_type(Walk* w, CtscTypeRegistry* reg,
             for (size_t i = 0; i < sym->decls_len; ++i) {
                 CtscNode* d = sym->decls[i];
                 if (d && d->kind == CTSC_SK_ClassDeclaration) {
-                    CtscType* pt = property_type_from_class_declaration(w, d, prop_name, prop_len, 0);
+                    CtscType* pt =
+                        property_type_from_class_declaration(w, d, prop_name, prop_len, 0, false);
+                    if (pt) {
+                        pt = maybe_instantiate_class_member_type(w, reg, d, pt, object_type->reference_type_args,
+                                                                 object_type->reference_type_args_len);
+                    }
+                    if (pt) return pt;
+                }
+            }
+        }
+    }
+    if (object_type->kind == CTSC_TYPE_CLASS_CONSTRUCTOR && w) {
+        CtscSymbol* sym = resolve_name(&w->scopes, object_type->text, object_type->text_len);
+        if (sym) {
+            for (size_t i = 0; i < sym->decls_len; ++i) {
+                CtscNode* d = sym->decls[i];
+                if (d && d->kind == CTSC_SK_ClassDeclaration) {
+                    CtscType* pt =
+                        property_type_from_class_declaration(w, d, prop_name, prop_len, 0, true);
                     if (pt) {
                         pt = maybe_instantiate_class_member_type(w, reg, d, pt, object_type->reference_type_args,
                                                                  object_type->reference_type_args_len);
@@ -1796,6 +1870,9 @@ static bool is_assignable_to(Walk* w, CtscTypeRegistry* reg, CtscType* source, C
         }
         return true;
     }
+    if (source->kind == CTSC_TYPE_CLASS_CONSTRUCTOR && target->kind == CTSC_TYPE_CLASS_CONSTRUCTOR) {
+        return utf16_type_text_equal(source->text, source->text_len, target->text, target->text_len);
+    }
     {
         CtscType* sw = ctsc_type_widen(reg, source);
         CtscType* tw = ctsc_type_widen(reg, target);
@@ -2003,6 +2080,132 @@ static CtscType* widen_nullish_when_not_strict_null(CtscTypeRegistry* reg, CtscT
     return t;
 }
 
+/*
+ * Object destructuring: inferred type for one BindingElement from the
+ * initializer object's property (checker.ts checkVariableDeclaration /
+ * getTypeFromBindingPattern ~41400+).
+ */
+static CtscType* destructured_binding_element_type_from_prop(Walk* w, CtscType* prop_t, bool is_const) {
+    if (!prop_t) return w->r->registry.t_any;
+    CtscType* after_literal = is_const ? prop_t : ctsc_type_widen(&w->r->registry, prop_t);
+    return widen_nullish_when_not_strict_null(&w->r->registry, after_literal);
+}
+
+static void register_object_binding_element_types(Walk* w, const CtscNode* be, CtscType* init_object_t, bool is_const);
+
+static void register_object_binding_pattern_types_from_init(Walk* w, const CtscNode* obp, CtscType* init_t,
+                                                            bool is_const) {
+    if (!obp || obp->kind != CTSC_SK_ObjectBindingPattern || !init_t) return;
+    const CtscNodeArray* ar = &obp->data.bindingPattern.elements;
+    for (size_t i = 0; i < ar->len; i++) {
+        CtscNode* el = ar->items[i];
+        if (!el || el->kind != CTSC_SK_BindingElement) continue;
+        register_object_binding_element_types(w, el, init_t, is_const);
+    }
+}
+
+static void register_array_binding_element_types(Walk* w, const CtscNode* be, CtscType* init_t,
+                                                 const CtscNode* initializer, size_t slot, bool is_const);
+
+/*
+ * One positional slot in array destructuring: infer from the initializer's array
+ * literal element or a tuple type (checker.ts getTypeForVariableLikeDeclaration
+ * / contextual tuple from binding pattern ~12444-12450).
+ */
+static CtscType* destructured_array_element_type_at_slot(Walk* w, const CtscNode* initializer,
+                                                         CtscType* init_t, size_t slot, bool is_const) {
+    if (initializer && initializer->kind == CTSC_SK_ArrayLiteralExpression) {
+        const CtscArrayLiteralExpressionData* ar = &initializer->data.arrayLiteralExpression;
+        if (slot < ar->elements.len) {
+            CtscNode* el = ar->elements.items[slot];
+            if (!el || el->kind == CTSC_SK_SpreadElement) return w->r->registry.t_any;
+            CtscType* et = type_of_expression(w, &w->r->registry, el);
+            et = ctsc_type_widen(&w->r->registry, et);
+            return destructured_binding_element_type_from_prop(w, et, is_const);
+        }
+        return w->r->registry.t_any;
+    }
+    if (init_t && init_t->kind == CTSC_TYPE_TUPLE && slot < init_t->tuple_elements_len) {
+        CtscType* et = init_t->tuple_elements[slot];
+        return destructured_binding_element_type_from_prop(w, et, is_const);
+    }
+    return w->r->registry.t_any;
+}
+
+static void register_array_binding_pattern_types_from_init(Walk* w, const CtscNode* abp, CtscType* init_t,
+                                                          const CtscNode* initializer, bool is_const) {
+    if (!abp || abp->kind != CTSC_SK_ArrayBindingPattern) return;
+    const CtscNodeArray* ar = &abp->data.bindingPattern.elements;
+    size_t slot = 0;
+    for (size_t i = 0; i < ar->len; i++) {
+        CtscNode* el = ar->items[i];
+        if (!el) continue;
+        if (el->kind == CTSC_SK_OmittedExpression) {
+            slot++;
+            continue;
+        }
+        if (el->kind != CTSC_SK_BindingElement) continue;
+        const CtscBindingElementData* bed = &el->data.bindingElement;
+        if (bed->has_dotdotdot) {
+            if (bed->name && bed->name->kind == CTSC_SK_Identifier) {
+                binding_elem_type_register(w, el, w->r->registry.t_any);
+            }
+            break;
+        }
+        register_array_binding_element_types(w, el, init_t, initializer, slot, is_const);
+        slot++;
+    }
+}
+
+static void register_array_binding_element_types(Walk* w, const CtscNode* be, CtscType* init_t,
+                                                 const CtscNode* initializer, size_t slot, bool is_const) {
+    if (!be || be->kind != CTSC_SK_BindingElement) return;
+    const CtscBindingElementData* bed = &be->data.bindingElement;
+    if (bed->has_dotdotdot) return;
+    CtscType* elem_t = destructured_array_element_type_at_slot(w, initializer, init_t, slot, is_const);
+    const CtscNode* name = bed->name;
+    if (!name) return;
+    if (name->kind == CTSC_SK_Identifier) {
+        binding_elem_type_register(w, be, elem_t);
+    } else if (name->kind == CTSC_SK_ObjectBindingPattern) {
+        register_object_binding_pattern_types_from_init(w, name, elem_t, is_const);
+    } else if (name->kind == CTSC_SK_ArrayBindingPattern) {
+        const CtscNode* inner_init = NULL;
+        if (initializer && initializer->kind == CTSC_SK_ArrayLiteralExpression) {
+            const CtscArrayLiteralExpressionData* ar = &initializer->data.arrayLiteralExpression;
+            if (slot < ar->elements.len) inner_init = ar->elements.items[slot];
+        }
+        register_array_binding_pattern_types_from_init(w, name, elem_t, inner_init, is_const);
+    }
+}
+
+static void register_object_binding_element_types(Walk* w, const CtscNode* be, CtscType* init_object_t,
+                                                 bool is_const) {
+    if (!be || be->kind != CTSC_SK_BindingElement || !init_object_t) return;
+    const CtscBindingElementData* bed = &be->data.bindingElement;
+    if (bed->has_dotdotdot) return;
+
+    const uint16_t* prop_utf16 = NULL;
+    size_t prop_len = 0;
+    if (bed->propertyName) {
+        if (!object_literal_property_name_utf16(bed->propertyName, &prop_utf16, &prop_len)) return;
+    } else {
+        if (!bed->name || bed->name->kind != CTSC_SK_Identifier) return;
+        prop_utf16 = bed->name->data.identifier.text;
+        prop_len = bed->name->data.identifier.text_len;
+    }
+
+    CtscType* prop_t =
+        type_of_property_of_object_type(w, &w->r->registry, init_object_t, prop_utf16, prop_len);
+    const CtscNode* name = bed->name;
+    if (!name) return;
+    if (name->kind == CTSC_SK_Identifier) {
+        binding_elem_type_register(w, be, destructured_binding_element_type_from_prop(w, prop_t, is_const));
+    } else if (name->kind == CTSC_SK_ObjectBindingPattern) {
+        register_object_binding_pattern_types_from_init(w, name, prop_t, is_const);
+    }
+}
+
 static const CtscNode* constructor_method_declaration(const CtscNode* class_decl) {
     if (!class_decl || class_decl->kind != CTSC_SK_ClassDeclaration) return NULL;
     const CtscNodeArray* members = &class_decl->data.classDeclaration.members;
@@ -2115,15 +2318,29 @@ static CtscType* class_property_declaration_type(Walk* w, const CtscNode* decl) 
     return widen_nullish_when_not_strict_null(&w->r->registry, ctsc_type_widen(&w->r->registry, init_t));
 }
 
+/*
+ * Mirrors parser / checker static vs instance member lists (checker.ts
+ * getPropertyOfType on staticType vs instanceType ~11575, ~15893).
+ */
+static bool modifier_list_has_static(const CtscNodeArray* mods) {
+    if (!mods) return false;
+    for (size_t i = 0; i < mods->len; ++i) {
+        CtscNode* m = mods->items[i];
+        if (m && m->kind == CTSC_SK_StaticKeyword) return true;
+    }
+    return false;
+}
+
 static CtscType* property_type_from_class_declaration(Walk* w, const CtscNode* class_node,
                                                       const uint16_t* prop_name, size_t prop_len,
-                                                      unsigned depth) {
+                                                      unsigned depth, bool static_side) {
     if (!class_node || class_node->kind != CTSC_SK_ClassDeclaration) return NULL;
     if (depth > 64) return NULL;
     const CtscNodeArray* members = &class_node->data.classDeclaration.members;
     for (size_t i = 0; i < members->len; ++i) {
         CtscNode* m = members->items[i];
         if (!m || m->kind != CTSC_SK_PropertyDeclaration) continue;
+        if (modifier_list_has_static(&m->data.propertyDeclaration.modifiers) != static_side) continue;
         const CtscNode* pname = m->data.propertyDeclaration.name;
         if (!pname || pname->kind != CTSC_SK_Identifier) continue;
         if (pname->data.identifier.text_len != prop_len) continue;
@@ -2131,8 +2348,8 @@ static CtscType* property_type_from_class_declaration(Walk* w, const CtscNode* c
         return class_property_declaration_type(w, m);
     }
     /*
-     * Inherited instance members: walk `extends` heritage (checker.ts
-     * getPropertyOfType / class resolution feeding getTypeOfPropertyOfType ~11575).
+     * Inherited members: walk `extends` heritage (instance and static both
+     * inherit declarations from the base class symbol).
      */
     const CtscNodeArray* hcs = &class_node->data.classDeclaration.heritage_clauses;
     for (size_t hi = 0; hi < hcs->len; ++hi) {
@@ -2152,7 +2369,7 @@ static CtscType* property_type_from_class_declaration(Walk* w, const CtscNode* c
                 CtscNode* bd = base_sym->decls[di];
                 if (!bd || bd->kind != CTSC_SK_ClassDeclaration) continue;
                 CtscType* inherited =
-                    property_type_from_class_declaration(w, bd, prop_name, prop_len, depth + 1);
+                    property_type_from_class_declaration(w, bd, prop_name, prop_len, depth + 1, static_side);
                 if (inherited) return inherited;
             }
         }
@@ -2339,7 +2556,8 @@ static void visit_variable_declaration_list(Walk* w, const CtscNode* list) {
         const CtscNode* d = decls->items[i];
         if (!d || d->kind != CTSC_SK_VariableDeclaration) continue;
         const CtscVariableDeclarationData* vd = &d->data.variableDeclaration;
-        if (!vd->type && vd->initializer && vd->initializer->kind == CTSC_SK_ArrowFunction) {
+        if (vd->name && vd->name->kind == CTSC_SK_Identifier && !vd->type && vd->initializer
+            && vd->initializer->kind == CTSC_SK_ArrowFunction) {
             const CtscArrowFunctionData* af = &vd->initializer->data.arrowFunction;
             CtscType* inferred_ret =
                 infer_return_type_for_arrow_function(w, &w->r->registry, w->arena, vd->initializer);
@@ -2352,7 +2570,8 @@ static void visit_variable_declaration_list(Walk* w, const CtscNode* list) {
             size_t slen = sig.len;
             ctsc_buf_free(&sig);
             push_entry_with_string(w, d, vd->name, s, slen);
-        } else if (!vd->type && vd->initializer && vd->initializer->kind == CTSC_SK_FunctionExpression) {
+        } else if (vd->name && vd->name->kind == CTSC_SK_Identifier && !vd->type && vd->initializer
+                   && vd->initializer->kind == CTSC_SK_FunctionExpression) {
             /*
              * FunctionExpression in a VariableDeclaration: same signature string as
              * ArrowFunction (checker.ts getReturnTypeFromBody ~39195 + getWidenedType
@@ -2371,8 +2590,33 @@ static void visit_variable_declaration_list(Walk* w, const CtscNode* list) {
             ctsc_buf_free(&sig);
             push_entry_with_string(w, d, vd->name, s, slen);
         } else {
-            CtscType* t = variable_declaration_type(w, d, is_const);
-            push_entry_for_name(w, d, vd->name, t);
+            const CtscNode* nm = vd->name;
+            if (nm && nm->kind == CTSC_SK_ObjectBindingPattern) {
+                CtscType* init_t;
+                if (vd->initializer) {
+                    init_t = type_of_expression(w, &w->r->registry, vd->initializer);
+                } else if (vd->type) {
+                    init_t = type_of_type_node(w, &w->r->registry, w->source_utf16, w->source_utf16_len, vd->type, 0);
+                } else {
+                    init_t = w->r->registry.t_any;
+                }
+                register_object_binding_pattern_types_from_init(w, nm, init_t, is_const);
+            }
+            if (nm && nm->kind == CTSC_SK_ArrayBindingPattern) {
+                CtscType* init_t;
+                if (vd->initializer) {
+                    init_t = type_of_expression(w, &w->r->registry, vd->initializer);
+                } else if (vd->type) {
+                    init_t = type_of_type_node(w, &w->r->registry, w->source_utf16, w->source_utf16_len, vd->type, 0);
+                } else {
+                    init_t = w->r->registry.t_any;
+                }
+                register_array_binding_pattern_types_from_init(w, nm, init_t, vd->initializer, is_const);
+            }
+            if (!nm || nm->kind == CTSC_SK_Identifier) {
+                CtscType* t = variable_declaration_type(w, d, is_const);
+                push_entry_for_name(w, d, nm, t);
+            }
         }
         if (vd->type && vd->type->kind == CTSC_SK_TypeLiteral) {
             push_property_signatures_from_type_literal(w, vd->type);
@@ -2431,8 +2675,20 @@ static CtscType* type_of_symbol_value(Walk* w, CtscSymbol* sym) {
         switch (d->kind) {
             case CTSC_SK_VariableDeclaration:
                 return variable_declaration_type(w, d, var_decl_is_const(w, d));
+            case CTSC_SK_BindingElement: {
+                CtscType* bt = binding_elem_type_lookup(w, d);
+                return bt ? bt : w->r->registry.t_any;
+            }
             case CTSC_SK_Parameter:
                 return param_type(w, d);
+            case CTSC_SK_ClassDeclaration: {
+                const CtscNode* cname = d->data.classDeclaration.name;
+                if (cname && cname->kind == CTSC_SK_Identifier) {
+                    const CtscIdentifierData* cid = &cname->data.identifier;
+                    return ctsc_type_class_constructor(&w->r->registry, cid->text, cid->text_len);
+                }
+                break;
+            }
             default:
                 break;
         }
@@ -2567,6 +2823,7 @@ static bool inferred_return_type_equal(CtscArena* arena, const CtscType* a, cons
         case CTSC_TYPE_STRING_LITERAL:
         case CTSC_TYPE_BIGINT_LITERAL:
         case CTSC_TYPE_REFERENCE:
+        case CTSC_TYPE_CLASS_CONSTRUCTOR:
             return utf16_type_text_equal(a->text, a->text_len, b->text, b->text_len);
         case CTSC_TYPE_BOOLEAN_LITERAL:
             return a->boolean_value == b->boolean_value;
@@ -2718,13 +2975,14 @@ static CtscType* return_type_of_method_declaration(Walk* w, const CtscNode* m) {
  */
 static CtscType* method_return_type_from_class_declaration(Walk* w, const CtscNode* class_node,
                                                            const uint16_t* prop_name, size_t prop_len,
-                                                           unsigned depth) {
+                                                           unsigned depth, bool static_side) {
     if (!class_node || class_node->kind != CTSC_SK_ClassDeclaration) return NULL;
     if (depth > 64) return NULL;
     const CtscNodeArray* members = &class_node->data.classDeclaration.members;
     for (size_t i = 0; i < members->len; ++i) {
         CtscNode* mem = members->items[i];
         if (!mem || mem->kind != CTSC_SK_MethodDeclaration) continue;
+        if (modifier_list_has_static(&mem->data.methodDeclaration.modifiers) != static_side) continue;
         const CtscNode* pname = mem->data.methodDeclaration.name;
         if (!pname || pname->kind != CTSC_SK_Identifier) continue;
         if (pname->data.identifier.text_len != prop_len) continue;
@@ -2748,8 +3006,8 @@ static CtscType* method_return_type_from_class_declaration(Walk* w, const CtscNo
             for (size_t di = 0; di < base_sym->decls_len; ++di) {
                 CtscNode* bd = base_sym->decls[di];
                 if (!bd || bd->kind != CTSC_SK_ClassDeclaration) continue;
-                CtscType* inherited =
-                    method_return_type_from_class_declaration(w, bd, prop_name, prop_len, depth + 1);
+                CtscType* inherited = method_return_type_from_class_declaration(w, bd, prop_name, prop_len,
+                                                                                depth + 1, static_side);
                 if (inherited) return inherited;
             }
         }

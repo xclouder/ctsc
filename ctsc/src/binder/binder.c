@@ -87,6 +87,59 @@ static void declare_symbol_in_scope(CtscArena* a, CtscScope* scope,
     ctsc_symbol_add_declaration(sym, a, (CtscNode*)decl);
 }
 
+static void declare_binding_pattern_recursive(CtscArena* a, CtscScope* scope, CtscSymbolFlags flags,
+                                              const CtscNode* pattern);
+static void declare_binding_element_recursive(CtscArena* a, CtscScope* scope, CtscSymbolFlags flags,
+                                              const CtscNode* be_node) {
+    if (!be_node || be_node->kind != CTSC_SK_BindingElement) return;
+    const CtscBindingElementData* bed = &be_node->data.bindingElement;
+    if (bed->has_dotdotdot) {
+        const CtscNode* nm = bed->name;
+        if (nm && (nm->kind == CTSC_SK_ObjectBindingPattern || nm->kind == CTSC_SK_ArrayBindingPattern)) {
+            declare_binding_pattern_recursive(a, scope, flags, nm);
+        } else if (nm && nm->kind == CTSC_SK_Identifier) {
+            declare_symbol_in_scope(a, scope, nm, flags, be_node);
+        }
+        return;
+    }
+    const CtscNode* nm = bed->name;
+    if (!nm) return;
+    if (nm->kind == CTSC_SK_ObjectBindingPattern || nm->kind == CTSC_SK_ArrayBindingPattern) {
+        declare_binding_pattern_recursive(a, scope, flags, nm);
+    } else if (nm->kind == CTSC_SK_Identifier) {
+        declare_symbol_in_scope(a, scope, nm, flags, be_node);
+    }
+}
+
+static void declare_binding_pattern_recursive(CtscArena* a, CtscScope* scope, CtscSymbolFlags flags,
+                                              const CtscNode* pattern) {
+    if (!pattern) return;
+    if (pattern->kind != CTSC_SK_ObjectBindingPattern && pattern->kind != CTSC_SK_ArrayBindingPattern) return;
+    const CtscNodeArray* el = &pattern->data.bindingPattern.elements;
+    for (size_t i = 0; i < el->len; i++) {
+        CtscNode* e = el->items[i];
+        if (!e) continue;
+        if (e->kind == CTSC_SK_OmittedExpression) continue;
+        if (e->kind == CTSC_SK_BindingElement) declare_binding_element_recursive(a, scope, flags, e);
+    }
+}
+
+/*
+ * VariableDeclaration / Parameter name: Identifier or binding pattern.
+ * Inner identifiers use BindingElement as the declaration node (binder.ts
+ * bindVariableDeclarationOrBindingElement ~3648).
+ */
+static void declare_variable_like_name(CtscArena* a, CtscScope* scope, CtscSymbolFlags sym_flag,
+                                       const CtscNode* name_node, const CtscNode* owner_decl) {
+    if (!name_node) return;
+    if (name_node->kind == CTSC_SK_Identifier) {
+        declare_symbol_in_scope(a, scope, name_node, sym_flag, owner_decl);
+    } else if (name_node->kind == CTSC_SK_ObjectBindingPattern
+               || name_node->kind == CTSC_SK_ArrayBindingPattern) {
+        declare_binding_pattern_recursive(a, scope, sym_flag, name_node);
+    }
+}
+
 static void bind_node(CtscBindResult* r, CtscArena* a,
                       CtscScope* container_scope, CtscScope* block_scope,
                       const CtscNode* node) {
@@ -186,12 +239,11 @@ static void bind_node(CtscBindResult* r, CtscArena* a,
         case CTSC_SK_Parameter: {
             /* Mirrors binder.ts bindParameter (~3684): identifier-named
              * parameters become SymbolFlags.FunctionScopedVariable in the
-             * containing function's locals. Binding patterns land in a
-             * synthetic "__<index>" anonymous symbol; ctsc will grow that
-             * when destructuring fixtures unlock. */
-            declare_symbol_in_scope(a, container_scope,
-                                    node->data.parameter.name,
-                                    CTSC_SYMBOL_FLAG_FunctionScopedVariable, node);
+             * containing function's locals. Binding patterns declare each
+             * inner name (BindingElement as decl) per bindVariableDeclarationOrBindingElement
+             * (~3648). */
+            declare_variable_like_name(a, container_scope, CTSC_SYMBOL_FLAG_FunctionScopedVariable,
+                                       node->data.parameter.name, node);
             break;
         }
         case CTSC_SK_Block: {
@@ -280,9 +332,7 @@ static void bind_node(CtscBindResult* r, CtscArena* a,
             for (size_t i = 0; i < decls->len; ++i) {
                 const CtscNode* d = decls->items[i];
                 if (!d || d->kind != CTSC_SK_VariableDeclaration) continue;
-                declare_symbol_in_scope(a, target,
-                                        d->data.variableDeclaration.name,
-                                        sym_flag, d);
+                declare_variable_like_name(a, target, sym_flag, d->data.variableDeclaration.name, d);
             }
             /* Initializers can contain function-like containers (e.g. arrow functions)
              * whose parameters must be bound (binder.ts bind ~3648 + bindChildren). */
@@ -332,7 +382,7 @@ static void bind_node(CtscBindResult* r, CtscArena* a,
                     for (size_t i = 0; i < decls->len; ++i) {
                         const CtscNode* d = decls->items[i];
                         if (!d || d->kind != CTSC_SK_VariableDeclaration) continue;
-                        declare_symbol_in_scope(a, target, d->data.variableDeclaration.name, sym_flag, d);
+                        declare_variable_like_name(a, target, sym_flag, d->data.variableDeclaration.name, d);
                     }
                     for (size_t i = 0; i < decls->len; ++i) {
                         const CtscNode* d = decls->items[i];

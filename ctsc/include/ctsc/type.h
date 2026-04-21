@@ -69,6 +69,15 @@ typedef enum {
      */
     CTSC_TYPE_REFERENCE,
 
+    /*
+     * Class constructor value (`class C {}` then identifier `C` in expression
+     * position). typeToString is `typeof <Name>` (checker.ts typeToString on
+     * TypeofType / typeof-narrowing of class symbols ~35000+). Property access
+     * on this type resolves static members only (getTypeOfSymbol staticType).
+     * Payload: `text` / `text_len` = class name (UTF-16), same as REFERENCE.
+     */
+    CTSC_TYPE_CLASS_CONSTRUCTOR,
+
     /* Reserved for M4.1+ (kept here so switch tables compile without churn). */
     CTSC_TYPE_FUNCTION
 } CtscTypeKind;
@@ -165,6 +174,9 @@ CtscType* ctsc_type_object_literal(CtscTypeRegistry* reg, CtscObjectProperty* pr
 
 /* Class instance / nominal named type: typeToString is the identifier text. */
 CtscType* ctsc_type_reference(CtscTypeRegistry* reg, const uint16_t* name, size_t name_len);
+
+/* Class identifier in value position: typeToString `typeof Name`; static member lookup. */
+CtscType* ctsc_type_class_constructor(CtscTypeRegistry* reg, const uint16_t* name, size_t name_len);
 
 /*
  * Same as ctsc_type_reference but with type arguments (e.g. Box<number>).
