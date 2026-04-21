@@ -1972,7 +1972,8 @@ static CtscType* type_of_symbol_value(Walk* w, CtscSymbol* sym) {
 
 /*
  * Aggregate ReturnStatement expression types inside a function body, mirroring
- * checker.ts getReturnTypeFromBody (~39195-39250) + getWidenedType (~39276-39277).
+ * checker.ts getReturnTypeFromBody (~39195-39250): union the expression types,
+ * then getWidenedType (~39276-39277) on the result (not per-return before union).
  * Nested function / arrow / class bodies are not descended into so inner
  * returns do not affect the outer signature.
  */
@@ -2081,24 +2082,87 @@ static void collect_return_expression_types(RetCollector* c, const CtscNode* n) 
     }
 }
 
+/*
+ * Structural equality for deduping aggregated return expression types before
+ * unioning. Mirrors getUnionType deduping distinct Type objects that represent
+ * the same type (checker.ts ~39249-39250).
+ */
+static bool inferred_return_type_equal(CtscArena* arena, const CtscType* a, const CtscType* b) {
+    if (a == b) return true;
+    if (!a || !b) return false;
+    if (a->kind != b->kind) return false;
+    switch (a->kind) {
+        case CTSC_TYPE_NUMBER_LITERAL:
+            return a->number_value == b->number_value;
+        case CTSC_TYPE_STRING_LITERAL:
+        case CTSC_TYPE_BIGINT_LITERAL:
+        case CTSC_TYPE_REFERENCE:
+            return utf16_type_text_equal(a->text, a->text_len, b->text, b->text_len);
+        case CTSC_TYPE_BOOLEAN_LITERAL:
+            return a->boolean_value == b->boolean_value;
+        case CTSC_TYPE_UNION: {
+            size_t n = a->union_members_len;
+            if (n != b->union_members_len) return false;
+            if (n == 0) return true;
+            bool* used = (bool*)ctsc_arena_alloc(arena, n * sizeof(bool));
+            if (!used) return false;
+            memset(used, 0, n * sizeof(bool));
+            for (size_t i = 0; i < n; ++i) {
+                bool found = false;
+                for (size_t j = 0; j < n; ++j) {
+                    if (used[j]) continue;
+                    if (inferred_return_type_equal(arena, a->union_members[i], b->union_members[j])) {
+                        used[j] = true;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) return false;
+            }
+            return true;
+        }
+        case CTSC_TYPE_OBJECT_LITERAL: {
+            if (a->object_properties_len != b->object_properties_len) return false;
+            for (size_t i = 0; i < a->object_properties_len; ++i) {
+                const CtscObjectProperty* ap = &a->object_properties[i];
+                const CtscObjectProperty* bp = &b->object_properties[i];
+                if (ap->name_len != bp->name_len
+                    || !utf16_type_text_equal(ap->name, ap->name_len, bp->name, bp->name_len)) {
+                    return false;
+                }
+                if (!inferred_return_type_equal(arena, ap->value_type, bp->value_type)) return false;
+            }
+            return true;
+        }
+        default:
+            return true;
+    }
+}
+
+/*
+ * checker.ts getReturnTypeFromBody (~39249-39250): union return expression types,
+ * then getWidenedType (~39276-39277) on the aggregate. Widening literals before
+ * unioning would collapse e.g. `1` and `2` to `number`; tsc keeps `1 | 2`.
+ */
 static CtscType* widen_inferred_return_types(CtscTypeRegistry* reg, CtscArena* arena,
                                             CtscType** raw, size_t n) {
     if (n == 0) return reg->t_void;
     CtscType** uniq = (CtscType**)ctsc_arena_alloc(arena, n * sizeof(CtscType*));
     size_t ulen = 0;
     for (size_t i = 0; i < n; ++i) {
-        CtscType* w = widen_nullish_when_not_strict_null(reg, ctsc_type_widen(reg, raw[i]));
+        CtscType* t = widen_nullish_when_not_strict_null(reg, raw[i]);
+        if (!t) continue;
         bool seen = false;
         for (size_t j = 0; j < ulen; ++j) {
-            if (uniq[j] == w) {
+            if (inferred_return_type_equal(arena, uniq[j], t)) {
                 seen = true;
                 break;
             }
         }
-        if (!seen) uniq[ulen++] = w;
+        if (!seen) uniq[ulen++] = t;
     }
     if (ulen == 0) return reg->t_void;
-    if (ulen == 1) return uniq[0];
+    if (ulen == 1) return ctsc_type_widen(reg, uniq[0]);
     {
         CtscType* u = ctsc_type_new(reg, CTSC_TYPE_UNION);
         u->union_members = (CtscType**)ctsc_arena_alloc(arena, ulen * sizeof(CtscType*));
@@ -2248,46 +2312,69 @@ static bool parameter_type_is_declared_type_parameter(const CtscNode* fn_decl, c
 }
 
 /*
- * Single-type-parameter identity generic: infer return from the first argument
- * when the body's inferred return is that type parameter (checker.ts
- * inferTypeArguments / getReturnTypeOfSignature ~27800+, ~37810+).
+ * Generic call return instantiation: when the function body's inferred return
+ * type is a type parameter (e.g. `return x` with `x: A`), map that parameter
+ * to either explicit type arguments (`first<number, string>(...)`) or the
+ * corresponding argument type (`first(1, "x")` → `1`).
+ *
+ * Mirrors checker.ts inferTypeArguments / getReturnTypeOfSignature (~35827+,
+ * ~37810+).
  */
 static CtscType* generic_call_instantiated_return_type(Walk* w, CtscTypeRegistry* reg, const CtscNode* fn_decl,
                                                       const CtscCallExpressionData* ce) {
     if (!w || !reg || !fn_decl || fn_decl->kind != CTSC_SK_FunctionDeclaration || !ce) return NULL;
     const CtscFunctionDeclarationData* fd = &fn_decl->data.functionDeclaration;
-    if (fd->type_parameters.len != 1 || ce->arguments.len < 1 || fd->parameters.len < 1) return NULL;
-    const CtscNode* tp_decl = fd->type_parameters.items[0];
-    if (!tp_decl || tp_decl->kind != CTSC_SK_TypeParameter) return NULL;
-    const CtscNode* tp_name_node = tp_decl->data.typeParameter.name;
-    if (!tp_name_node || tp_name_node->kind != CTSC_SK_Identifier) return NULL;
-    const CtscIdentifierData* tp_id = &tp_name_node->data.identifier;
-
-    const CtscNode* p0 = fd->parameters.items[0];
-    if (!parameter_type_is_declared_type_parameter(fn_decl, p0)) return NULL;
+    if (fd->type_parameters.len < 1 || ce->arguments.len < 1 || fd->parameters.len < 1) return NULL;
 
     CtscType* inferred_ret =
         infer_return_type_for_function_body(w, reg, w->arena, fd->body, fn_decl);
     if (!inferred_ret || inferred_ret->kind != CTSC_TYPE_REFERENCE) return NULL;
-    if (!utf16_type_text_equal(inferred_ret->text, inferred_ret->text_len, tp_id->text, tp_id->text_len)) {
+
+    /* Return type must name one of this signature's type parameters (e.g. A in `: A`). */
+    size_t ret_tp_index = (size_t)-1;
+    for (size_t ti = 0; ti < fd->type_parameters.len; ++ti) {
+        const CtscNode* tp = fd->type_parameters.items[ti];
+        if (!tp || tp->kind != CTSC_SK_TypeParameter) continue;
+        const CtscNode* tnm = tp->data.typeParameter.name;
+        if (!tnm || tnm->kind != CTSC_SK_Identifier) continue;
+        const CtscIdentifierData* tid = &tnm->data.identifier;
+        if (utf16_type_text_equal(inferred_ret->text, inferred_ret->text_len, tid->text, tid->text_len)) {
+            ret_tp_index = ti;
+            break;
+        }
+    }
+    if (ret_tp_index == (size_t)-1) return NULL;
+
+    /*
+     * Explicit `<T0, T1, ...>`: pick the type argument at the same index as
+     * the return type parameter (`id<number>(42)` → number; `first<number,
+     * string>(1,"x")` → number).
+     */
+    if (ce->has_type_arguments && ce->type_arguments.len == fd->type_parameters.len && w) {
+        if (ret_tp_index < ce->type_arguments.len) {
+            CtscType* explicit_t = type_of_type_node(w, reg, w->source_utf16, w->source_utf16_len,
+                                                     ce->type_arguments.items[ret_tp_index], 0);
+            if (explicit_t) return widen_nullish_when_not_strict_null(reg, explicit_t);
+        }
         return NULL;
     }
 
-    /*
-     * Explicit `<TInst>` supplies type arguments (checker.ts inferTypeArguments
-     * when the CallExpression already has typeArguments, ~35827+): the
-     * instantiated return uses those types, not inference from argument
-     * expressions (e.g. `id<number>(42)` → `number`, not literal `42`).
-     */
-    if (ce->has_type_arguments && ce->type_arguments.len >= 1 && w) {
-        CtscType* explicit_t =
-            type_of_type_node(w, reg, w->source_utf16, w->source_utf16_len, ce->type_arguments.items[0], 0);
-        if (explicit_t) return widen_nullish_when_not_strict_null(reg, explicit_t);
+    /* Infer from arguments: use the parameter whose type is that type parameter. */
+    for (size_t i = 0; i < fd->parameters.len && i < ce->arguments.len; ++i) {
+        const CtscNode* param = fd->parameters.items[i];
+        if (!param || param->kind != CTSC_SK_Parameter) continue;
+        if (!parameter_type_is_declared_type_parameter(fn_decl, param)) continue;
+        const CtscNode* pty = param->data.parameter.type;
+        if (!pty || pty->kind != CTSC_SK_TypeReference) continue;
+        const CtscTypeReferenceData* tr = &pty->data.typeReference;
+        if (!tr->typeName || tr->typeName->kind != CTSC_SK_Identifier) continue;
+        const CtscIdentifierData* pid = &tr->typeName->data.identifier;
+        if (!utf16_type_text_equal(pid->text, pid->text_len, inferred_ret->text, inferred_ret->text_len)) continue;
+        CtscType* arg_t = type_of_expression(w, reg, ce->arguments.items[i]);
+        if (!arg_t) return NULL;
+        return widen_nullish_when_not_strict_null(reg, arg_t);
     }
-
-    CtscType* arg0_t = type_of_expression(w, reg, ce->arguments.items[0]);
-    if (!arg0_t) return NULL;
-    return widen_nullish_when_not_strict_null(reg, arg0_t);
+    return NULL;
 }
 
 static void emit_type_parameters_for_signature(CtscBuffer* out, const CtscNodeArray* type_parameters) {

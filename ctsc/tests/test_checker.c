@@ -616,6 +616,39 @@ int test_checker(void) {
         ctsc_arena_free(&a);
     }
 
+    /* Multiple returns with distinct literal types (fixtures/checker/multi_return/01_same_type.ts;
+     * checker.ts getReturnTypeFromBody ~39249-39250 + getWidenedType ~39276-39277). */
+    {
+        const char* src =
+            "// @checker: types\n"
+            "function f(b: boolean) {\n"
+            "  if (b) {\n"
+            "    return 1;\n"
+            "  }\n"
+            "  return 2;\n"
+            "}\n"
+            "const n = f(true);\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 8192);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 3);
+        if (cr->entries_len >= 1 && cr->entries[0].type_string && cr->entries[0].type_string_len > 0) {
+            const char* want = "(b: boolean) => 1 | 2";
+            EXPECT(cr->entries[0].type_string_len == strlen(want));
+            EXPECT(memcmp(cr->entries[0].type_string, want, strlen(want)) == 0);
+        }
+        if (cr->entries_len >= 3 && cr->entries[2].type_string && cr->entries[2].type_string_len > 0) {
+            const char* want_n = "1 | 2";
+            EXPECT(cr->entries[2].type_string_len == strlen(want_n));
+            EXPECT(memcmp(cr->entries[2].type_string, want_n, strlen(want_n)) == 0);
+        }
+        ctsc_arena_free(&a);
+    }
+
     /* FunctionExpression with one typed parameter (fixtures/checker/function_expressions/02_one_param.ts). */
     {
         const char* src = "// @checker: types\nconst f = function (x: number) {\n  return x;\n};\n";
@@ -737,6 +770,32 @@ int test_checker(void) {
             ctsc_buf_init(&ts);
             ctsc_type_to_string(cr->entries[2].type, &ts);
             EXPECT(ts.len == 6 && memcmp(ts.data, "number", 6) == 0);
+            ctsc_buf_free(&ts);
+        }
+        ctsc_arena_free(&a);
+    }
+
+    /* Two type parameters: return type A inferred from first arg (fixtures/checker/generics/04_two_type_params.ts;
+     * checker.ts inferTypeArguments / getReturnTypeOfSignature ~35827+, ~37810+). */
+    {
+        const char* src = "// @checker: types\n"
+                          "function first<A, B>(a: A, b: B): A {\n"
+                          "  return a;\n"
+                          "}\n"
+                          "const n = first(1, \"x\");\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 8192);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 4);
+        if (cr->entries_len >= 4 && cr->entries[3].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[3].type, &ts);
+            EXPECT(ts.len == 1 && memcmp(ts.data, "1", 1) == 0);
             ctsc_buf_free(&ts);
         }
         ctsc_arena_free(&a);
