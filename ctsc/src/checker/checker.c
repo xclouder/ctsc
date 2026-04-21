@@ -797,7 +797,8 @@ static CtscType* type_of_property_of_object_type(Walk* w, CtscTypeRegistry* reg,
 static CtscType* variable_declaration_type(Walk* w, const CtscNode* decl, bool is_const);
 static CtscType* class_property_declaration_type(Walk* w, const CtscNode* decl);
 static CtscType* property_type_from_class_declaration(Walk* w, const CtscNode* class_node,
-                                                      const uint16_t* prop_name, size_t prop_len);
+                                                      const uint16_t* prop_name, size_t prop_len,
+                                                      unsigned depth);
 static CtscType* type_of_symbol_value(Walk* w, CtscSymbol* sym);
 static CtscType* param_type(Walk* w, const CtscNode* param);
 
@@ -1089,7 +1090,7 @@ static CtscType* type_of_object_literal_expression(Walk* w, CtscTypeRegistry* re
 /*
  * checker.ts getTypeOfPropertyOfType (~11575): anonymous object literal
  * properties and class instance members (resolve class symbol → declared
- * PropertyDeclaration type).
+ * PropertyDeclaration type, including members from `extends` heritage).
  */
 static CtscType* type_of_property_of_object_type(Walk* w, CtscTypeRegistry* reg, CtscType* object_type,
                                                  const uint16_t* prop_name, size_t prop_len) {
@@ -1110,7 +1111,7 @@ static CtscType* type_of_property_of_object_type(Walk* w, CtscTypeRegistry* reg,
             for (size_t i = 0; i < sym->decls_len; ++i) {
                 CtscNode* d = sym->decls[i];
                 if (d && d->kind == CTSC_SK_ClassDeclaration) {
-                    CtscType* pt = property_type_from_class_declaration(w, d, prop_name, prop_len);
+                    CtscType* pt = property_type_from_class_declaration(w, d, prop_name, prop_len, 0);
                     if (pt) return pt;
                 }
             }
@@ -1614,8 +1615,10 @@ static CtscType* class_property_declaration_type(Walk* w, const CtscNode* decl) 
 }
 
 static CtscType* property_type_from_class_declaration(Walk* w, const CtscNode* class_node,
-                                                      const uint16_t* prop_name, size_t prop_len) {
+                                                      const uint16_t* prop_name, size_t prop_len,
+                                                      unsigned depth) {
     if (!class_node || class_node->kind != CTSC_SK_ClassDeclaration) return NULL;
+    if (depth > 64) return NULL;
     const CtscNodeArray* members = &class_node->data.classDeclaration.members;
     for (size_t i = 0; i < members->len; ++i) {
         CtscNode* m = members->items[i];
@@ -1626,6 +1629,33 @@ static CtscType* property_type_from_class_declaration(Walk* w, const CtscNode* c
         if (memcmp(pname->data.identifier.text, prop_name, prop_len * sizeof(uint16_t)) != 0) continue;
         return class_property_declaration_type(w, m);
     }
+    /*
+     * Inherited instance members: walk `extends` heritage (checker.ts
+     * getPropertyOfType / class resolution feeding getTypeOfPropertyOfType ~11575).
+     */
+    const CtscNodeArray* hcs = &class_node->data.classDeclaration.heritage_clauses;
+    for (size_t hi = 0; hi < hcs->len; ++hi) {
+        CtscNode* hc = hcs->items[hi];
+        if (!hc || hc->kind != CTSC_SK_HeritageClause) continue;
+        if (hc->data.heritageClause.token != CTSC_SK_ExtendsKeyword) continue;
+        const CtscNodeArray* ext_types = &hc->data.heritageClause.types;
+        for (size_t ti = 0; ti < ext_types->len; ++ti) {
+            CtscNode* ewta = ext_types->items[ti];
+            if (!ewta || ewta->kind != CTSC_SK_ExpressionWithTypeArguments) continue;
+            const CtscNode* base_expr = ewta->data.expressionWithTypeArguments.expression;
+            if (!base_expr || base_expr->kind != CTSC_SK_Identifier) continue;
+            const CtscIdentifierData* bid = &base_expr->data.identifier;
+            CtscSymbol* base_sym = resolve_name(&w->scopes, bid->text, bid->text_len);
+            if (!base_sym) continue;
+            for (size_t di = 0; di < base_sym->decls_len; ++di) {
+                CtscNode* bd = base_sym->decls[di];
+                if (!bd || bd->kind != CTSC_SK_ClassDeclaration) continue;
+                CtscType* inherited =
+                    property_type_from_class_declaration(w, bd, prop_name, prop_len, depth + 1);
+                if (inherited) return inherited;
+            }
+        }
+    }
     return NULL;
 }
 
@@ -1635,6 +1665,13 @@ static const char* syntax_kind_cstr(CtscSyntaxKind k) { return ctsc_syntax_kind_
 
 static void visit(Walk* w, const CtscNode* n);
 static void visit_class_declaration(Walk* w, const CtscNode* n);
+static CtscType* infer_return_type_for_arrow_function(Walk* w, CtscTypeRegistry* reg, CtscArena* arena,
+                                                     const CtscNode* arrow);
+static void emit_function_signature_string(CtscBuffer* out, const CtscNodeArray* params, CtscTypeRegistry* reg,
+                                           const CtscNode* return_type_node, CtscType* inferred_return_type,
+                                           const uint16_t* src, size_t src_len);
+static void push_entry_with_string(Walk* w, const CtscNode* decl, const CtscNode* name_id, const char* type_str,
+                                   size_t type_str_len);
 
 static void walk_children_nodearray(Walk* w, const CtscNodeArray* arr) {
     for (size_t i = 0; i < arr->len; ++i) visit(w, arr->items[i]);
@@ -1761,9 +1798,13 @@ static void close_scope_if_container(Walk* w, const CtscNode* n) {
     if (s) scope_pop(&w->scopes);
 }
 
-static void visit_variable_statement(Walk* w, const CtscNode* n) {
-    const CtscVariableStatementData* vs = &n->data.variableStatement;
-    const CtscNode* list = vs->declarationList;
+/*
+ * VariableDeclarationList from a VariableStatement or a C-style ForStatement
+ * initializer. Mirrors checker visiting order with bindVariableDeclaration in
+ * binder.ts bindVariableDeclaration (~3648) scoped to ForStatement as
+ * block-scope container (binder.ts getContainerFlags ~3876).
+ */
+static void visit_variable_declaration_list(Walk* w, const CtscNode* list) {
     if (!list || list->kind != CTSC_SK_VariableDeclarationList) return;
     bool is_const = is_const_decl_list(list);
     const CtscNodeArray* decls = &list->data.variableDeclarationList.declarations;
@@ -1775,9 +1816,24 @@ static void visit_variable_statement(Walk* w, const CtscNode* n) {
     for (size_t i = 0; i < decls->len; ++i) {
         const CtscNode* d = decls->items[i];
         if (!d || d->kind != CTSC_SK_VariableDeclaration) continue;
-        CtscType* t = variable_declaration_type(w, d, is_const);
-        push_entry_for_name(w, d, d->data.variableDeclaration.name, t);
         const CtscVariableDeclarationData* vd = &d->data.variableDeclaration;
+        if (!vd->type && vd->initializer && vd->initializer->kind == CTSC_SK_ArrowFunction) {
+            const CtscArrowFunctionData* af = &vd->initializer->data.arrowFunction;
+            CtscType* inferred_ret =
+                infer_return_type_for_arrow_function(w, &w->r->registry, w->arena, vd->initializer);
+            CtscBuffer sig;
+            ctsc_buf_init(&sig);
+            emit_function_signature_string(&sig, &af->parameters, &w->r->registry, NULL, inferred_ret,
+                                           w->source_utf16, w->source_utf16_len);
+            char* s = (char*)ctsc_arena_alloc(w->arena, sig.len);
+            memcpy(s, sig.data, sig.len);
+            size_t slen = sig.len;
+            ctsc_buf_free(&sig);
+            push_entry_with_string(w, d, vd->name, s, slen);
+        } else {
+            CtscType* t = variable_declaration_type(w, d, is_const);
+            push_entry_for_name(w, d, vd->name, t);
+        }
         if (vd->type && vd->type->kind == CTSC_SK_TypeLiteral) {
             push_property_signatures_from_type_literal(w, vd->type);
         }
@@ -1809,6 +1865,10 @@ static void visit_variable_statement(Walk* w, const CtscNode* n) {
             visit(w, d->data.variableDeclaration.initializer);
         }
     }
+}
+
+static void visit_variable_statement(Walk* w, const CtscNode* n) {
+    visit_variable_declaration_list(w, n->data.variableStatement.declarationList);
 }
 
 static CtscType* param_type(Walk* w, const CtscNode* param) {
@@ -1983,6 +2043,30 @@ static CtscType* infer_return_type_for_function_body(CtscTypeRegistry* reg, Ctsc
         collect_return_expression_types(&c, stmts->items[i]);
     }
     return widen_inferred_return_types(reg, arena, c.items, c.len);
+}
+
+/*
+ * Inferred return type for an arrow's ConciseBody: Block uses the same return
+ * aggregation as functions; expression body mirrors checker.ts
+ * getReturnTypeFromBody (~39208-39210) then getWidenedType on the result
+ * (~39276-39277) for display in the signature string.
+ */
+static CtscType* infer_return_type_for_arrow_function(Walk* w, CtscTypeRegistry* reg, CtscArena* arena,
+                                                     const CtscNode* arrow) {
+    if (!arrow || arrow->kind != CTSC_SK_ArrowFunction) return reg->t_void;
+    const CtscNode* body = arrow->data.arrowFunction.body;
+    if (!body) return reg->t_void;
+    if (body->kind == CTSC_SK_Block) {
+        return infer_return_type_for_function_body(reg, arena, body);
+    }
+    /* Concise body uses checkExpressionCached on the body (~39208-39210); parameters
+     * must be in scope — push the binder scope before resolving identifiers. */
+    CtscScope* arrow_scope = w ? find_scope_for_node(w->scopes.binding, arrow) : NULL;
+    if (arrow_scope) scope_push(&w->scopes, arrow_scope);
+    CtscType* t = type_of_expression(w, reg, body);
+    if (arrow_scope) scope_pop(&w->scopes);
+    if (!t) return reg->t_void;
+    return widen_nullish_when_not_strict_null(reg, ctsc_type_widen(reg, t));
 }
 
 static void emit_function_signature_string(CtscBuffer* out,
@@ -2229,6 +2313,24 @@ static void visit(Walk* w, const CtscNode* n) {
             visit_function_declaration(w, n);
             return;
 
+        case CTSC_SK_ArrowFunction: {
+            const CtscArrowFunctionData* af = &n->data.arrowFunction;
+            for (size_t i = 0; i < af->parameters.len; ++i) {
+                const CtscNode* p = af->parameters.items[i];
+                if (!p || p->kind != CTSC_SK_Parameter) continue;
+                push_entry_for_name(w, p, p->data.parameter.name, param_type(w, p));
+            }
+            open_scope_if_container(w, n);
+            for (size_t i = 0; i < af->parameters.len; ++i) {
+                const CtscNode* p = af->parameters.items[i];
+                if (!p || p->kind != CTSC_SK_Parameter) continue;
+                if (p->data.parameter.initializer) visit(w, p->data.parameter.initializer);
+            }
+            if (af->body) visit(w, af->body);
+            close_scope_if_container(w, n);
+            return;
+        }
+
         case CTSC_SK_InterfaceDeclaration:
             push_property_signatures_from_interface_declaration(w, n);
             return;
@@ -2263,6 +2365,23 @@ static void visit(Walk* w, const CtscNode* n) {
             visit(w, n->data.whileStatement.expression);
             visit(w, n->data.whileStatement.statement);
             return;
+
+        case CTSC_SK_ForStatement: {
+            const CtscForStatementData* fs = &n->data.forStatement;
+            open_scope_if_container(w, n);
+            if (fs->initializer) {
+                if (fs->initializer->kind == CTSC_SK_VariableDeclarationList) {
+                    visit_variable_declaration_list(w, fs->initializer);
+                } else {
+                    visit(w, fs->initializer);
+                }
+            }
+            if (fs->condition) visit(w, fs->condition);
+            if (fs->statement) visit(w, fs->statement);
+            if (fs->incrementor) visit(w, fs->incrementor);
+            close_scope_if_container(w, n);
+            return;
+        }
 
         /* Identifier references: TS2304 detection. */
         case CTSC_SK_Identifier:

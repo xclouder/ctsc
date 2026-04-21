@@ -235,6 +235,69 @@ static void bind_node(CtscBindResult* r, CtscArena* a,
                                         d->data.variableDeclaration.name,
                                         sym_flag, d);
             }
+            /* Initializers can contain function-like containers (e.g. arrow functions)
+             * whose parameters must be bound (binder.ts bind ~3648 + bindChildren). */
+            for (size_t i = 0; i < decls->len; ++i) {
+                const CtscNode* d = decls->items[i];
+                if (!d || d->kind != CTSC_SK_VariableDeclaration) continue;
+                const CtscNode* init = d->data.variableDeclaration.initializer;
+                if (init) bind_node(r, a, container_scope, block_scope, init);
+            }
+            break;
+        }
+        case CTSC_SK_ArrowFunction: {
+            /* Mirrors bindFunctionDeclaration / bind ~3709: arrow is a container with
+             * parameter locals (binder.ts bindArrowFunction ~3765). */
+            CtscScope* fn_scope = scope_new(a, node);
+            scopes_push(r, a, fn_scope);
+            const CtscNodeArray* params = &node->data.arrowFunction.parameters;
+            for (size_t i = 0; i < params->len; ++i) {
+                bind_node(r, a, fn_scope, fn_scope, params->items[i]);
+            }
+            const CtscNode* body = node->data.arrowFunction.body;
+            if (body) {
+                if (body->kind == CTSC_SK_Block) {
+                    bind_children(r, a, fn_scope, fn_scope, &body->data.block.statements);
+                } else {
+                    bind_node(r, a, fn_scope, fn_scope, body);
+                }
+            }
+            break;
+        }
+        case CTSC_SK_ForStatement: {
+            /* binder.ts getContainerFlags (~3876): ForStatement is IsBlockScopedContainer |
+             * HasLocals; bindForStatement (~1541) walks initializer, condition, body,
+             * incrementor. */
+            CtscScope* for_scope = scope_new(a, node);
+            scopes_push(r, a, for_scope);
+            const CtscForStatementData* fs = &node->data.forStatement;
+            if (fs->initializer) {
+                if (fs->initializer->kind == CTSC_SK_VariableDeclarationList) {
+                    const CtscNode* list = fs->initializer;
+                    int vflags = list->data.variableDeclarationList.flags;
+                    bool is_block_scoped = (vflags & 0x3) != 0;
+                    CtscSymbolFlags sym_flag = is_block_scoped ? CTSC_SYMBOL_FLAG_BlockScopedVariable
+                                                               : CTSC_SYMBOL_FLAG_FunctionScopedVariable;
+                    CtscScope* target = is_block_scoped ? for_scope : container_scope;
+                    const CtscNodeArray* decls = &list->data.variableDeclarationList.declarations;
+                    for (size_t i = 0; i < decls->len; ++i) {
+                        const CtscNode* d = decls->items[i];
+                        if (!d || d->kind != CTSC_SK_VariableDeclaration) continue;
+                        declare_symbol_in_scope(a, target, d->data.variableDeclaration.name, sym_flag, d);
+                    }
+                    for (size_t i = 0; i < decls->len; ++i) {
+                        const CtscNode* d = decls->items[i];
+                        if (!d || d->kind != CTSC_SK_VariableDeclaration) continue;
+                        const CtscNode* init = d->data.variableDeclaration.initializer;
+                        if (init) bind_node(r, a, container_scope, for_scope, init);
+                    }
+                } else {
+                    bind_node(r, a, container_scope, for_scope, fs->initializer);
+                }
+            }
+            if (fs->condition) bind_node(r, a, container_scope, for_scope, fs->condition);
+            if (fs->statement) bind_node(r, a, container_scope, for_scope, fs->statement);
+            if (fs->incrementor) bind_node(r, a, container_scope, for_scope, fs->incrementor);
             break;
         }
         default:

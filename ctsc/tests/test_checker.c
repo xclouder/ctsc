@@ -293,6 +293,31 @@ int test_checker(void) {
         ctsc_arena_free(&a);
     }
 
+    /* `for (let i = 0; ...)` block-scoped loop var + body const (binder.ts bindForStatement ~1541, getContainerFlags ~3876). */
+    {
+        const char* src = "// @checker: types\nfor (let i = 0; i < 10; i = i + 1) {\n  const x = i;\n}\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 2);
+        if (cr->entries_len == 2 && cr->entries[0].type && cr->entries[1].type) {
+            CtscBuffer t0, t1;
+            ctsc_buf_init(&t0);
+            ctsc_buf_init(&t1);
+            ctsc_type_to_string(cr->entries[0].type, &t0);
+            ctsc_type_to_string(cr->entries[1].type, &t1);
+            EXPECT(t0.len == 6 && memcmp(t0.data, "number", 6) == 0);
+            EXPECT(t1.len == 6 && memcmp(t1.data, "number", 6) == 0);
+            ctsc_buf_free(&t0);
+            ctsc_buf_free(&t1);
+        }
+        ctsc_arena_free(&a);
+    }
+
     /* NoSubstitutionTemplateLiteral: string literal type uses cooked text (checker.ts ~32611, LiteralExpression). */
     {
         const char* src = "// @checker: types\nconst t = `hello`;\n";
@@ -393,6 +418,35 @@ int test_checker(void) {
             CtscBuffer ts;
             ctsc_buf_init(&ts);
             ctsc_type_to_string(cr->entries[1].type, &ts);
+            EXPECT(ts.len == 6 && memcmp(ts.data, "number", 6) == 0);
+            ctsc_buf_free(&ts);
+        }
+        ctsc_arena_free(&a);
+    }
+
+    /* Inherited class field: `extends` heritage + getTypeOfPropertyOfType (~11575);
+     * fixtures/checker/class_inheritance/02_inherit_field.ts. */
+    {
+        const char* src =
+            "// @checker: types\n"
+            "class A {\n"
+            "  x: number = 1;\n"
+            "}\n"
+            "class B extends A {}\n"
+            "const b = new B();\n"
+            "const n = b.x;\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 3);
+        if (cr->entries_len == 3 && cr->entries[2].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[2].type, &ts);
             EXPECT(ts.len == 6 && memcmp(ts.data, "number", 6) == 0);
             ctsc_buf_free(&ts);
         }
@@ -539,6 +593,51 @@ int test_checker(void) {
         if (cr->entries_len == 1 && cr->entries[0].type_string && cr->entries[0].type_string_len > 0) {
             EXPECT(cr->entries[0].type_string_len == 12);
             EXPECT(memcmp(cr->entries[0].type_string, "() => number", 12) == 0);
+        }
+        ctsc_arena_free(&a);
+    }
+
+    /* Arrow function with no params (fixtures/checker/arrow_functions/01_no_params.ts;
+     * checker.ts getReturnTypeFromBody ~39208-39210). */
+    {
+        const char* src = "// @checker: types\nconst f = () => 1;\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 8192);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 1);
+        if (cr->entries_len == 1 && cr->entries[0].type_string && cr->entries[0].type_string_len > 0) {
+            EXPECT(cr->entries[0].type_string_len == 12);
+            EXPECT(memcmp(cr->entries[0].type_string, "() => number", 12) == 0);
+        }
+        ctsc_arena_free(&a);
+    }
+
+    /* One typed parameter + identity body (fixtures/checker/arrow_functions/02_one_param.ts;
+     * checkExpressionCached on concise body ~39208-39210). */
+    {
+        const char* src = "// @checker: types\nconst f = (x: number) => x;\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 8192);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 2);
+        if (cr->entries_len >= 2 && cr->entries[0].type_string && cr->entries[0].type_string_len > 0) {
+            EXPECT(cr->entries[0].type_string_len == 21);
+            EXPECT(memcmp(cr->entries[0].type_string, "(x: number) => number", 21) == 0);
+        }
+        if (cr->entries_len >= 2 && cr->entries[1].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[1].type, &ts);
+            EXPECT(ts.len == 6 && memcmp(ts.data, "number", 6) == 0);
+            ctsc_buf_free(&ts);
         }
         ctsc_arena_free(&a);
     }
