@@ -312,6 +312,16 @@ static void bind_node(CtscBindResult* r, CtscArena* a,
             }
             break;
         }
+        case CTSC_SK_EnumDeclaration: {
+            /* Mirrors binder.ts bindEnumDeclaration (~3642): block-scoped
+             * SymbolFlags.RegularEnum (non-const enums). ctsc does not parse
+             * const enums yet. */
+            const CtscNode* name = node->data.enumDeclaration.name;
+            if (name) {
+                declare_symbol_in_scope(a, block_scope, name, CTSC_SYMBOL_FLAG_RegularEnum, node);
+            }
+            break;
+        }
         case CTSC_SK_VariableStatement: {
             /* Mirrors binder.ts bindVariableDeclarationOrBindingElement (~3648):
              * each VariableDeclaration contributes a symbol. `let`/`const`

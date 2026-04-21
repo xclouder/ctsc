@@ -96,6 +96,23 @@ CtscType* ctsc_type_class_constructor(CtscTypeRegistry* reg, const uint16_t* nam
     return t;
 }
 
+CtscType* ctsc_type_enum_value(CtscTypeRegistry* reg, const uint16_t* name, size_t name_len) {
+    CtscType* t = ctsc_type_new(reg, CTSC_TYPE_ENUM_VALUE);
+    t->text = name;
+    t->text_len = name_len;
+    return t;
+}
+
+CtscType* ctsc_type_enum_member_literal(CtscTypeRegistry* reg, const uint16_t* enum_name, size_t enum_name_len,
+                                        const uint16_t* member_name, size_t member_name_len) {
+    CtscType* t = ctsc_type_new(reg, CTSC_TYPE_ENUM_MEMBER_LITERAL);
+    t->enum_parent_name = enum_name;
+    t->enum_parent_name_len = enum_name_len;
+    t->enum_member_name = member_name;
+    t->enum_member_name_len = member_name_len;
+    return t;
+}
+
 CtscType* ctsc_type_reference_with_type_args(CtscTypeRegistry* reg, const uint16_t* name, size_t name_len,
                                                CtscType** args, size_t arg_count) {
     CtscType* t = ctsc_type_new(reg, CTSC_TYPE_REFERENCE);
@@ -124,6 +141,17 @@ CtscType* ctsc_type_tuple(CtscTypeRegistry* reg, CtscType** elements, size_t ele
     return t;
 }
 
+CtscType* ctsc_type_intersection(CtscTypeRegistry* reg, CtscType** members, size_t member_count) {
+    if (!reg || member_count == 0 || !members) return reg ? reg->t_any : NULL;
+    if (member_count == 1) return members[0];
+    CtscType* t = ctsc_type_new(reg, CTSC_TYPE_INTERSECTION);
+    CtscType** slot = (CtscType**)ctsc_arena_alloc(reg->arena, member_count * sizeof(CtscType*));
+    memcpy(slot, members, member_count * sizeof(CtscType*));
+    t->intersection_members = slot;
+    t->intersection_members_len = member_count;
+    return t;
+}
+
 /*
  * Literal → base widening (types.ts getWidenedLiteralType ~35395):
  *   42 → number,  "hi" → string,  true/false → boolean,  42n → bigint.
@@ -138,7 +166,13 @@ CtscType* ctsc_type_widen(CtscTypeRegistry* reg, const CtscType* t) {
         case CTSC_TYPE_BIGINT_LITERAL:  return reg->t_bigint;
         case CTSC_TYPE_REFERENCE:
         case CTSC_TYPE_CLASS_CONSTRUCTOR:
+        case CTSC_TYPE_ENUM_VALUE:
             return (CtscType*)t;
+        case CTSC_TYPE_ENUM_MEMBER_LITERAL:
+            if (t->enum_parent_name && t->enum_parent_name_len > 0) {
+                return ctsc_type_reference(reg, t->enum_parent_name, t->enum_parent_name_len);
+            }
+            return reg->t_any;
         default: return (CtscType*)t;
     }
 }
@@ -254,6 +288,13 @@ void ctsc_type_to_string(const CtscType* t, CtscBuffer* out) {
             }
             return;
         }
+        case CTSC_TYPE_INTERSECTION: {
+            for (size_t i = 0; i < t->intersection_members_len; ++i) {
+                if (i > 0) ctsc_buf_append_cstr(out, " & ");
+                ctsc_type_to_string(t->intersection_members[i], out);
+            }
+            return;
+        }
         case CTSC_TYPE_OBJECT_LITERAL: {
             if (t->alias_symbol_name && t->alias_symbol_name_len > 0) {
                 append_utf16_ascii_identifier_prop_name(out, t->alias_symbol_name, t->alias_symbol_name_len);
@@ -294,6 +335,14 @@ void ctsc_type_to_string(const CtscType* t, CtscBuffer* out) {
         case CTSC_TYPE_CLASS_CONSTRUCTOR:
             ctsc_buf_append_cstr(out, "typeof ");
             append_utf16_ascii_identifier_prop_name(out, t->text, t->text_len);
+            return;
+        case CTSC_TYPE_ENUM_VALUE:
+            append_utf16_ascii_identifier_prop_name(out, t->text, t->text_len);
+            return;
+        case CTSC_TYPE_ENUM_MEMBER_LITERAL:
+            append_utf16_ascii_identifier_prop_name(out, t->enum_parent_name, t->enum_parent_name_len);
+            ctsc_buf_append_char(out, '.');
+            append_utf16_ascii_identifier_prop_name(out, t->enum_member_name, t->enum_member_name_len);
             return;
         default:
             ctsc_buf_append_cstr(out, "any");

@@ -50,6 +50,12 @@ typedef enum {
     CTSC_TYPE_UNION,
 
     /*
+     * Intersection type (types.ts IntersectionType). Constituents in source
+     * order (`A & B`); checker.ts getTypeFromIntersectionTypeNode ~14510+.
+     */
+    CTSC_TYPE_INTERSECTION,
+
+    /*
      * Anonymous object literal type (checker.ts checkObjectLiteral ~33527).
      * typeToString matches `{ a: number; }` style (space after `{`, `; ` between
      * properties, trailing `; ` before `}`).
@@ -77,6 +83,19 @@ typedef enum {
      * Payload: `text` / `text_len` = class name (UTF-16), same as REFERENCE.
      */
     CTSC_TYPE_CLASS_CONSTRUCTOR,
+
+    /*
+     * `enum E { ... }` value type: `E` in expression position (checker.ts
+     * getTypeOfSymbol for regular enum ~12537+). typeToString is `E`;
+     * property access yields CTSC_TYPE_ENUM_MEMBER_LITERAL.
+     */
+    CTSC_TYPE_ENUM_VALUE,
+
+    /*
+     * Unique enum member type (checker.ts EnumLiteralType); typeToString `E.M`.
+     * Parent / member names are UTF-16 slices (typically Identifier text).
+     */
+    CTSC_TYPE_ENUM_MEMBER_LITERAL,
 
     /* Reserved for M4.1+ (kept here so switch tables compile without churn). */
     CTSC_TYPE_FUNCTION
@@ -107,6 +126,10 @@ struct CtscType {
      * preserves the order types entered the union in most cases). */
     CtscType**  union_members;
     size_t      union_members_len;
+
+    /* INTERSECTION: same storage shape as union; distinct kind for typeToString. */
+    CtscType**  intersection_members;
+    size_t      intersection_members_len;
 
     /* OBJECT_LITERAL */
     CtscObjectProperty* object_properties;
@@ -139,6 +162,12 @@ struct CtscType {
      */
     const uint16_t* alias_symbol_name;
     size_t          alias_symbol_name_len;
+
+    /* CTSC_TYPE_ENUM_MEMBER_LITERAL only: `enum_parent`.`enum_member` */
+    const uint16_t* enum_parent_name;
+    size_t          enum_parent_name_len;
+    const uint16_t* enum_member_name;
+    size_t          enum_member_name_len;
 };
 
 struct CtscArena;
@@ -184,6 +213,13 @@ CtscType* ctsc_type_reference(CtscTypeRegistry* reg, const uint16_t* name, size_
 /* Class identifier in value position: typeToString `typeof Name`; static member lookup. */
 CtscType* ctsc_type_class_constructor(CtscTypeRegistry* reg, const uint16_t* name, size_t name_len);
 
+/* Regular / non-const enum object type (expression-side `E`). */
+CtscType* ctsc_type_enum_value(CtscTypeRegistry* reg, const uint16_t* name, size_t name_len);
+
+/* Enum member literal type `E.M` (checker.ts EnumLiteralType). */
+CtscType* ctsc_type_enum_member_literal(CtscTypeRegistry* reg, const uint16_t* enum_name, size_t enum_name_len,
+                                        const uint16_t* member_name, size_t member_name_len);
+
 /*
  * Same as ctsc_type_reference but with type arguments (e.g. Box<number>).
  * `args` is copied into the arena; pointers must remain valid for the type's lifetime.
@@ -193,6 +229,9 @@ CtscType* ctsc_type_reference_with_type_args(CtscTypeRegistry* reg, const uint16
 
 /* Tuple type: `elements` copied into the arena (may be NULL when count is 0). */
 CtscType* ctsc_type_tuple(CtscTypeRegistry* reg, CtscType** elements, size_t element_count);
+
+/* Intersection: `members` copied into the arena; count must be >= 1. */
+CtscType* ctsc_type_intersection(CtscTypeRegistry* reg, CtscType** members, size_t member_count);
 
 /* Widening rules (types.ts getWidenedLiteralType): narrow literal -> base. */
 CtscType* ctsc_type_widen(CtscTypeRegistry* reg, const CtscType* t);

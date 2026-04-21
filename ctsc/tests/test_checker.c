@@ -524,6 +524,35 @@ int test_checker(void) {
         ctsc_arena_free(&a);
     }
 
+    /* Interface `extends`: structural members for property access (checker.ts
+     * resolveBaseTypesOfInterface ~13400; fixtures/checker/interface_extends/01_simple.ts). */
+    {
+        const char* src =
+            "// @checker: types\n"
+            "interface A {\n"
+            "  x: number;\n"
+            "}\n"
+            "interface B extends A {}\n"
+            "const b: B = { x: 1 };\n"
+            "const n = b.x;\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 3);
+        if (cr->entries_len == 3 && cr->entries[2].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[2].type, &ts);
+            EXPECT(ts.len == 6 && memcmp(ts.data, "number", 6) == 0);
+            ctsc_buf_free(&ts);
+        }
+        ctsc_arena_free(&a);
+    }
+
     /* Missing property on object literal: TS2339 (checker.ts ~34948-34968;
      * fixtures/checker/property_access/02_missing_property.ts). */
     {
@@ -857,6 +886,44 @@ int test_checker(void) {
         ctsc_arena_free(&a);
     }
 
+    /*
+     * Union of string literal types + `===` discriminant narrowing (fixtures/checker/narrowing/
+     * 07_discriminant_literal.ts; checker.ts narrowTypeByEquality ~29752-29787).
+     */
+    {
+        const char* src = "// @checker: types\n"
+                          "function f(tag: \"a\" | \"b\") {\n"
+                          "  if (tag === \"a\") {\n"
+                          "    const x = tag;\n"
+                          "  }\n"
+                          "}\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 3);
+        if (cr->entries_len >= 2 && cr->entries[1].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[1].type, &ts);
+            const char* want_tag = "\"a\" | \"b\"";
+            EXPECT(ts.len == strlen(want_tag) && memcmp(ts.data, want_tag, strlen(want_tag)) == 0);
+            ctsc_buf_free(&ts);
+        }
+        if (cr->entries_len >= 3 && cr->entries[2].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[2].type, &ts);
+            const char* want_x = "\"a\"";
+            EXPECT(ts.len == strlen(want_x) && memcmp(ts.data, want_x, strlen(want_x)) == 0);
+            ctsc_buf_free(&ts);
+        }
+        ctsc_arena_free(&a);
+    }
+
     /* FunctionExpression with one typed parameter (fixtures/checker/function_expressions/02_one_param.ts). */
     {
         const char* src = "// @checker: types\nconst f = function (x: number) {\n  return x;\n};\n";
@@ -1087,6 +1154,64 @@ int test_checker(void) {
                 EXPECT(t1.len == 1 && memcmp(t1.data, "P", 1) == 0);
                 ctsc_buf_free(&t1);
             }
+        }
+        ctsc_arena_free(&a);
+    }
+
+    /* Intersection of two interfaces (fixtures/checker/intersection/01_two_types.ts;
+     * checker.ts getTypeFromIntersectionTypeNode ~14510+). */
+    {
+        const char* src = "// @checker: types\n"
+                          "interface A {\n"
+                          "  x: number;\n"
+                          "}\n"
+                          "interface B {\n"
+                          "  y: string;\n"
+                          "}\n"
+                          "const ab: A & B = { x: 1, y: \"hi\" };\n"
+                          "const n = ab.x;\n"
+                          "const s = ab.y;\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 5);
+        const CtscCheckTypeEntry* e_ab = NULL;
+        const CtscCheckTypeEntry* e_n = NULL;
+        const CtscCheckTypeEntry* e_s = NULL;
+        for (size_t i = 0; i < cr->entries_len; i++) {
+            if (cr->entries[i].name_len == 2 && cr->entries[i].name
+                && cr->entries[i].name[0] == (uint16_t)'a' && cr->entries[i].name[1] == (uint16_t)'b')
+                e_ab = &cr->entries[i];
+            if (cr->entries[i].name_len == 1 && cr->entries[i].name && cr->entries[i].name[0] == (uint16_t)'n')
+                e_n = &cr->entries[i];
+            if (cr->entries[i].name_len == 1 && cr->entries[i].name && cr->entries[i].name[0] == (uint16_t)'s')
+                e_s = &cr->entries[i];
+        }
+        EXPECT(e_ab != NULL && e_n != NULL && e_s != NULL);
+        if (e_ab && e_ab->type) {
+            CtscBuffer t;
+            ctsc_buf_init(&t);
+            ctsc_type_to_string(e_ab->type, &t);
+            EXPECT(t.len == 5 && memcmp(t.data, "A & B", 5) == 0);
+            ctsc_buf_free(&t);
+        }
+        if (e_n && e_n->type) {
+            CtscBuffer t;
+            ctsc_buf_init(&t);
+            ctsc_type_to_string(e_n->type, &t);
+            EXPECT(t.len == 6 && memcmp(t.data, "number", 6) == 0);
+            ctsc_buf_free(&t);
+        }
+        if (e_s && e_s->type) {
+            CtscBuffer t;
+            ctsc_buf_init(&t);
+            ctsc_type_to_string(e_s->type, &t);
+            EXPECT(t.len == 6 && memcmp(t.data, "string", 6) == 0);
+            ctsc_buf_free(&t);
         }
         ctsc_arena_free(&a);
     }
@@ -1806,6 +1931,50 @@ int test_checker(void) {
         EXPECT(cr->entries_len == 1);
         if (cr->entries_len >= 1 && cr->entries[0].type) {
             EXPECT(cr->entries[0].type->kind == CTSC_TYPE_NUMBER);
+        }
+        ctsc_arena_free(&a);
+    }
+
+    /* Numeric enum member literal type (fixtures/checker/enums/01_numeric_enum.ts;
+     * checker.ts getTypeOfPropertyOfType / EnumLiteralType ~35200+). */
+    {
+        const char* src = "// @checker: types\nenum Color {\n  Red,\n  Green,\n  Blue,\n}\nconst c = Color.Red;\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 1);
+        if (cr->entries_len >= 1 && cr->entries[0].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[0].type, &ts);
+            EXPECT(ts.len == 9 && memcmp(ts.data, "Color.Red", 9) == 0);
+            ctsc_buf_free(&ts);
+        }
+        ctsc_arena_free(&a);
+    }
+
+    /* String enum member literal (fixtures/checker/enums/02_string_enum.ts). */
+    {
+        const char* src =
+            "// @checker: types\nenum Name {\n  A = \"a\",\n  B = \"b\",\n}\nconst n = Name.A;\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 1);
+        if (cr->entries_len >= 1 && cr->entries[0].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[0].type, &ts);
+            EXPECT(ts.len == 6 && memcmp(ts.data, "Name.A", 6) == 0);
+            ctsc_buf_free(&ts);
         }
         ctsc_arena_free(&a);
     }
