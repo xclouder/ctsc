@@ -4759,6 +4759,7 @@ static CtscNode* parse_parameter(Parser* p) {
  */
 static void parse_function_signature_and_body(Parser* p,
                                               CtscNodeArray* out_params,
+                                              CtscNode** out_type,
                                               CtscNode** out_body,
                                               int* out_body_end,
                                               bool is_async_function) {
@@ -4840,14 +4841,21 @@ static void parse_function_signature_and_body(Parser* p,
     /* Mirrors upstream/TypeScript/src/compiler/parser.ts
      * parseFunctionDeclaration (~7746):
      *     const type = parseReturnType(SyntaxKind.ColonToken, isType=false);
-     * The oracle (harness/src/oracle-ast.ts) does not emit a `type` field for
-     * FunctionDeclaration, so we consume the annotation purely to advance the
-     * scanner past it — matching tsc's body position. Without this, a return
-     * type like `: {}` is left unconsumed and the following `{` body is
-     * misparsed (the `{}` is picked up as a top-level Block statement and the
-     * FunctionDeclaration end/body positions drift). Fixture
-     * 107_generatorTypeCheck4.ts (`function* g1(): {} { }`) exercises this. */
-    (void)parse_type_annotation(p);
+     * The AST JSON oracle does not serialise the return `type` slot, but the
+     * checker oracle (typeToString) does — `declare function f(): T;` needs
+     * to report `() => T`, not `() => void`. Store the annotation node so
+     * callers can forward it into emit_function_signature_string and
+     * return_type_of_function_declaration.
+     *
+     * Without recording it, a return annotation like `: {}` would still
+     * advance the scanner correctly (the original purpose of this call),
+     * but downstream phases would see `type == NULL` and fall back to body
+     * inference — which is fine for `function f(): T { ... }` but loses
+     * fidelity for ambient/overload signatures with no body. Fixture
+     * 107_generatorTypeCheck4.ts (`function* g1(): {} { }`) exercises the
+     * scanner-advancement property. */
+    CtscNode* return_ty = parse_type_annotation(p);
+    if (out_type) *out_type = return_ty;
     /* Mirrors upstream/TypeScript/src/compiler/parser.ts
      * parseFunctionBlockOrSemicolon (~7567):
      *     if (token() !== OpenBraceToken) {
@@ -4943,14 +4951,16 @@ static CtscNode* parse_function_declaration(Parser* p, bool is_async) {
     ctsc_node_array_init(&type_parameters);
     (void)parse_type_parameters(p, &type_parameters);
     CtscNodeArray params;
+    CtscNode* return_ty = NULL;
     CtscNode* body;
     int body_end;
-    parse_function_signature_and_body(p, &params, &body, &body_end, is_async);
+    parse_function_signature_and_body(p, &params, &return_ty, &body, &body_end, is_async);
     CtscNode* fn = ctsc_node_new(p->arena, CTSC_SK_FunctionDeclaration, fs, body_end);
     fn->data.functionDeclaration.has_async = is_async;
     fn->data.functionDeclaration.name = name;
     fn->data.functionDeclaration.type_parameters = type_parameters;
     fn->data.functionDeclaration.parameters = params;
+    fn->data.functionDeclaration.type = return_ty;
     fn->data.functionDeclaration.body = body;
     return fn;
 }
@@ -5004,9 +5014,10 @@ static CtscNode* parse_function_expression(Parser* p) {
     ctsc_node_array_init(&type_parameters);
     (void)parse_type_parameters(p, &type_parameters);
     CtscNodeArray params;
+    CtscNode* return_ty = NULL;
     CtscNode* body;
     int body_end;
-    parse_function_signature_and_body(p, &params, &body, &body_end, false);
+    parse_function_signature_and_body(p, &params, &return_ty, &body, &body_end, false);
     CtscNode* fn = ctsc_node_new(p->arena, CTSC_SK_FunctionExpression, fs, body_end);
     fn->data.functionDeclaration.has_asterisk = has_asterisk;
     fn->data.functionDeclaration.asterisk_pos = asterisk_pos;
@@ -5014,6 +5025,7 @@ static CtscNode* parse_function_expression(Parser* p) {
     fn->data.functionDeclaration.name = name;
     fn->data.functionDeclaration.type_parameters = type_parameters;
     fn->data.functionDeclaration.parameters = params;
+    fn->data.functionDeclaration.type = return_ty;
     fn->data.functionDeclaration.body = body;
     return fn;
 }

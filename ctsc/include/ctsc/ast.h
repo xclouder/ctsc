@@ -283,7 +283,13 @@ typedef struct {
     /* Mirrors parseTypeParameters (~3987) between name and parseParameters. */
     CtscNodeArray type_parameters;
     CtscNodeArray parameters;
-    CtscNode*     body;       /* Block */
+    /* Mirrors upstream/TypeScript/src/compiler/parser.ts parseFunctionDeclaration
+     * (~7746): `const type = parseReturnType(ColonToken, isType=false)`. Stored
+     * verbatim so the checker's emit_function_signature_string can render it
+     * (matches MethodDeclaration's `type` handling ~2423). Required for
+     * `declare function f(): T;` where the body is absent. */
+    CtscNode*     type;       /* TypeNode, NULL if omitted */
+    CtscNode*     body;       /* Block, NULL for overload/ambient signatures */
 } CtscFunctionDeclarationData;
 
 /*

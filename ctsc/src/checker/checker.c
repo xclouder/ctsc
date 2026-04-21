@@ -3407,11 +3407,14 @@ static void visit_variable_declaration_list(Walk* w, const CtscNode* list) {
              * ~39276-39277; typeToString uses `=>` form for callable display).
              */
             const CtscFunctionDeclarationData* fe = &vd->initializer->data.functionDeclaration;
-            CtscType* inferred_ret = infer_return_type_for_function_body(w, &w->r->registry, w->arena, fe->body,
-                                                                           vd->initializer);
+            CtscType* inferred_ret = NULL;
+            if (!fe->type) {
+                inferred_ret = infer_return_type_for_function_body(w, &w->r->registry, w->arena, fe->body,
+                                                                   vd->initializer);
+            }
             CtscBuffer sig;
             ctsc_buf_init(&sig);
-            emit_function_signature_string(&sig, &fe->type_parameters, &fe->parameters, &w->r->registry, NULL,
+            emit_function_signature_string(&sig, &fe->type_parameters, &fe->parameters, &w->r->registry, fe->type,
                                            inferred_ret, w->source_utf16, w->source_utf16_len);
             char* s = (char*)ctsc_arena_alloc(w->arena, sig.len);
             memcpy(s, sig.data, sig.len);
@@ -3982,6 +3985,13 @@ static CtscType* method_return_type_from_class_declaration(Walk* w, const CtscNo
 static CtscType* return_type_of_function_declaration(Walk* w, const CtscNode* fn) {
     if (!fn || fn->kind != CTSC_SK_FunctionDeclaration) return NULL;
     const CtscFunctionDeclarationData* f = &fn->data.functionDeclaration;
+    /* Explicit return annotation wins (checker.ts getReturnTypeFromAnnotation
+     * ~39185 path); ambient `declare function` has no body but always a
+     * declared annotation (or implicit any in tsc, which we approximate as
+     * NULL → caller falls back to t_any). */
+    if (f->type) {
+        return type_of_type_node(w, &w->r->registry, w->source_utf16, w->source_utf16_len, f->type, 0);
+    }
     if (!f->body || f->body->kind != CTSC_SK_Block) return NULL;
     CtscType* t = infer_return_type_for_function_body(w, &w->r->registry, w->arena, f->body, fn);
     return widen_nullish_when_not_strict_null(&w->r->registry, t);
@@ -4158,10 +4168,16 @@ static void visit_function_declaration(Walk* w, const CtscNode* n) {
      * not model function types structurally — it pre-formats the string the
      * oracle expects (see emit_function_signature_string comment). */
     if (f->name && f->name->kind == CTSC_SK_Identifier) {
-        CtscType* inferred_ret =
-            infer_return_type_for_function_body(w, &w->r->registry, w->arena, f->body, n);
+        /* Mirrors checker.ts getSignatureOfTypeNode / signatureToString: when
+         * an explicit return-type annotation is present (including ambient
+         * `declare function f(): T;` shapes), prefer it over the body-inferred
+         * type. Matches MethodDeclaration handling above (~md->type branch). */
+        CtscType* inferred_ret = NULL;
+        if (!f->type) {
+            inferred_ret = infer_return_type_for_function_body(w, &w->r->registry, w->arena, f->body, n);
+        }
         CtscBuffer sig; ctsc_buf_init(&sig);
-        emit_function_signature_string(&sig, &f->type_parameters, &f->parameters, &w->r->registry, NULL,
+        emit_function_signature_string(&sig, &f->type_parameters, &f->parameters, &w->r->registry, f->type,
                                        inferred_ret, w->source_utf16, w->source_utf16_len);
         char* s = (char*)ctsc_arena_alloc(w->arena, sig.len);
         memcpy(s, sig.data, sig.len);
