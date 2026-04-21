@@ -809,11 +809,11 @@ typedef struct {
  * kinds forEachChild visits, in order:
  *   modifiers, name, typeParameters, parameters, type, body.
  *
- * ctsc currently models only `name`, `parameters`, and `body` — modifiers,
- * typeParameters, and the (setter-only) return-type annotation are skipped
- * until a fixture demands them (the initial unlock is
+ * ctsc models `name`, `parameters`, optional `type` (getter return type after
+ * `)` per parseAccessorDeclaration ~7851), and `body`. Modifiers and
+ * typeParameters are stored when present; the initial unlock is
  * 108_parserComputedPropertyName4.ts: `var v = { get [e]() { } };` which
- * exercises the bare `get ComputedPropertyName () Block` shape). `name` is
+ * exercises the bare `get ComputedPropertyName () Block` shape. `name` is
  * non-null (parsePropertyName falls back to createMissingNode(Identifier)
  * per parser.ts ~4210 when no property-name-starting token is present).
  * `body` is nullable to mirror parseFunctionBlockOrSemicolon, which returns
@@ -823,6 +823,8 @@ typedef struct {
     CtscNodeArray modifiers;        /* ModifierLike token leaves; may be empty */
     CtscNode*     name;           /* PropertyName (Identifier | ComputedPropertyName | ...) */
     CtscNodeArray parameters;     /* typically empty for getters, one for setters */
+    /* Optional `: Type` after `)` for getters (return type); parsed when present. */
+    CtscNode*     type;
     CtscNode*     body;           /* nullable Block */
 } CtscAccessorDeclarationData;
 

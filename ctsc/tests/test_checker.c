@@ -821,6 +821,42 @@ int test_checker(void) {
         ctsc_arena_free(&a);
     }
 
+    /*
+     * Harness default strictNullChecks off widens unions for getTypeAtLocation dumps
+     * (fixtures/checker/narrowing/04_null_check.ts; checker.ts getWidenedType ~26021+).
+     */
+    {
+        const char* src = "// @checker: types\n"
+                          "function f(x: string | null) {\n"
+                          "  if (x !== null) {\n"
+                          "    const s = x;\n"
+                          "  }\n"
+                          "}\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 3);
+        if (cr->entries_len >= 2 && cr->entries[1].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[1].type, &ts);
+            EXPECT(ts.len == 6 && memcmp(ts.data, "string", 6) == 0);
+            ctsc_buf_free(&ts);
+        }
+        if (cr->entries_len >= 3 && cr->entries[2].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[2].type, &ts);
+            EXPECT(ts.len == 6 && memcmp(ts.data, "string", 6) == 0);
+            ctsc_buf_free(&ts);
+        }
+        ctsc_arena_free(&a);
+    }
+
     /* FunctionExpression with one typed parameter (fixtures/checker/function_expressions/02_one_param.ts). */
     {
         const char* src = "// @checker: types\nconst f = function (x: number) {\n  return x;\n};\n";
@@ -1384,6 +1420,96 @@ int test_checker(void) {
                 ctsc_type_to_string(cr->entries[2].type, &t2);
                 EXPECT(t2.len == 6 && memcmp(t2.data, "number", 6) == 0);
                 ctsc_buf_free(&t2);
+            }
+        }
+        ctsc_arena_free(&a);
+    }
+
+    /* Class getter return type on instance access (fixtures/checker/accessors/01_getter.ts;
+     * checker.ts getTypeOfAccessors ~12706-12723, getTypeOfPropertyOfType ~11575). */
+    {
+        const char* src = "// @checker: types\nclass C {\n  _x: number = 1;\n  get x(): number {\n    return this._x;\n  }\n}\nconst n = new C().x;\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 2);
+        if (cr->entries_len == 2) {
+            EXPECT(cr->entries[0].decl_kind_name
+                   && strcmp(cr->entries[0].decl_kind_name, "PropertyDeclaration") == 0);
+            EXPECT(cr->entries[1].decl_kind_name
+                   && strcmp(cr->entries[1].decl_kind_name, "VariableDeclaration") == 0);
+            if (cr->entries[1].type) {
+                CtscBuffer ts;
+                ctsc_buf_init(&ts);
+                ctsc_type_to_string(cr->entries[1].type, &ts);
+                EXPECT(ts.len == 6 && memcmp(ts.data, "number", 6) == 0);
+                ctsc_buf_free(&ts);
+            }
+        }
+        ctsc_arena_free(&a);
+    }
+
+    /* Class getter + setter: types channel includes setter parameter (fixtures/checker/
+     * accessors/02_getter_setter.ts; checker.ts getTypeOfVariableOrParameterOrPropertyWorker
+     * ~12643-12650). */
+    {
+        /* CRLF line endings match fixtures/checker/accessors/02_getter_setter.ts (181 bytes). */
+        const char* src = "// @checker: types\r\n"
+                          "class C {\r\n"
+                          "  _x: number = 1;\r\n"
+                          "  get x(): number {\r\n"
+                          "    return this._x;\r\n"
+                          "  }\r\n"
+                          "  set x(v: number) {\r\n"
+                          "    this._x = v;\r\n"
+                          "  }\r\n"
+                          "}\r\n"
+                          "const c = new C();\r\n"
+                          "const n = c.x;\r\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 4);
+        if (cr->entries_len == 4) {
+            EXPECT(cr->entries[0].decl_kind_name
+                   && strcmp(cr->entries[0].decl_kind_name, "PropertyDeclaration") == 0);
+            EXPECT(cr->entries[1].decl_kind_name
+                   && strcmp(cr->entries[1].decl_kind_name, "Parameter") == 0);
+            EXPECT(cr->entries[1].name_len == 1 && cr->entries[1].name
+                   && cr->entries[1].name[0] == (uint16_t)'v');
+            EXPECT(cr->entries[1].pos == 105 && cr->entries[1].end == 106);
+            EXPECT(cr->entries[2].decl_kind_name
+                   && strcmp(cr->entries[2].decl_kind_name, "VariableDeclaration") == 0);
+            EXPECT(cr->entries[3].decl_kind_name
+                   && strcmp(cr->entries[3].decl_kind_name, "VariableDeclaration") == 0);
+            if (cr->entries[1].type) {
+                CtscBuffer t1;
+                ctsc_buf_init(&t1);
+                ctsc_type_to_string(cr->entries[1].type, &t1);
+                EXPECT(t1.len == 6 && memcmp(t1.data, "number", 6) == 0);
+                ctsc_buf_free(&t1);
+            }
+            if (cr->entries[2].type) {
+                CtscBuffer t2;
+                ctsc_buf_init(&t2);
+                ctsc_type_to_string(cr->entries[2].type, &t2);
+                EXPECT(t2.len == 1 && memcmp(t2.data, "C", 1) == 0);
+                ctsc_buf_free(&t2);
+            }
+            if (cr->entries[3].type) {
+                CtscBuffer t3;
+                ctsc_buf_init(&t3);
+                ctsc_type_to_string(cr->entries[3].type, &t3);
+                EXPECT(t3.len == 6 && memcmp(t3.data, "number", 6) == 0);
+                ctsc_buf_free(&t3);
             }
         }
         ctsc_arena_free(&a);

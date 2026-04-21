@@ -750,14 +750,15 @@ static void emit_node(CtscJson* j, const CtscNode* n) {
              * branch which serializes forEachChild's visits as a single
              * `children` array (only when non-empty).
              *
-             * ctsc currently models only `name`, `parameters`, and `body`;
-             * modifiers, typeParameters, and the (setter-only) return-type
-             * annotation are skipped until a fixture demands them. Undefined
-             * visits are skipped the way ts.forEachChild / visitNode skip
+             * ctsc emits modifiers, name, parameters, optional `type` (getter
+             * return annotation), then body — matching forEachChild order for
+             * the fields we model (typeParameters remain unserialized until needed).
+             * Undefined visits are skipped the way ts.forEachChild / visitNode skip
              * undefined. */
             size_t child_count = n->data.accessorDeclaration.modifiers.len;
             if (n->data.accessorDeclaration.name) child_count++;
             child_count += n->data.accessorDeclaration.parameters.len;
+            if (n->data.accessorDeclaration.type) child_count++;
             if (n->data.accessorDeclaration.body) child_count++;
             if (child_count > 0) {
                 ctsc_json_key(j, "children");
@@ -770,6 +771,9 @@ static void emit_node(CtscJson* j, const CtscNode* n) {
                 }
                 for (size_t i = 0; i < n->data.accessorDeclaration.parameters.len; ++i) {
                     emit_node(j, n->data.accessorDeclaration.parameters.items[i]);
+                }
+                if (n->data.accessorDeclaration.type) {
+                    emit_node(j, n->data.accessorDeclaration.type);
                 }
                 if (n->data.accessorDeclaration.body) {
                     emit_node(j, n->data.accessorDeclaration.body);

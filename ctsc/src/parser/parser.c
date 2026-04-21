@@ -2454,8 +2454,8 @@ static bool token_can_follow_get_or_set(CtscSyntaxKind k) {
  * finishNode (~2600) uses end = scanner.getTokenFullStart() of the token
  * AFTER the body, so the node's end mirrors body.end in the typical case
  * (body is a Block whose own end is finishNode-produced). ctsc currently
- * models only `name`, `parameters`, and `body`; typeParameters, return-type
- * annotation, and modifiers are skipped until a fixture demands them.
+ * models `name`, `parameters`, optional return `type`, and `body`; typeParameters
+ * and modifiers are filled when the caller supplies them.
  */
 static CtscNode* parse_accessor_declaration(Parser* p, int pos, CtscSyntaxKind kind,
                                             const CtscNodeArray* modifiers_opt) {
@@ -2484,18 +2484,16 @@ static CtscNode* parse_accessor_declaration(Parser* p, int pos, CtscSyntaxKind k
             cur_start(p), cur_end(p) - cur_start(p),
             "'%s' expected.", ctsc_syntax_kind_name(CTSC_SK_OpenParenToken));
     }
-    /* Optional `:` ReturnType — skip for now (no unlocked fixture uses a
-     * typed accessor; parse_type_annotation handles its own stop set). */
-    if (cur(p) == CTSC_SK_ColonToken) {
-        (void)parse_type_annotation(p);
-    }
+    /* Optional `:` ReturnType after `)` (getter return type / parseAccessorDeclaration
+     * ~7851). Mirrors parseTypeAnnotation (~4961). */
+    CtscNode* acc_type = parse_type_annotation(p);
     CtscNode* body = NULL;
     if (cur(p) == CTSC_SK_OpenBraceToken) {
         body = parse_block(p);
     } else if (cur(p) == CTSC_SK_SemicolonToken) {
         advance(p);
     }
-    int end = body ? body->end : cur_full_start(p);
+    int end = body ? body->end : (acc_type ? acc_type->end : cur_full_start(p));
     CtscNode* n = ctsc_node_new(p->arena, kind, pos, end);
     if (modifiers_opt) {
         n->data.accessorDeclaration.modifiers = *modifiers_opt;
@@ -2504,6 +2502,7 @@ static CtscNode* parse_accessor_declaration(Parser* p, int pos, CtscSyntaxKind k
     }
     n->data.accessorDeclaration.name = name;
     n->data.accessorDeclaration.parameters = params;
+    n->data.accessorDeclaration.type = acc_type;
     n->data.accessorDeclaration.body = body;
     return n;
 }

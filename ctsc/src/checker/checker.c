@@ -1238,6 +1238,7 @@ static CtscType* property_type_from_class_declaration(Walk* w, const CtscNode* c
                                                       const uint16_t* prop_name, size_t prop_len,
                                                       unsigned depth, bool static_side);
 static CtscType* return_type_of_method_declaration(Walk* w, const CtscNode* method_node);
+static CtscType* return_type_of_get_accessor_declaration(Walk* w, const CtscNode* getter_node);
 static CtscType* method_return_type_from_class_declaration(Walk* w, const CtscNode* class_node,
                                                            const uint16_t* prop_name, size_t prop_len,
                                                            unsigned depth, bool static_side);
@@ -2400,6 +2401,50 @@ static CtscType* widen_nullish_when_not_strict_null(CtscTypeRegistry* reg, CtscT
 }
 
 /*
+ * Harness oracle uses ts.TypeChecker.getTypeAtLocation with default compiler
+ * options (strictNullChecks off). Unions lose null/undefined constituents when
+ * other members remain (checker.ts getWidenedType ~26021+); if only nullish
+ * members remain, collapse to null when both appear (observed: null | undefined
+ * parameter → "null").
+ */
+static CtscType* widen_union_remove_nullish_for_types_dump(CtscTypeRegistry* reg, CtscType* t) {
+    if (!reg || !t) return reg ? reg->t_any : NULL;
+    if (t->kind != CTSC_TYPE_UNION) return t;
+    CtscType* buf[32];
+    size_t n = 0;
+    bool saw_null = false;
+    bool saw_undef = false;
+    for (size_t i = 0; i < t->union_members_len && n < 32; ++i) {
+        CtscType* m = t->union_members[i];
+        if (!m) continue;
+        if (m == reg->t_null) {
+            saw_null = true;
+            continue;
+        }
+        if (m == reg->t_undefined) {
+            saw_undef = true;
+            continue;
+        }
+        buf[n++] = m;
+    }
+    /* No null / undefined constituents — keep the union object (alias_symbol_name etc.). */
+    if (n == t->union_members_len) return t;
+    if (n > 0) {
+        if (n == 1) return buf[0];
+        CtscType* u = ctsc_type_new(reg, CTSC_TYPE_UNION);
+        u->union_members = (CtscType**)ctsc_arena_alloc(reg->arena, n * sizeof(CtscType*));
+        memcpy(u->union_members, buf, n * sizeof(CtscType*));
+        u->union_members_len = n;
+        sort_intrinsic_union_members(u);
+        return u;
+    }
+    if (saw_null && saw_undef) return reg->t_null;
+    if (saw_null) return reg->t_null;
+    if (saw_undef) return reg->t_undefined;
+    return reg->t_any;
+}
+
+/*
  * Object destructuring: inferred type for one BindingElement from the
  * initializer object's property (checker.ts checkVariableDeclaration /
  * getTypeFromBindingPattern ~41400+).
@@ -2658,13 +2703,23 @@ static CtscType* property_type_from_class_declaration(Walk* w, const CtscNode* c
     const CtscNodeArray* members = &class_node->data.classDeclaration.members;
     for (size_t i = 0; i < members->len; ++i) {
         CtscNode* m = members->items[i];
-        if (!m || m->kind != CTSC_SK_PropertyDeclaration) continue;
-        if (modifier_list_has_static(&m->data.propertyDeclaration.modifiers) != static_side) continue;
-        const CtscNode* pname = m->data.propertyDeclaration.name;
-        if (!pname || pname->kind != CTSC_SK_Identifier) continue;
-        if (pname->data.identifier.text_len != prop_len) continue;
-        if (memcmp(pname->data.identifier.text, prop_name, prop_len * sizeof(uint16_t)) != 0) continue;
-        return class_property_declaration_type(w, m);
+        if (!m) continue;
+        if (m->kind == CTSC_SK_PropertyDeclaration) {
+            if (modifier_list_has_static(&m->data.propertyDeclaration.modifiers) != static_side) continue;
+            const CtscNode* pname = m->data.propertyDeclaration.name;
+            if (!pname || pname->kind != CTSC_SK_Identifier) continue;
+            if (pname->data.identifier.text_len != prop_len) continue;
+            if (memcmp(pname->data.identifier.text, prop_name, prop_len * sizeof(uint16_t)) != 0) continue;
+            return class_property_declaration_type(w, m);
+        }
+        if (m->kind == CTSC_SK_GetAccessor) {
+            if (modifier_list_has_static(&m->data.accessorDeclaration.modifiers) != static_side) continue;
+            const CtscNode* pname = m->data.accessorDeclaration.name;
+            if (!pname || pname->kind != CTSC_SK_Identifier) continue;
+            if (pname->data.identifier.text_len != prop_len) continue;
+            if (memcmp(pname->data.identifier.text, prop_name, prop_len * sizeof(uint16_t)) != 0) continue;
+            return return_type_of_get_accessor_declaration(w, m);
+        }
     }
     /*
      * Inherited members: walk `extends` heritage (instance and static both
@@ -2776,7 +2831,7 @@ static void push_entry_for_name(Walk* w, const CtscNode* decl, const CtscNode* n
     e.decl_kind_name = syntax_kind_cstr(decl->kind);
     e.pos = name_id->pos;
     e.end = name_id->end;
-    e.type = type ? type : w->r->registry.t_any;
+    e.type = widen_union_remove_nullish_for_types_dump(&w->r->registry, type ? type : w->r->registry.t_any);
     entry_push(w->r, w->arena, e);
 }
 
@@ -2794,7 +2849,8 @@ static void push_property_signatures_from_type_literal(Walk* w, const CtscNode* 
         pe.decl_kind_name = syntax_kind_cstr(CTSC_SK_Parameter);
         pe.pos = idx.param_name_pos;
         pe.end = idx.param_name_end;
-        pe.type = idx.key_type ? idx.key_type : w->r->registry.t_any;
+        pe.type =
+            widen_union_remove_nullish_for_types_dump(&w->r->registry, idx.key_type ? idx.key_type : w->r->registry.t_any);
         entry_push(w->r, w->arena, pe);
     }
     for (size_t i = 0; i < n; i++) {
@@ -2804,7 +2860,8 @@ static void push_property_signatures_from_type_literal(Walk* w, const CtscNode* 
         e.decl_kind_name = syntax_kind_cstr(CTSC_SK_PropertySignature);
         e.pos = tmp[i].name_pos;
         e.end = tmp[i].name_end;
-        e.type = tmp[i].value_type ? tmp[i].value_type : w->r->registry.t_any;
+        e.type = widen_union_remove_nullish_for_types_dump(&w->r->registry,
+                                                             tmp[i].value_type ? tmp[i].value_type : w->r->registry.t_any);
         entry_push(w->r, w->arena, e);
     }
 }
@@ -2825,7 +2882,8 @@ static void push_property_signatures_from_interface_declaration(Walk* w, const C
         pe.decl_kind_name = syntax_kind_cstr(CTSC_SK_Parameter);
         pe.pos = idx.param_name_pos;
         pe.end = idx.param_name_end;
-        pe.type = idx.key_type ? idx.key_type : w->r->registry.t_any;
+        pe.type =
+            widen_union_remove_nullish_for_types_dump(&w->r->registry, idx.key_type ? idx.key_type : w->r->registry.t_any);
         entry_push(w->r, w->arena, pe);
     }
     for (size_t i = 0; i < n; i++) {
@@ -2835,7 +2893,8 @@ static void push_property_signatures_from_interface_declaration(Walk* w, const C
         e.decl_kind_name = syntax_kind_cstr(CTSC_SK_PropertySignature);
         e.pos = tmp[i].name_pos;
         e.end = tmp[i].name_end;
-        e.type = tmp[i].value_type ? tmp[i].value_type : w->r->registry.t_any;
+        e.type = widen_union_remove_nullish_for_types_dump(&w->r->registry,
+                                                             tmp[i].value_type ? tmp[i].value_type : w->r->registry.t_any);
         entry_push(w->r, w->arena, e);
     }
 }
@@ -3372,6 +3431,24 @@ static CtscType* return_type_of_method_declaration(Walk* w, const CtscNode* m) {
 }
 
 /*
+ * Getter return type: annotation first, else inferred from body (checker.ts
+ * getTypeOfAccessors ~12706-12723: getAnnotatedAccessorType(getter) then
+ * getReturnTypeFromBody(getter)).
+ */
+static CtscType* return_type_of_get_accessor_declaration(Walk* w, const CtscNode* m) {
+    if (!m || m->kind != CTSC_SK_GetAccessor) return NULL;
+    const CtscAccessorDeclarationData* ad = &m->data.accessorDeclaration;
+    if (ad->type) {
+        return type_of_type_node(w, &w->r->registry, w->source_utf16, w->source_utf16_len, ad->type, 0);
+    }
+    if (ad->body && ad->body->kind == CTSC_SK_Block) {
+        CtscType* t = infer_return_type_for_function_body(w, &w->r->registry, w->arena, ad->body, m);
+        return widen_nullish_when_not_strict_null(&w->r->registry, t);
+    }
+    return NULL;
+}
+
+/*
  * Instance method lookup by name, including `extends` (checker.ts getPropertyOfType
  * feeding signature resolution ~11575+).
  */
@@ -3763,6 +3840,18 @@ static void visit_class_declaration(Walk* w, const CtscNode* n) {
              * getTypeOfVariableOrParameterOrPropertyWorker ~12554). */
             for (size_t pi = 0; pi < md->parameters.len; ++pi) {
                 const CtscNode* p = md->parameters.items[pi];
+                if (!p || p->kind != CTSC_SK_Parameter) continue;
+                push_entry_for_name(w, p, p->data.parameter.name, param_type(w, p));
+            }
+        } else if (m->kind == CTSC_SK_SetAccessor) {
+            /*
+             * Setter value parameter: same types channel as method parameters
+             * (checker.ts getTypeOfVariableOrParameterOrPropertyWorker ~12643
+             * for SyntaxKind.Parameter).
+             */
+            const CtscAccessorDeclarationData* ad = &m->data.accessorDeclaration;
+            for (size_t pi = 0; pi < ad->parameters.len; ++pi) {
+                const CtscNode* p = ad->parameters.items[pi];
                 if (!p || p->kind != CTSC_SK_Parameter) continue;
                 push_entry_for_name(w, p, p->data.parameter.name, param_type(w, p));
             }
