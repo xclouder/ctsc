@@ -37,16 +37,23 @@ wave 计划：
   - 参考 `upstream/TypeScript/src/compiler/parser.ts` 的 `parseDeclaration`
     分支、`binder.ts` 中 `SymbolFlags.Ambient`。
 
-- wave 14 · `declare class` / `declare interface` / 命名空间占位
+- wave 14 · `declare class` / `declare interface` / 接口合并
   - `declare class Foo { x: number; }`
   - `declare interface Point { readonly x: number; }`
-  - `declare namespace N { const x: number; }`（仅解析 + 顶层成员查找，
-    不做嵌套逻辑）。
+  - `interface P { x: number; } interface P { y: string; }` 同文件合并。
+  - **延后**：`declare namespace N { ... }` 的成员查找需要 parser/binder/
+    checker 协同改造，挪到 M5.0.5（单独 sub-wave）。
 
-- wave 15 · 接口合并（interface merging）
+- wave 15 · `declare namespace` + 泛型接口合并（M5.0.5 / 合并入 wave 15）
+  - `declare namespace N { const x: number; function f(): string; }`
+    → `N.x` / `N.f()` 跨成员查找（parser 吃掉 `declare` 前缀，binder
+    把 ModuleBlock 成员登记到 N 的 locals，checker 的
+    PropertyAccessExpression 看 ModuleDeclaration 符号时走 locals 查询）；
   - `interface Array<T> { foo(): T; }` + `interface Array<T> { bar():
-    number; }` 合并成员；
-  - 参考 `checker.ts` 中 `mergeSymbol` / `getDeclaredTypeOfClassOrInterface`。
+    number; }` 合并成员 —— 前半同名合并已在 wave 14 搞定，这里验证带
+    泛型的合并；
+  - 参考 `checker.ts` 中 `mergeSymbol` / `getDeclaredTypeOfClassOrInterface`
+    / `bindModuleDeclaration`。
 
 **退出标准**：至少 15 个 fixture，覆盖 declare 变量/函数/类/接口合并/命名
 空间；checker 继续保持 100%。

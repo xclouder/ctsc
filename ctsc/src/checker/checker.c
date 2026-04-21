@@ -2284,13 +2284,28 @@ static CtscType* resolve_type_reference_to_object_literal(Walk* w, CtscTypeRegis
     if (!w || !reg || !ref || ref->kind != CTSC_TYPE_REFERENCE) return NULL;
     CtscSymbol* sym = resolve_name(&w->scopes, ref->text, ref->text_len);
     if (!sym) return NULL;
+    /* Declaration merging (checker.ts mergeSymbol ~3567 +
+     * getDeclaredTypeOfClassOrInterface ~13463): every InterfaceDeclaration
+     * sharing the same name contributes members. tsc materialises one
+     * InterfaceType whose resolvedMembers is the union of each declaration's
+     * own members plus its base types. Here we approximate by calling the
+     * per-declaration resolver and concatenating the shapes. Later
+     * declarations override earlier ones on conflicting member names, which
+     * matches tsc's "last write wins" behaviour for declaration merging
+     * (important for lib.d.ts augmentations). */
+    CtscType* merged = NULL;
     for (size_t i = 0; i < sym->decls_len; ++i) {
         CtscNode* d = sym->decls[i];
         if (!d || d->kind != CTSC_SK_InterfaceDeclaration) continue;
         CtscType* t = resolve_interface_declaration_to_object_literal(w, reg, d, 0);
-        if (t) return t;
+        if (!t) continue;
+        if (!merged) {
+            merged = t;
+        } else {
+            merged = merge_object_literal_shapes(reg, merged, t);
+        }
     }
-    return NULL;
+    return merged;
 }
 
 /*
