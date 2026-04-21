@@ -67,12 +67,12 @@ function difficultyHint(name: string): number {
  * are intrinsically about diagnostics; everything else defaults to types. */
 function stageDefaultChannel(stage: string): CheckerChannel {
   if (stage === "undefined_refs" || stage === "assignability" ||
-      stage === "function_calls") {
+      stage === "function_calls" || stage === "block_scope") {
     return "diag";
   }
-  /* property_access has a mix; each fixture specifies // @checker:
-   * explicitly, but default to types so a forgotten annotation on a
-   * read-shaped fixture still routes correctly. */
+  /* property_access / block_scope have a mix; each fixture specifies
+   * // @checker: explicitly, but default to types/diag above so a
+   * forgotten annotation still routes sensibly. */
   return "types";
 }
 
