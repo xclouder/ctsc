@@ -204,8 +204,16 @@ typedef struct {
     CtscNode*       right;
 } CtscBinaryExpressionData;
 
+/*
+ * Mirrors upstream CallExpression: optional type arguments from the
+ * `Callee<TypeArgs>(Args)` form (parser.ts parseCallExpressionRest ~6520 +
+ * parseTypeArgumentsInExpression). ctsc absorbs `<...>` like NewExpression;
+ * ast_json keeps emitting only expression/arguments for oracle parity.
+ */
 typedef struct {
     CtscNode*     expression;
+    bool          has_type_arguments;
+    CtscNodeArray type_arguments;
     CtscNodeArray arguments;
 } CtscCallExpressionData;
 

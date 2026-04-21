@@ -799,8 +799,18 @@ static CtscType* class_property_declaration_type(Walk* w, const CtscNode* decl);
 static CtscType* property_type_from_class_declaration(Walk* w, const CtscNode* class_node,
                                                       const uint16_t* prop_name, size_t prop_len,
                                                       unsigned depth);
+static CtscType* return_type_of_method_declaration(Walk* w, const CtscNode* method_node);
+static CtscType* method_return_type_from_class_declaration(Walk* w, const CtscNode* class_node,
+                                                           const uint16_t* prop_name, size_t prop_len,
+                                                           unsigned depth);
+static CtscType* return_type_of_function_declaration(Walk* w, const CtscNode* fn_decl);
+static const CtscNode* symbol_function_declaration_decl(CtscSymbol* sym);
 static CtscType* type_of_symbol_value(Walk* w, CtscSymbol* sym);
 static CtscType* param_type(Walk* w, const CtscNode* param);
+static CtscType* infer_return_type_for_function_body(Walk* w, CtscTypeRegistry* reg, CtscArena* arena,
+                                                     const CtscNode* body, const CtscNode* scope_container);
+static CtscType* generic_call_instantiated_return_type(Walk* w, CtscTypeRegistry* reg, const CtscNode* fn_decl,
+                                                      const CtscCallExpressionData* ce);
 
 /* Operand classification for binary `+` / ordering (checker.ts ~40837-40848). */
 static bool type_is_number_like(const CtscType* t) {
@@ -1036,6 +1046,53 @@ static CtscType* type_of_expression(Walk* w, CtscTypeRegistry* reg, const CtscNo
         }
         case CTSC_SK_NewExpression:
             return type_of_new_expression(w, reg, expr);
+        case CTSC_SK_CallExpression: {
+            /*
+             * checkCallExpression → getReturnTypeOfSignature (checker.ts ~37810-37878).
+             * M4.0: direct calls to a FunctionDeclaration or to a class method via
+             * PropertyAccessExpression (e.g. `new C().m()`).
+             */
+            const CtscCallExpressionData* ce = &expr->data.callExpression;
+            const CtscNode* callee = ce->expression;
+            if (callee && callee->kind == CTSC_SK_PropertyAccessExpression && w) {
+                const CtscPropertyAccessExpressionData* pa = &callee->data.propertyAccessExpression;
+                CtscType* obj_t = type_of_expression(w, reg, pa->expression);
+                if (obj_t && obj_t->kind == CTSC_TYPE_REFERENCE && pa->name
+                    && pa->name->kind == CTSC_SK_Identifier) {
+                    const CtscIdentifierData* id = &pa->name->data.identifier;
+                    CtscSymbol* sym = resolve_name(&w->scopes, obj_t->text, obj_t->text_len);
+                    if (sym) {
+                        for (size_t i = 0; i < sym->decls_len; ++i) {
+                            CtscNode* d = sym->decls[i];
+                            if (d && d->kind == CTSC_SK_ClassDeclaration) {
+                                CtscType* rt =
+                                    method_return_type_from_class_declaration(w, d, id->text, id->text_len, 0);
+                                if (rt) return rt;
+                            }
+                        }
+                    }
+                }
+                return reg->t_any;
+            }
+            if (callee && callee->kind == CTSC_SK_Identifier && w) {
+                const uint16_t* nm = callee->data.identifier.text;
+                size_t nl = callee->data.identifier.text_len;
+                if (nm && nl > 0) {
+                    CtscSymbol* sym = resolve_name(&w->scopes, nm, nl);
+                    if (sym) {
+                        const CtscNode* fn_decl = symbol_function_declaration_decl(sym);
+                        if (fn_decl) {
+                            CtscType* gen = generic_call_instantiated_return_type(w, reg, fn_decl, ce);
+                            if (gen) return gen;
+                            CtscType* rt = return_type_of_function_declaration(w, fn_decl);
+                            if (rt) return rt;
+                        }
+                    }
+                }
+                return reg->t_any;
+            }
+            return reg->t_any;
+        }
         case CTSC_SK_PropertyAccessExpression: {
             const CtscPropertyAccessExpressionData* pa = &expr->data.propertyAccessExpression;
             CtscType* obj_t = type_of_expression(w, reg, pa->expression);
@@ -1667,7 +1724,8 @@ static void visit(Walk* w, const CtscNode* n);
 static void visit_class_declaration(Walk* w, const CtscNode* n);
 static CtscType* infer_return_type_for_arrow_function(Walk* w, CtscTypeRegistry* reg, CtscArena* arena,
                                                      const CtscNode* arrow);
-static void emit_function_signature_string(CtscBuffer* out, const CtscNodeArray* params, CtscTypeRegistry* reg,
+static void emit_function_signature_string(CtscBuffer* out, const CtscNodeArray* type_parameters,
+                                           const CtscNodeArray* params, CtscTypeRegistry* reg,
                                            const CtscNode* return_type_node, CtscType* inferred_return_type,
                                            const uint16_t* src, size_t src_len);
 static void push_entry_with_string(Walk* w, const CtscNode* decl, const CtscNode* name_id, const char* type_str,
@@ -1823,8 +1881,26 @@ static void visit_variable_declaration_list(Walk* w, const CtscNode* list) {
                 infer_return_type_for_arrow_function(w, &w->r->registry, w->arena, vd->initializer);
             CtscBuffer sig;
             ctsc_buf_init(&sig);
-            emit_function_signature_string(&sig, &af->parameters, &w->r->registry, NULL, inferred_ret,
-                                           w->source_utf16, w->source_utf16_len);
+            emit_function_signature_string(&sig, &af->type_parameters, &af->parameters, &w->r->registry, NULL,
+                                           inferred_ret, w->source_utf16, w->source_utf16_len);
+            char* s = (char*)ctsc_arena_alloc(w->arena, sig.len);
+            memcpy(s, sig.data, sig.len);
+            size_t slen = sig.len;
+            ctsc_buf_free(&sig);
+            push_entry_with_string(w, d, vd->name, s, slen);
+        } else if (!vd->type && vd->initializer && vd->initializer->kind == CTSC_SK_FunctionExpression) {
+            /*
+             * FunctionExpression in a VariableDeclaration: same signature string as
+             * ArrowFunction (checker.ts getReturnTypeFromBody ~39195 + getWidenedType
+             * ~39276-39277; typeToString uses `=>` form for callable display).
+             */
+            const CtscFunctionDeclarationData* fe = &vd->initializer->data.functionDeclaration;
+            CtscType* inferred_ret = infer_return_type_for_function_body(w, &w->r->registry, w->arena, fe->body,
+                                                                           vd->initializer);
+            CtscBuffer sig;
+            ctsc_buf_init(&sig);
+            emit_function_signature_string(&sig, &fe->type_parameters, &fe->parameters, &w->r->registry, NULL,
+                                           inferred_ret, w->source_utf16, w->source_utf16_len);
             char* s = (char*)ctsc_arena_alloc(w->arena, sig.len);
             memcpy(s, sig.data, sig.len);
             size_t slen = sig.len;
@@ -1903,6 +1979,7 @@ static CtscType* type_of_symbol_value(Walk* w, CtscSymbol* sym) {
 typedef struct {
     CtscTypeRegistry* reg;
     CtscArena*        arena;
+    Walk*             w; /* NULL: ReturnStatement operand types treat Identifier as any */
     CtscType**        items;
     size_t            len;
     size_t            cap;
@@ -1954,7 +2031,7 @@ static void collect_return_expression_types(RetCollector* c, const CtscNode* n) 
         }
         case CTSC_SK_ReturnStatement:
             if (n->data.returnStatement.expression) {
-                ret_collector_push(c, type_of_expression(NULL, c->reg, n->data.returnStatement.expression));
+                ret_collector_push(c, type_of_expression(c->w, c->reg, n->data.returnStatement.expression));
             }
             return;
         case CTSC_SK_FunctionDeclaration:
@@ -2031,17 +2108,24 @@ static CtscType* widen_inferred_return_types(CtscTypeRegistry* reg, CtscArena* a
     }
 }
 
-static CtscType* infer_return_type_for_function_body(CtscTypeRegistry* reg, CtscArena* arena,
-                                                     const CtscNode* body) {
+static CtscType* infer_return_type_for_function_body(Walk* w, CtscTypeRegistry* reg, CtscArena* arena,
+                                                     const CtscNode* body, const CtscNode* scope_container) {
     if (!body || body->kind != CTSC_SK_Block) return reg->t_void;
+    CtscScope* fn_scope = NULL;
+    if (w && scope_container) {
+        fn_scope = find_scope_for_node(w->scopes.binding, scope_container);
+    }
+    if (fn_scope) scope_push(&w->scopes, fn_scope);
     RetCollector c;
     memset(&c, 0, sizeof(c));
     c.reg = reg;
     c.arena = arena;
+    c.w = w;
     const CtscNodeArray* stmts = &body->data.block.statements;
     for (size_t i = 0; i < stmts->len; ++i) {
         collect_return_expression_types(&c, stmts->items[i]);
     }
+    if (fn_scope) scope_pop(&w->scopes);
     return widen_inferred_return_types(reg, arena, c.items, c.len);
 }
 
@@ -2057,7 +2141,7 @@ static CtscType* infer_return_type_for_arrow_function(Walk* w, CtscTypeRegistry*
     const CtscNode* body = arrow->data.arrowFunction.body;
     if (!body) return reg->t_void;
     if (body->kind == CTSC_SK_Block) {
-        return infer_return_type_for_function_body(reg, arena, body);
+        return infer_return_type_for_function_body(w, reg, arena, body, arrow);
     }
     /* Concise body uses checkExpressionCached on the body (~39208-39210); parameters
      * must be in scope — push the binder scope before resolving identifiers. */
@@ -2069,19 +2153,170 @@ static CtscType* infer_return_type_for_arrow_function(Walk* w, CtscTypeRegistry*
     return widen_nullish_when_not_strict_null(reg, ctsc_type_widen(reg, t));
 }
 
-static void emit_function_signature_string(CtscBuffer* out,
-                                           const CtscNodeArray* params,
-                                           CtscTypeRegistry* reg,
-                                           const CtscNode* return_type_node,
-                                           CtscType* inferred_return_type,
+/*
+ * Return type of a class MethodDeclaration for call-expression typing (checker.ts
+ * getReturnTypeOfSignature / resolve call signature ~37851-37878).
+ */
+static CtscType* return_type_of_method_declaration(Walk* w, const CtscNode* m) {
+    if (!m || m->kind != CTSC_SK_MethodDeclaration) return NULL;
+    const CtscMethodDeclarationData* md = &m->data.methodDeclaration;
+    if (md->type) {
+        return type_of_type_node(w, &w->r->registry, w->source_utf16, w->source_utf16_len, md->type, 0);
+    }
+    if (md->body && md->body->kind == CTSC_SK_Block) {
+        CtscType* t = infer_return_type_for_function_body(w, &w->r->registry, w->arena, md->body, m);
+        return widen_nullish_when_not_strict_null(&w->r->registry, t);
+    }
+    return NULL;
+}
+
+/*
+ * Instance method lookup by name, including `extends` (checker.ts getPropertyOfType
+ * feeding signature resolution ~11575+).
+ */
+static CtscType* method_return_type_from_class_declaration(Walk* w, const CtscNode* class_node,
+                                                           const uint16_t* prop_name, size_t prop_len,
+                                                           unsigned depth) {
+    if (!class_node || class_node->kind != CTSC_SK_ClassDeclaration) return NULL;
+    if (depth > 64) return NULL;
+    const CtscNodeArray* members = &class_node->data.classDeclaration.members;
+    for (size_t i = 0; i < members->len; ++i) {
+        CtscNode* mem = members->items[i];
+        if (!mem || mem->kind != CTSC_SK_MethodDeclaration) continue;
+        const CtscNode* pname = mem->data.methodDeclaration.name;
+        if (!pname || pname->kind != CTSC_SK_Identifier) continue;
+        if (pname->data.identifier.text_len != prop_len) continue;
+        if (memcmp(pname->data.identifier.text, prop_name, prop_len * sizeof(uint16_t)) != 0) continue;
+        return return_type_of_method_declaration(w, mem);
+    }
+    const CtscNodeArray* hcs = &class_node->data.classDeclaration.heritage_clauses;
+    for (size_t hi = 0; hi < hcs->len; ++hi) {
+        CtscNode* hc = hcs->items[hi];
+        if (!hc || hc->kind != CTSC_SK_HeritageClause) continue;
+        if (hc->data.heritageClause.token != CTSC_SK_ExtendsKeyword) continue;
+        const CtscNodeArray* ext_types = &hc->data.heritageClause.types;
+        for (size_t ti = 0; ti < ext_types->len; ++ti) {
+            CtscNode* ewta = ext_types->items[ti];
+            if (!ewta || ewta->kind != CTSC_SK_ExpressionWithTypeArguments) continue;
+            const CtscNode* base_expr = ewta->data.expressionWithTypeArguments.expression;
+            if (!base_expr || base_expr->kind != CTSC_SK_Identifier) continue;
+            const CtscIdentifierData* bid = &base_expr->data.identifier;
+            CtscSymbol* base_sym = resolve_name(&w->scopes, bid->text, bid->text_len);
+            if (!base_sym) continue;
+            for (size_t di = 0; di < base_sym->decls_len; ++di) {
+                CtscNode* bd = base_sym->decls[di];
+                if (!bd || bd->kind != CTSC_SK_ClassDeclaration) continue;
+                CtscType* inherited =
+                    method_return_type_from_class_declaration(w, bd, prop_name, prop_len, depth + 1);
+                if (inherited) return inherited;
+            }
+        }
+    }
+    return NULL;
+}
+
+static CtscType* return_type_of_function_declaration(Walk* w, const CtscNode* fn) {
+    if (!fn || fn->kind != CTSC_SK_FunctionDeclaration) return NULL;
+    const CtscFunctionDeclarationData* f = &fn->data.functionDeclaration;
+    if (!f->body || f->body->kind != CTSC_SK_Block) return NULL;
+    CtscType* t = infer_return_type_for_function_body(w, &w->r->registry, w->arena, f->body, fn);
+    return widen_nullish_when_not_strict_null(&w->r->registry, t);
+}
+
+/*
+ * True when `param`'s type annotation is a TypeReference whose name matches a
+ * TypeParameter on `fn_decl` (checker.ts unconstrained type parameter assignability).
+ */
+static bool parameter_type_is_declared_type_parameter(const CtscNode* fn_decl, const CtscNode* param) {
+    if (!fn_decl || fn_decl->kind != CTSC_SK_FunctionDeclaration) return false;
+    if (!param || param->kind != CTSC_SK_Parameter) return false;
+    const CtscNode* pty = param->data.parameter.type;
+    if (!pty || pty->kind != CTSC_SK_TypeReference) return false;
+    const CtscTypeReferenceData* tr = &pty->data.typeReference;
+    if (!tr->typeName || tr->typeName->kind != CTSC_SK_Identifier) return false;
+    const CtscIdentifierData* pid = &tr->typeName->data.identifier;
+    const CtscNodeArray* tps = &fn_decl->data.functionDeclaration.type_parameters;
+    for (size_t ti = 0; ti < tps->len; ++ti) {
+        const CtscNode* tp = tps->items[ti];
+        if (!tp || tp->kind != CTSC_SK_TypeParameter) continue;
+        const CtscNode* tnm = tp->data.typeParameter.name;
+        if (!tnm || tnm->kind != CTSC_SK_Identifier) continue;
+        const CtscIdentifierData* tid = &tnm->data.identifier;
+        if (utf16_type_text_equal(pid->text, pid->text_len, tid->text, tid->text_len)) return true;
+    }
+    return false;
+}
+
+/*
+ * Single-type-parameter identity generic: infer return from the first argument
+ * when the body's inferred return is that type parameter (checker.ts
+ * inferTypeArguments / getReturnTypeOfSignature ~27800+, ~37810+).
+ */
+static CtscType* generic_call_instantiated_return_type(Walk* w, CtscTypeRegistry* reg, const CtscNode* fn_decl,
+                                                      const CtscCallExpressionData* ce) {
+    if (!w || !reg || !fn_decl || fn_decl->kind != CTSC_SK_FunctionDeclaration || !ce) return NULL;
+    const CtscFunctionDeclarationData* fd = &fn_decl->data.functionDeclaration;
+    if (fd->type_parameters.len != 1 || ce->arguments.len < 1 || fd->parameters.len < 1) return NULL;
+    const CtscNode* tp_decl = fd->type_parameters.items[0];
+    if (!tp_decl || tp_decl->kind != CTSC_SK_TypeParameter) return NULL;
+    const CtscNode* tp_name_node = tp_decl->data.typeParameter.name;
+    if (!tp_name_node || tp_name_node->kind != CTSC_SK_Identifier) return NULL;
+    const CtscIdentifierData* tp_id = &tp_name_node->data.identifier;
+
+    const CtscNode* p0 = fd->parameters.items[0];
+    if (!parameter_type_is_declared_type_parameter(fn_decl, p0)) return NULL;
+
+    CtscType* inferred_ret =
+        infer_return_type_for_function_body(w, reg, w->arena, fd->body, fn_decl);
+    if (!inferred_ret || inferred_ret->kind != CTSC_TYPE_REFERENCE) return NULL;
+    if (!utf16_type_text_equal(inferred_ret->text, inferred_ret->text_len, tp_id->text, tp_id->text_len)) {
+        return NULL;
+    }
+
+    /*
+     * Explicit `<TInst>` supplies type arguments (checker.ts inferTypeArguments
+     * when the CallExpression already has typeArguments, ~35827+): the
+     * instantiated return uses those types, not inference from argument
+     * expressions (e.g. `id<number>(42)` → `number`, not literal `42`).
+     */
+    if (ce->has_type_arguments && ce->type_arguments.len >= 1 && w) {
+        CtscType* explicit_t =
+            type_of_type_node(w, reg, w->source_utf16, w->source_utf16_len, ce->type_arguments.items[0], 0);
+        if (explicit_t) return widen_nullish_when_not_strict_null(reg, explicit_t);
+    }
+
+    CtscType* arg0_t = type_of_expression(w, reg, ce->arguments.items[0]);
+    if (!arg0_t) return NULL;
+    return widen_nullish_when_not_strict_null(reg, arg0_t);
+}
+
+static void emit_type_parameters_for_signature(CtscBuffer* out, const CtscNodeArray* type_parameters) {
+    if (!type_parameters || type_parameters->len == 0) return;
+    ctsc_buf_append_char(out, '<');
+    for (size_t i = 0; i < type_parameters->len; ++i) {
+        if (i > 0) ctsc_buf_append_cstr(out, ", ");
+        const CtscNode* tp = type_parameters->items[i];
+        if (tp && tp->kind == CTSC_SK_TypeParameter) {
+            const CtscNode* nm = tp->data.typeParameter.name;
+            if (nm && nm->kind == CTSC_SK_Identifier) {
+                const CtscIdentifierData* id = &nm->data.identifier;
+                append_utf16_ascii_identifier(out, id->text, id->text_len);
+            }
+        }
+    }
+    ctsc_buf_append_char(out, '>');
+}
+
+static void emit_function_signature_string(CtscBuffer* out, const CtscNodeArray* type_parameters,
+                                           const CtscNodeArray* params, CtscTypeRegistry* reg,
+                                           const CtscNode* return_type_node, CtscType* inferred_return_type,
                                            const uint16_t* src, size_t src_len) {
     /*
-     * tsc's typeToString on a FunctionType uses the printer with signature
-     * display rules; at default flags the output form is:
-     *   (p0: T0, p1: T1, ...) => R
-     * with parameter names preserved. Rest parameters would prefix `...`;
-     * we re-emit them when CtscParameterData.has_dot_dot_dot is true.
+     * tsc's typeToString on a FunctionType uses signatureToString (~6202) /
+     * WriteTypeParametersInQualifiedName: optional `<T, U>` then `(p0: T0, ...)
+     * => R` at default flags.
      */
+    emit_type_parameters_for_signature(out, type_parameters);
     ctsc_buf_append_char(out, '(');
     for (size_t i = 0; i < params->len; ++i) {
         const CtscNode* p = params->items[i];
@@ -2135,10 +2370,11 @@ static void visit_function_declaration(Walk* w, const CtscNode* n) {
      * not model function types structurally — it pre-formats the string the
      * oracle expects (see emit_function_signature_string comment). */
     if (f->name && f->name->kind == CTSC_SK_Identifier) {
-        CtscType* inferred_ret = infer_return_type_for_function_body(&w->r->registry, w->arena, f->body);
+        CtscType* inferred_ret =
+            infer_return_type_for_function_body(w, &w->r->registry, w->arena, f->body, n);
         CtscBuffer sig; ctsc_buf_init(&sig);
-        emit_function_signature_string(&sig, &f->parameters, &w->r->registry, NULL, inferred_ret,
-                                       w->source_utf16, w->source_utf16_len);
+        emit_function_signature_string(&sig, &f->type_parameters, &f->parameters, &w->r->registry, NULL,
+                                       inferred_ret, w->source_utf16, w->source_utf16_len);
         char* s = (char*)ctsc_arena_alloc(w->arena, sig.len);
         memcpy(s, sig.data, sig.len);
         size_t slen = sig.len;
@@ -2212,10 +2448,12 @@ static void visit_call_expression(Walk* w, const CtscNode* n) {
             if (i < params->len) {
                 const CtscNode* param = params->items[i];
                 if (param && param->kind == CTSC_SK_Parameter) {
-                    CtscType* param_t = param_type(w, param);
-                    CtscType* arg_t = type_of_expression(w, &w->r->registry, arg);
-                    if (!is_assignable_to(w, &w->r->registry, arg_t, param_t)) {
-                        emit_ts2345_on_argument(w->r, w->arena, &w->r->registry, arg, arg_t, param_t);
+                    if (!parameter_type_is_declared_type_parameter(fn_decl, param)) {
+                        CtscType* param_t = param_type(w, param);
+                        CtscType* arg_t = type_of_expression(w, &w->r->registry, arg);
+                        if (!is_assignable_to(w, &w->r->registry, arg_t, param_t)) {
+                            emit_ts2345_on_argument(w->r, w->arena, &w->r->registry, arg, arg_t, param_t);
+                        }
                     }
                 }
             }
@@ -2265,24 +2503,39 @@ static void visit_class_declaration(Walk* w, const CtscNode* n) {
             const CtscNode* name_node = md->name;
             if (!name_node || name_node->kind != CTSC_SK_Identifier) continue;
             CtscType* inferred_ret =
-                infer_return_type_for_function_body(&w->r->registry, w->arena, md->body);
+                infer_return_type_for_function_body(w, &w->r->registry, w->arena, md->body, m);
             CtscBuffer sig;
             ctsc_buf_init(&sig);
-            emit_function_signature_string(&sig, &md->parameters, &w->r->registry, md->type, inferred_ret,
-                                           w->source_utf16, w->source_utf16_len);
+            emit_function_signature_string(&sig, &md->type_parameters, &md->parameters, &w->r->registry, md->type,
+                                           inferred_ret, w->source_utf16, w->source_utf16_len);
             char* s = (char*)ctsc_arena_alloc(w->arena, sig.len);
             memcpy(s, sig.data, sig.len);
             size_t slen = sig.len;
             ctsc_buf_free(&sig);
             push_entry_with_string(w, m, name_node, s, slen);
+            /* Parameters: same types channel as FunctionDeclaration (checker.ts
+             * getTypeOfVariableOrParameterOrPropertyWorker ~12554). */
+            for (size_t pi = 0; pi < md->parameters.len; ++pi) {
+                const CtscNode* p = md->parameters.items[pi];
+                if (!p || p->kind != CTSC_SK_Parameter) continue;
+                push_entry_for_name(w, p, p->data.parameter.name, param_type(w, p));
+            }
         }
     }
     for (size_t i = 0; i < c->members.len; ++i) {
         CtscNode* m = c->members.items[i];
         if (m && m->kind == CTSC_SK_PropertyDeclaration && m->data.propertyDeclaration.initializer) {
             visit(w, m->data.propertyDeclaration.initializer);
-        } else if (m && m->kind == CTSC_SK_MethodDeclaration && m->data.methodDeclaration.body) {
-            visit(w, m->data.methodDeclaration.body);
+        } else if (m && m->kind == CTSC_SK_MethodDeclaration) {
+            const CtscMethodDeclarationData* md = &m->data.methodDeclaration;
+            open_scope_if_container(w, m);
+            for (size_t pi = 0; pi < md->parameters.len; ++pi) {
+                const CtscNode* p = md->parameters.items[pi];
+                if (!p || p->kind != CTSC_SK_Parameter) continue;
+                if (p->data.parameter.initializer) visit(w, p->data.parameter.initializer);
+            }
+            if (md->body) visit(w, md->body);
+            close_scope_if_container(w, m);
         }
     }
 }
@@ -2312,6 +2565,24 @@ static void visit(Walk* w, const CtscNode* n) {
         case CTSC_SK_FunctionDeclaration:
             visit_function_declaration(w, n);
             return;
+
+        case CTSC_SK_FunctionExpression: {
+            const CtscFunctionDeclarationData* f = &n->data.functionDeclaration;
+            for (size_t i = 0; i < f->parameters.len; ++i) {
+                const CtscNode* p = f->parameters.items[i];
+                if (!p || p->kind != CTSC_SK_Parameter) continue;
+                push_entry_for_name(w, p, p->data.parameter.name, param_type(w, p));
+            }
+            open_scope_if_container(w, n);
+            for (size_t i = 0; i < f->parameters.len; ++i) {
+                const CtscNode* p = f->parameters.items[i];
+                if (!p || p->kind != CTSC_SK_Parameter) continue;
+                if (p->data.parameter.initializer) visit(w, p->data.parameter.initializer);
+            }
+            if (f->body) visit(w, f->body);
+            close_scope_if_container(w, n);
+            return;
+        }
 
         case CTSC_SK_ArrowFunction: {
             const CtscArrowFunctionData* af = &n->data.arrowFunction;

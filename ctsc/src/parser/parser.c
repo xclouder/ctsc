@@ -831,6 +831,8 @@ static CtscNode* parse_call_or_property_rest(Parser* p, CtscNode* left) {
             expect(p, CTSC_SK_CloseParenToken);
             CtscNode* call = ctsc_node_new(p->arena, CTSC_SK_CallExpression, fs, end);
             call->data.callExpression.expression = left;
+            call->data.callExpression.has_type_arguments = false;
+            ctsc_node_array_init(&call->data.callExpression.type_arguments);
             call->data.callExpression.arguments = args;
             left = call;
             continue;
@@ -893,8 +895,8 @@ static CtscNode* parse_call_or_property_rest(Parser* p, CtscNode* left) {
         if (cur(p) == CTSC_SK_LessThanToken) {
             CtscScanner saved = p->scanner;
             size_t saved_diag_count = p->diagnostics->count;
-            CtscNodeArray discard; ctsc_node_array_init(&discard);
-            bool ok = try_parse_type_arguments_in_expression_capturing(p, &discard);
+            CtscNodeArray type_args; ctsc_node_array_init(&type_args);
+            bool ok = try_parse_type_arguments_in_expression_capturing(p, &type_args);
             if (ok && cur(p) == CTSC_SK_OpenParenToken) {
                 /* Success: consume the argument list as a CallExpression. */
                 int fs = left->pos;
@@ -912,6 +914,8 @@ static CtscNode* parse_call_or_property_rest(Parser* p, CtscNode* left) {
                 expect(p, CTSC_SK_CloseParenToken);
                 CtscNode* call = ctsc_node_new(p->arena, CTSC_SK_CallExpression, fs, end);
                 call->data.callExpression.expression = left;
+                call->data.callExpression.has_type_arguments = true;
+                call->data.callExpression.type_arguments = type_args;
                 call->data.callExpression.arguments = args;
                 left = call;
                 continue;

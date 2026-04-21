@@ -136,6 +136,53 @@ static void bind_node(CtscBindResult* r, CtscArena* a,
             }
             break;
         }
+        case CTSC_SK_MethodDeclaration: {
+            /* Mirrors binder.ts bindMethodDeclaration / bindFunctionLikeDeclaration
+             * (~3720+): method is a function-like container; parameters live in its
+             * locals (same Block/body rule as FunctionDeclaration). */
+            CtscScope* m_scope = scope_new(a, node);
+            scopes_push(r, a, m_scope);
+            const CtscMethodDeclarationData* md = &node->data.methodDeclaration;
+            const CtscNodeArray* params = &md->parameters;
+            for (size_t i = 0; i < params->len; ++i) {
+                bind_node(r, a, m_scope, m_scope, params->items[i]);
+            }
+            const CtscNode* body = md->body;
+            if (body) {
+                if (body->kind == CTSC_SK_Block) {
+                    bind_children(r, a, m_scope, m_scope, &body->data.block.statements);
+                } else {
+                    bind_node(r, a, m_scope, m_scope, body);
+                }
+            }
+            break;
+        }
+        case CTSC_SK_FunctionExpression: {
+            /*
+             * Mirrors bindFunctionExpression (binder.ts ~3715): container with
+             * parameter locals. A named function expression's binding identifier
+             * lives in the function's own locals (not the enclosing container).
+             */
+            const CtscFunctionDeclarationData* fd = &node->data.functionDeclaration;
+            CtscScope* fn_scope = scope_new(a, node);
+            scopes_push(r, a, fn_scope);
+            if (fd->name) {
+                declare_symbol_in_scope(a, fn_scope, fd->name, CTSC_SYMBOL_FLAG_Function, node);
+            }
+            const CtscNodeArray* params = &fd->parameters;
+            for (size_t i = 0; i < params->len; ++i) {
+                bind_node(r, a, fn_scope, fn_scope, params->items[i]);
+            }
+            const CtscNode* body = fd->body;
+            if (body) {
+                if (body->kind == CTSC_SK_Block) {
+                    bind_children(r, a, fn_scope, fn_scope, &body->data.block.statements);
+                } else {
+                    bind_node(r, a, fn_scope, fn_scope, body);
+                }
+            }
+            break;
+        }
         case CTSC_SK_Parameter: {
             /* Mirrors binder.ts bindParameter (~3684): identifier-named
              * parameters become SymbolFlags.FunctionScopedVariable in the
@@ -185,11 +232,13 @@ static void bind_node(CtscBindResult* r, CtscArena* a,
         case CTSC_SK_ClassDeclaration: {
             /* Mirrors binder.ts bindClassDeclaration (~3720): class name is a
              * BlockLike / container-local value symbol (script top-level uses
-             * the SourceFile as container). */
+             * the SourceFile as container). Members are bound for locals
+             * (method parameters, etc.) like bindChildren on the class body. */
             const CtscNode* name = node->data.classDeclaration.name;
             if (name) {
                 declare_symbol_in_scope(a, container_scope, name, CTSC_SYMBOL_FLAG_Class, node);
             }
+            bind_children(r, a, container_scope, block_scope, &node->data.classDeclaration.members);
             break;
         }
         case CTSC_SK_InterfaceDeclaration: {
