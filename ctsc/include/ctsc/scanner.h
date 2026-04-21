@@ -254,6 +254,11 @@ typedef enum {
     CTSC_SK_CatchClause,
     /* Mirrors ts.SyntaxKind.LabeledStatement (parser.ts parseExpressionOrLabeledStatement ~7123). */
     CTSC_SK_LabeledStatement,
+    /* Mirrors ts.SyntaxKind.TypeQuery (types.ts ~254 / parser.ts parseTypeQuery ~3946):
+     * `typeof E` in a type position, where E is an EntityName. ctsc currently
+     * supports only the Identifier form (single-name); dotted exprName and
+     * type arguments are not yet modelled — fixtures will add them. */
+    CTSC_SK_TypeQuery,
 
     CTSC_SK__COUNT
 } CtscSyntaxKind;

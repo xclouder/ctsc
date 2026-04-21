@@ -3050,6 +3050,51 @@ static CtscNode* parse_type_in_annotation_position(Parser* p, bool allow_multili
         tl->end = cur_full_start(p);
         return tl;
     }
+    /*
+     * Mirrors upstream/TypeScript/src/compiler/parser.ts parseNonArrayType
+     * (~4641) dispatching to parseTypeQuery (~3946), which consumes the
+     * `typeof` keyword, parses an EntityName (allowReservedWords=true) as the
+     * exprName, and attaches optional type arguments when no preceding line
+     * break is present.
+     *
+     * ctsc currently models only the single-Identifier form of exprName. If
+     * the identifier is followed by `.` (dotted QualifiedName) or `<` (type
+     * arguments) we roll back and defer to the generic stop-set fallback
+     * scan below, so fixtures like `var v: typeof A.` / `var v: typeof A.B`
+     * / `var v: typeof A<B>` (parser/from-upstream/107_parserTypeQuery3..8)
+     * keep their previous VariableDeclaration.end positions while the new
+     * typeof_query/* checker fixtures all hit the structured TypeQuery path.
+     *
+     * The node carries the Identifier in the shared CtscTypeReferenceData
+     * slot so forEachChild still visits it via the TypeReference-shaped
+     * emitter in ast_json.c.
+     */
+    if (cur(p) == CTSC_SK_TypeOfKeyword) {
+        CtscScanner saved = p->scanner;
+        size_t saved_diag_count = p->diagnostics->count;
+        int fs = cur_full_start(p);
+        advance(p); /* typeof */
+        CtscNode* entity_name = NULL;
+        if (cur(p) == CTSC_SK_Identifier) {
+            entity_name = make_identifier_from_current(p);
+        }
+        /* Only commit to the structured TypeQuery node for the simple form
+         * (no `.` / `<` after the exprName). For more complex shapes we
+         * fall through; the fallback scan preserves the legacy end-position
+         * behaviour that upstream-derived parser fixtures were baselined on. */
+        CtscSyntaxKind after = cur(p);
+        if (entity_name != NULL && after != CTSC_SK_DotToken && after != CTSC_SK_LessThanToken) {
+            consume_postfix_type_operators(p);
+            int end = cur_full_start(p);
+            CtscNode* tq = ctsc_node_new(p->arena, CTSC_SK_TypeQuery, fs, end);
+            tq->data.typeReference.typeName = entity_name;
+            tq->data.typeReference.has_type_arguments = false;
+            ctsc_node_array_init(&tq->data.typeReference.type_arguments);
+            return tq;
+        }
+        p->scanner = saved;
+        ctsc_diag_truncate(p->diagnostics, saved_diag_count);
+    }
     /* Mirrors upstream/TypeScript/src/compiler/parser.ts parseNonArrayType (~4629):
      *     case SyntaxKind.VoidKeyword:
      *         return parseTokenNode<TypeNode>();

@@ -113,6 +113,26 @@ CtscType* ctsc_type_enum_member_literal(CtscTypeRegistry* reg, const uint16_t* e
     return t;
 }
 
+/*
+ * Anonymous function type (checker.ts getTypeOfFuncClassEnumModule /
+ * createAnonymousType for a function symbol; typeToString emits the single
+ * call signature as `(params) => ret`). The signature string is
+ * pre-formatted by the caller via emit_function_signature_string because
+ * the M4.0 type model does not yet carry structural signature data.
+ */
+CtscType* ctsc_type_function(CtscTypeRegistry* reg, const char* signature_text, size_t signature_text_len,
+                             const void* decl) {
+    CtscType* t = ctsc_type_new(reg, CTSC_TYPE_FUNCTION);
+    if (signature_text && signature_text_len > 0) {
+        char* slot = (char*)ctsc_arena_alloc(reg->arena, signature_text_len);
+        memcpy(slot, signature_text, signature_text_len);
+        t->function_signature_text = slot;
+        t->function_signature_text_len = signature_text_len;
+    }
+    t->function_decl = decl;
+    return t;
+}
+
 CtscType* ctsc_type_reference_with_type_args(CtscTypeRegistry* reg, const uint16_t* name, size_t name_len,
                                                CtscType** args, size_t arg_count) {
     CtscType* t = ctsc_type_new(reg, CTSC_TYPE_REFERENCE);
@@ -462,6 +482,18 @@ void ctsc_type_to_string(const CtscType* t, CtscBuffer* out) {
             append_utf16_ascii_identifier_prop_name(out, t->enum_parent_name, t->enum_parent_name_len);
             ctsc_buf_append_char(out, '.');
             append_utf16_ascii_identifier_prop_name(out, t->enum_member_name, t->enum_member_name_len);
+            return;
+        case CTSC_TYPE_FUNCTION:
+            /*
+             * Pre-formatted call signature string. Mirrors tsc's typeToString
+             * on an anonymous object type with a single call signature
+             * (checker.ts signatureToString ~7500+; emits `(p: T) => R`).
+             */
+            if (t->function_signature_text && t->function_signature_text_len > 0) {
+                ctsc_buf_append(out, t->function_signature_text, t->function_signature_text_len);
+            } else {
+                ctsc_buf_append_cstr(out, "() => any");
+            }
             return;
         default:
             ctsc_buf_append_cstr(out, "any");

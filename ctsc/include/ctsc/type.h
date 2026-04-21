@@ -97,7 +97,18 @@ typedef enum {
      */
     CTSC_TYPE_ENUM_MEMBER_LITERAL,
 
-    /* Reserved for M4.1+ (kept here so switch tables compile without churn). */
+    /*
+     * Anonymous function type with a single call signature.
+     *
+     * Built for `typeof fn` on a FunctionDeclaration symbol (checker.ts
+     * getTypeOfSymbol → getTypeOfFuncClassEnumModule → createAnonymousType
+     * with resolved call signatures; getTypeFromTypeQueryNode ~17410 flows
+     * this type through `type X = typeof fn`). M4.0 stores a pre-formatted
+     * signature string (e.g. `"(n: number) => number"`) + an optional
+     * opaque pointer back to the FunctionDeclaration node so call
+     * expressions on a value of this type can recover the return type
+     * (checker.ts getReturnTypeOfSignature path).
+     */
     CTSC_TYPE_FUNCTION
 } CtscTypeKind;
 
@@ -197,6 +208,25 @@ struct CtscType {
     size_t          enum_parent_name_len;
     const uint16_t* enum_member_name;
     size_t          enum_member_name_len;
+
+    /*
+     * CTSC_TYPE_FUNCTION only.
+     *
+     * `function_signature_text` is the pre-formatted UTF-8 signature string
+     * (e.g. "(n: number) => number"), used by ctsc_type_to_string so the
+     * types-channel dump reproduces tsc's typeToString output. The text
+     * must live in an arena that outlives the type (ctsc_type_function
+     * copies the caller's bytes into `reg->arena`).
+     *
+     * `function_decl` is an opaque pointer to the source FunctionDeclaration
+     * node — declared `const void*` to keep this header decoupled from the
+     * AST header. Call-expression handling in checker.c casts it back to
+     * `const CtscNode*` to reach the parameters / return annotation so
+     * `const r = f(1)` can read `f`'s return type.
+     */
+    const char* function_signature_text;
+    size_t      function_signature_text_len;
+    const void* function_decl;
 };
 
 struct CtscArena;
@@ -248,6 +278,17 @@ CtscType* ctsc_type_enum_value(CtscTypeRegistry* reg, const uint16_t* name, size
 /* Enum member literal type `E.M` (checker.ts EnumLiteralType). */
 CtscType* ctsc_type_enum_member_literal(CtscTypeRegistry* reg, const uint16_t* enum_name, size_t enum_name_len,
                                         const uint16_t* member_name, size_t member_name_len);
+
+/*
+ * Anonymous function type with one call signature.
+ *
+ * `signature_text` bytes (UTF-8) are copied into `reg->arena` so the caller
+ * may free its local buffer after the call; `signature_text_len` counts
+ * bytes (no trailing NUL required). `decl` is an opaque pointer to the
+ * FunctionDeclaration node and is stored verbatim (not owned).
+ */
+CtscType* ctsc_type_function(CtscTypeRegistry* reg, const char* signature_text, size_t signature_text_len,
+                             const void* decl);
 
 /*
  * Same as ctsc_type_reference but with type arguments (e.g. Box<number>).

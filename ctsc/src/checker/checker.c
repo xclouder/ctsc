@@ -1600,6 +1600,11 @@ static CtscType* type_from_type_literal_span(CtscTypeRegistry* reg, const uint16
 static CtscType* instantiate_type_params_in_type(Walk* w, CtscTypeRegistry* reg, CtscType* t,
                                                  const CtscNodeArray* type_params, CtscType** type_arg_values,
                                                  size_t type_arg_count, unsigned depth);
+/* Forward declaration for the TypeQuery branch in type_of_type_node
+ * (checker.ts getTypeFromTypeQueryNode ~17410 → checkExpressionWithTypeArguments
+ * → value-symbol type). Defined further down alongside the expression-level
+ * symbol lookups. */
+static CtscType* type_of_symbol_value(Walk* w, CtscSymbol* sym);
 
 /*
  * Maps TypeNode → CtscType for the M4.0 subset. Unknown types collapse to
@@ -1652,10 +1657,26 @@ static CtscType* type_of_type_node(Walk* w, CtscTypeRegistry* reg, const uint16_
                             if (alias_ty) {
                                 CtscType* expanded =
                                     type_of_type_node(w, reg, src, src_len, alias_ty, alias_depth + 1);
-                                if (expanded
+                                /*
+                                 * Only tag the alias name on a freshly-created
+                                 * structural type. A TypeQuery alias body
+                                 * (`type O = typeof v`) forwards to an existing
+                                 * value's cached type; mirror tsc by leaving its
+                                 * aliasSymbol unset (checker.ts
+                                 * getDeclaredTypeOfTypeAlias ~13500 only returns
+                                 * getTypeFromTypeNode(typeNode), and
+                                 * getTypeFromTypeQueryNode ~17410 does not call
+                                 * getAliasSymbolForTypeNode on the result) so
+                                 * typeToString expands it in situ and the shared
+                                 * cached object type is not mutated.
+                                 */
+                                bool can_tag_alias =
+                                    expanded
+                                    && alias_ty->kind != CTSC_SK_TypeQuery
                                     && (expanded->kind == CTSC_TYPE_UNION
                                         || expanded->kind == CTSC_TYPE_INTERSECTION
-                                        || expanded->kind == CTSC_TYPE_OBJECT_LITERAL)) {
+                                        || expanded->kind == CTSC_TYPE_OBJECT_LITERAL);
+                                if (can_tag_alias) {
                                     expanded->alias_symbol_name = id->text;
                                     expanded->alias_symbol_name_len = id->text_len;
                                 }
@@ -1764,6 +1785,28 @@ static CtscType* type_of_type_node(Walk* w, CtscTypeRegistry* reg, const uint16_
                 return reg->t_any;
             }
             return type_from_annotation_fallback_span(reg, src, src_len, type_node->pos, type_node->end);
+        }
+        case CTSC_SK_TypeQuery: {
+            /*
+             * Mirrors upstream/TypeScript/src/compiler/checker.ts
+             * getTypeFromTypeQueryNode (~17410):
+             *     const type = checkExpressionWithTypeArguments(node);
+             *     links.resolvedType = getRegularTypeOfLiteralType(getWidenedType(type));
+             * The exprName is looked up in the *value* symbol space; for
+             * `const x = 42; type X = typeof x` this yields the literal type
+             * `42` (a const binding preserves its literal type through
+             * variable_declaration_type so `getWidenedType` is a no-op for
+             * non-fresh literals). ctsc currently models only the Identifier
+             * form of the exprName — parse_type_in_annotation_position stores
+             * it in typeReference.typeName.
+             */
+            const CtscTypeReferenceData* tr = &type_node->data.typeReference;
+            if (w && tr->typeName && tr->typeName->kind == CTSC_SK_Identifier) {
+                const CtscIdentifierData* id = &tr->typeName->data.identifier;
+                CtscSymbol* sym = resolve_name(&w->scopes, id->text, id->text_len);
+                if (sym) return type_of_symbol_value(w, sym);
+            }
+            return reg->t_any;
         }
         case CTSC_SK_TypeLiteral: {
             /* No TypeElement children in the AST yet — recover from source span. */
@@ -1976,42 +2019,56 @@ static CtscType* type_of_new_expression(Walk* w, CtscTypeRegistry* reg, const Ct
     const CtscNewExpressionData* ne = &expr->data.newExpression;
     const CtscNode* callee = ne->expression;
     if (!callee || !w) return reg->t_any;
-    if (callee->kind != CTSC_SK_Identifier) return reg->t_any;
-    const uint16_t* nm = callee->data.identifier.text;
-    size_t nl = callee->data.identifier.text_len;
-    CtscSymbol* sym = resolve_name(&w->scopes, nm, nl);
-    if (!sym) return reg->t_any;
-    for (size_t i = 0; i < sym->decls_len; ++i) {
-        CtscNode* d = sym->decls[i];
-        if (d && d->kind == CTSC_SK_ClassDeclaration) {
-            const CtscClassDeclarationData* cd = &d->data.classDeclaration;
-            const CtscNode* cname = cd->name;
-            if (cname && cname->kind == CTSC_SK_Identifier) {
-                const CtscIdentifierData* id = &cname->data.identifier;
-                if (ne->has_type_arguments && ne->type_arguments.len > 0
-                    && cd->type_parameters.len == ne->type_arguments.len
-                    && cd->type_parameters.len <= 32) {
-                    CtscType* args_buf[32];
-                    size_t na = ne->type_arguments.len;
-                    for (size_t ai = 0; ai < na; ++ai) {
-                        CtscNode* tnode = ne->type_arguments.items[ai];
-                        args_buf[ai] =
-                            type_of_type_node(w, reg, w->source_utf16, w->source_utf16_len, tnode, 0);
-                        if (!args_buf[ai]) args_buf[ai] = reg->t_any;
+    if (callee->kind == CTSC_SK_Identifier) {
+        const uint16_t* nm = callee->data.identifier.text;
+        size_t nl = callee->data.identifier.text_len;
+        CtscSymbol* sym = resolve_name(&w->scopes, nm, nl);
+        if (sym) {
+            for (size_t i = 0; i < sym->decls_len; ++i) {
+                CtscNode* d = sym->decls[i];
+                if (d && d->kind == CTSC_SK_ClassDeclaration) {
+                    const CtscClassDeclarationData* cd = &d->data.classDeclaration;
+                    const CtscNode* cname = cd->name;
+                    if (cname && cname->kind == CTSC_SK_Identifier) {
+                        const CtscIdentifierData* id = &cname->data.identifier;
+                        if (ne->has_type_arguments && ne->type_arguments.len > 0
+                            && cd->type_parameters.len == ne->type_arguments.len
+                            && cd->type_parameters.len <= 32) {
+                            CtscType* args_buf[32];
+                            size_t na = ne->type_arguments.len;
+                            for (size_t ai = 0; ai < na; ++ai) {
+                                CtscNode* tnode = ne->type_arguments.items[ai];
+                                args_buf[ai] =
+                                    type_of_type_node(w, reg, w->source_utf16, w->source_utf16_len, tnode, 0);
+                                if (!args_buf[ai]) args_buf[ai] = reg->t_any;
+                            }
+                            CtscType** slot = (CtscType**)ctsc_arena_alloc(w->arena, na * sizeof(CtscType*));
+                            memcpy(slot, args_buf, na * sizeof(CtscType*));
+                            return ctsc_type_reference_with_type_args(reg, id->text, id->text_len, slot, na);
+                        }
+                        if (cd->type_parameters.len > 0 && cd->type_parameters.len <= 32) {
+                            CtscType* inferred_inst =
+                                inferred_generic_class_instance_from_new(w, reg, d, id, ne);
+                            if (inferred_inst) return inferred_inst;
+                        }
+                        return ctsc_type_reference(reg, id->text, id->text_len);
                     }
-                    CtscType** slot = (CtscType**)ctsc_arena_alloc(w->arena, na * sizeof(CtscType*));
-                    memcpy(slot, args_buf, na * sizeof(CtscType*));
-                    return ctsc_type_reference_with_type_args(reg, id->text, id->text_len, slot, na);
+                    break;
                 }
-                if (cd->type_parameters.len > 0 && cd->type_parameters.len <= 32) {
-                    CtscType* inferred_inst =
-                        inferred_generic_class_instance_from_new(w, reg, d, id, ne);
-                    if (inferred_inst) return inferred_inst;
-                }
-                return ctsc_type_reference(reg, id->text, id->text_len);
             }
-            break;
         }
+    }
+    /*
+     * Callee is not a direct class identifier (e.g. `new Ctor()` where
+     * `Ctor: typeof Box`, or `new (expr)()`). Mirror checker.ts
+     * resolveNewExpression (~37131): get the callee's type and take the
+     * return type of its construct signature. For a class constructor
+     * type (typeToString `typeof C`), the construct signature returns the
+     * class instance type `C`.
+     */
+    CtscType* callee_t = type_of_expression(w, reg, callee);
+    if (callee_t && callee_t->kind == CTSC_TYPE_CLASS_CONSTRUCTOR) {
+        return ctsc_type_reference(reg, callee_t->text, callee_t->text_len);
     }
     return reg->t_any;
 }
@@ -2234,6 +2291,26 @@ static CtscType* type_of_expression(Walk* w, CtscTypeRegistry* reg, const CtscNo
                             CtscType* gen = generic_call_instantiated_return_type(w, reg, fn_decl, ce);
                             if (gen) return gen;
                             CtscType* rt = return_type_of_function_declaration(w, fn_decl);
+                            if (rt) return rt;
+                        }
+                        /*
+                         * Callee resolves to a value whose type is a function
+                         * type built by typeof-query flow (e.g.
+                         * `declare const f: Inc;` where `type Inc = typeof inc`).
+                         * The variable symbol itself is not a FunctionDeclaration,
+                         * so the branches above miss it; recover the call
+                         * signature from the CTSC_TYPE_FUNCTION stored decl.
+                         * Mirrors checker.ts getSignaturesOfType on an
+                         * anonymous function object type (~37810+) which
+                         * yields the same Signature that getReturnTypeOfSignature
+                         * reads to produce the call expression's type.
+                         */
+                        CtscType* ct = type_of_symbol_value(w, sym);
+                        if (ct && ct->kind == CTSC_TYPE_FUNCTION && ct->function_decl) {
+                            const CtscNode* stored = (const CtscNode*)ct->function_decl;
+                            CtscType* gen = generic_call_instantiated_return_type(w, reg, stored, ce);
+                            if (gen) return gen;
+                            CtscType* rt = return_type_of_function_declaration(w, stored);
                             if (rt) return rt;
                         }
                     }
@@ -3846,6 +3923,7 @@ static void emit_function_signature_string(CtscBuffer* out, const CtscNodeArray*
                                            const uint16_t* src, size_t src_len);
 static void push_entry_with_string(Walk* w, const CtscNode* decl, const CtscNode* name_id, const char* type_str,
                                    size_t type_str_len);
+static size_t symbol_function_declaration_count(CtscSymbol* sym);
 
 static void walk_children_nodearray(Walk* w, const CtscNodeArray* arr) {
     for (size_t i = 0; i < arr->len; ++i) visit(w, arr->items[i]);
@@ -4169,6 +4247,36 @@ static CtscType* param_type(Walk* w, const CtscNode* param) {
     return w->r->registry.t_any;
 }
 
+/*
+ * Build an anonymous function type (CTSC_TYPE_FUNCTION) representing the
+ * single call signature of a FunctionDeclaration. Mirrors checker.ts
+ * getTypeOfFuncClassEnumModule → createAnonymousType carrying one resolved
+ * signature (~17300+); typeToString on that anonymous type prints
+ * signatureToString on the single signature, i.e. `(p: T) => R`
+ * (signatureToString ~7500+).
+ *
+ * We do not model signatures structurally yet, so the signature is
+ * pre-formatted as a UTF-8 string via emit_function_signature_string and
+ * stashed on the CtscType. The FunctionDeclaration node is kept on the type
+ * so a subsequent CallExpression on a value of this type can look up the
+ * return annotation (checker.ts getReturnTypeOfSignature ~37810-37878).
+ */
+static CtscType* function_type_from_decl(Walk* w, const CtscNode* fn) {
+    if (!w || !fn || fn->kind != CTSC_SK_FunctionDeclaration) return w->r->registry.t_any;
+    const CtscFunctionDeclarationData* f = &fn->data.functionDeclaration;
+    CtscType* inferred_ret = NULL;
+    if (!f->type) {
+        inferred_ret = infer_return_type_for_function_body(w, &w->r->registry, w->arena, f->body, fn);
+    }
+    CtscBuffer sig;
+    ctsc_buf_init(&sig);
+    emit_function_signature_string(&sig, &f->type_parameters, &f->parameters, &w->r->registry, f->type, inferred_ret,
+                                   w->source_utf16, w->source_utf16_len);
+    CtscType* t = ctsc_type_function(&w->r->registry, sig.data, sig.len, fn);
+    ctsc_buf_free(&sig);
+    return t;
+}
+
 static CtscType* type_of_symbol_value(Walk* w, CtscSymbol* sym) {
     if (!sym || sym->decls_len == 0) return w->r->registry.t_any;
     for (size_t i = 0; i < sym->decls_len; ++i) {
@@ -4183,6 +4291,21 @@ static CtscType* type_of_symbol_value(Walk* w, CtscSymbol* sym) {
             }
             case CTSC_SK_Parameter:
                 return param_type(w, d);
+            case CTSC_SK_FunctionDeclaration:
+                /*
+                 * `typeof fn` on a FunctionDeclaration symbol: the type is
+                 * the anonymous object type with one call signature per
+                 * overload. M4.0 only handles the single-signature case;
+                 * overloaded functions still fall through to the decls
+                 * loop, where a later iteration may produce a more specific
+                 * type, or the final `any` fallback keeps existing
+                 * behaviour (checker.ts getTypeOfFuncClassEnumModule
+                 * ~17300+ collects signatures from every declaration).
+                 */
+                if (symbol_function_declaration_count(sym) == 1) {
+                    return function_type_from_decl(w, d);
+                }
+                break;
             case CTSC_SK_ClassDeclaration: {
                 const CtscNode* cname = d->data.classDeclaration.name;
                 if (cname && cname->kind == CTSC_SK_Identifier) {
