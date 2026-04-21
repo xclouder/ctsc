@@ -6226,6 +6226,29 @@ static CtscNode* parse_statement(Parser* p) {
                     }
                     return fn;
                 }
+                /*
+                 * Mirrors parser.ts parseDeclaration (~7467) +
+                 * parseModuleOrNamespaceDeclaration (~8303-8338): `declare
+                 * namespace N {...}` / `declare module "x" {...}` are ambient
+                 * module declarations. ts.forEachChild on the resulting
+                 * ModuleDeclaration does not descend into modifiers, so the
+                 * oracle AST still sees `[Identifier, ModuleBlock]`; we elide
+                 * the `declare` keyword from the tree and position the node
+                 * at the pre-modifier getNodePos (finishNode ~2600). No
+                 * has_declare flag is needed on CtscModuleDeclarationData
+                 * because the emitter already drops every ModuleDeclaration
+                 * (see transformers/ts.ts visitTypeScript ~643 for namespaces
+                 * whose members are all type-only).
+                 */
+                if (cur(p) == CTSC_SK_ModuleKeyword || cur(p) == CTSC_SK_NamespaceKeyword) {
+                    if (next_token_is_identifier_or_string_literal_on_same_line(p)) {
+                        CtscNode* mod = parse_module_declaration(p);
+                        if (mod && mod->kind == CTSC_SK_ModuleDeclaration) {
+                            mod->pos = fs;
+                        }
+                        return mod;
+                    }
+                }
             }
             /* Not a declaration we can parse; fall back to expression-statement
              * treatment of `declare` as a contextual identifier. */

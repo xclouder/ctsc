@@ -1416,6 +1416,25 @@ static CtscType* type_of_type_node(Walk* w, CtscTypeRegistry* reg, const uint16_
                         }
                     }
                 }
+                /*
+                 * Preserve type arguments for generic class / interface references
+                 * (checker.ts getTypeFromClassOrInterfaceReference ~16990:
+                 * createTypeReference(type, typeArguments)). Without this, a
+                 * `Box<number>` annotation would stringify back as just `Box`
+                 * and property access would never substitute type parameters.
+                 */
+                if (tr->has_type_arguments && tr->type_arguments.len > 0 && tr->type_arguments.len <= 32) {
+                    size_t na = tr->type_arguments.len;
+                    CtscType* args_buf[32];
+                    for (size_t ai = 0; ai < na; ++ai) {
+                        CtscNode* tnode = tr->type_arguments.items[ai];
+                        args_buf[ai] = type_of_type_node(w, reg, src, src_len, tnode, alias_depth + 1);
+                        if (!args_buf[ai]) args_buf[ai] = reg->t_any;
+                    }
+                    CtscType** slot = (CtscType**)ctsc_arena_alloc(reg->arena, na * sizeof(CtscType*));
+                    memcpy(slot, args_buf, na * sizeof(CtscType*));
+                    return ctsc_type_reference_with_type_args(reg, id->text, id->text_len, slot, na);
+                }
                 return ctsc_type_reference(reg, id->text, id->text_len);
             }
             if (tr->typeName) {
@@ -1442,6 +1461,11 @@ static CtscType* type_of_expression(Walk* w, CtscTypeRegistry* reg, const CtscNo
 static CtscType* type_of_object_literal_expression(Walk* w, CtscTypeRegistry* reg, const CtscNode* expr);
 static CtscType* type_of_property_of_object_type(Walk* w, CtscTypeRegistry* reg, CtscType* object_type,
                                                  const uint16_t* prop_name, size_t prop_len);
+static CtscType* type_of_namespace_member(Walk* w, CtscTypeRegistry* reg, CtscSymbol* ns_sym,
+                                                      const uint16_t* prop_name, size_t prop_len);
+static const CtscNode* function_declaration_in_namespace(CtscSymbol* ns_sym,
+                                                         const uint16_t* prop_name, size_t prop_len);
+static bool is_const_decl_list(const CtscNode* list);
 static CtscType* variable_declaration_type(Walk* w, const CtscNode* decl, bool is_const);
 static CtscType* class_property_declaration_type(Walk* w, const CtscNode* decl);
 static CtscType* property_type_from_class_declaration(Walk* w, const CtscNode* class_node,
@@ -1809,6 +1833,33 @@ static CtscType* type_of_expression(Walk* w, CtscTypeRegistry* reg, const CtscNo
             const CtscNode* callee = ce->expression;
             if (callee && callee->kind == CTSC_SK_PropertyAccessExpression && w) {
                 const CtscPropertyAccessExpressionData* pa = &callee->data.propertyAccessExpression;
+                /*
+                 * Namespace-qualified call `N.fn(args)` (checker.ts
+                 * resolveEntityName ~34822-34842 → getResolvedSignature on the
+                 * function's symbol): when the LHS identifier resolves to a
+                 * ValueModule / NamespaceModule, look up the declared function
+                 * in the module body and return its return type. Mirrors the
+                 * PropertyAccessExpression namespace branch below (~1867).
+                 */
+                if (pa->expression && pa->expression->kind == CTSC_SK_Identifier && pa->name
+                    && pa->name->kind == CTSC_SK_Identifier) {
+                    const CtscIdentifierData* lhs = &pa->expression->data.identifier;
+                    CtscSymbol* lhs_sym = resolve_name(&w->scopes, lhs->text, lhs->text_len);
+                    if (lhs_sym
+                        && (lhs_sym->flags & (CTSC_SYMBOL_FLAG_ValueModule
+                                              | CTSC_SYMBOL_FLAG_NamespaceModule))) {
+                        const CtscIdentifierData* mid = &pa->name->data.identifier;
+                        const CtscNode* fn_decl =
+                            function_declaration_in_namespace(lhs_sym, mid->text, mid->text_len);
+                        if (fn_decl) {
+                            CtscType* gen = generic_call_instantiated_return_type(w, reg, fn_decl, ce);
+                            if (gen) return gen;
+                            CtscType* rt = return_type_of_function_declaration(w, fn_decl);
+                            if (rt) return rt;
+                            return reg->t_any;
+                        }
+                    }
+                }
                 CtscType* obj_t = type_of_expression(w, reg, pa->expression);
                 bool static_member = (obj_t && obj_t->kind == CTSC_TYPE_CLASS_CONSTRUCTOR);
                 if (obj_t && (obj_t->kind == CTSC_TYPE_REFERENCE || static_member) && pa->name
@@ -1850,9 +1901,28 @@ static CtscType* type_of_expression(Walk* w, CtscTypeRegistry* reg, const CtscNo
         }
         case CTSC_SK_PropertyAccessExpression: {
             const CtscPropertyAccessExpressionData* pa = &expr->data.propertyAccessExpression;
-            CtscType* obj_t = type_of_expression(w, reg, pa->expression);
             if (!pa->name || pa->name->kind != CTSC_SK_Identifier) return reg->t_any;
             const CtscIdentifierData* id = &pa->name->data.identifier;
+            /*
+             * Namespace qualified access `N.member` (checker.ts
+             * checkQualifiedName / resolveEntityName ~34822-34842): when the
+             * LHS is an Identifier that resolves to a ModuleDeclaration
+             * (SymbolFlags.NamespaceModule), look the member up directly in
+             * the module body's statements. This short-circuits the object-
+             * type path because a namespace is not represented as a
+             * CtscType and its members aren't on a CtscType.object_properties.
+             */
+            if (w && pa->expression && pa->expression->kind == CTSC_SK_Identifier) {
+                const CtscIdentifierData* lhs = &pa->expression->data.identifier;
+                CtscSymbol* lhs_sym = resolve_name(&w->scopes, lhs->text, lhs->text_len);
+                if (lhs_sym
+                    && (lhs_sym->flags & (CTSC_SYMBOL_FLAG_ValueModule
+                                          | CTSC_SYMBOL_FLAG_NamespaceModule))) {
+                    CtscType* mt = type_of_namespace_member(w, reg, lhs_sym, id->text, id->text_len);
+                    if (mt) return mt;
+                }
+            }
+            CtscType* obj_t = type_of_expression(w, reg, pa->expression);
             return type_of_property_of_object_type(w, reg, obj_t, id->text, id->text_len);
         }
         case CTSC_SK_ElementAccessExpression: {
@@ -2015,7 +2085,19 @@ static CtscType* type_of_property_of_object_type(Walk* w, CtscTypeRegistry* reg,
                     CtscType* lit = resolve_type_reference_to_object_literal(w, reg, object_type);
                     if (lit) {
                         CtscType* pt = type_of_property_of_object_type(w, reg, lit, prop_name, prop_len);
-                        if (pt) return pt;
+                        if (pt) {
+                            /*
+                             * Substitute the interface's local type parameters with the
+                             * reference's type arguments (checker.ts
+                             * getTypeFromClassOrInterfaceReference ~16990 +
+                             * getPropertyTypeForIndexType ~19262 path on a generic
+                             * interface instance).
+                             */
+                            pt = maybe_instantiate_class_member_type(w, reg, d, pt,
+                                                                     object_type->reference_type_args,
+                                                                     object_type->reference_type_args_len);
+                            return pt;
+                        }
                     }
                 }
                 if (d && d->kind == CTSC_SK_ClassDeclaration) {
@@ -2048,6 +2130,100 @@ static CtscType* type_of_property_of_object_type(Walk* w, CtscTypeRegistry* reg,
         }
     }
     return reg->t_any;
+}
+
+/*
+ * Resolve `N.<prop>` by scanning the ModuleDeclaration body(s) attached to
+ * the namespace symbol. Mirrors checker.ts getSymbol on
+ * `symbol.exports` for a NamespaceModule (~2520-2560, resolveEntityName
+ * ~34822-34842); our M5.0 slice walks the AST directly because the binder
+ * does not yet maintain per-namespace export tables.
+ *
+ * Iterates each ModuleDeclaration declaration of the symbol, unwraps
+ * ModuleBlock bodies (or nested ModuleDeclaration bodies for dotted-name
+ * namespaces — currently not exercised here but cheap to support), and
+ * looks for a VariableDeclaration whose name matches `prop_name`. Returns
+ * the declared type (annotation preferred; widened initializer otherwise),
+ * or NULL when nothing matches so the caller can fall back.
+ */
+static CtscType* type_of_namespace_member(Walk* w, CtscTypeRegistry* reg, CtscSymbol* ns_sym,
+                                          const uint16_t* prop_name, size_t prop_len) {
+    if (!w || !reg || !ns_sym || !prop_name || prop_len == 0) return NULL;
+    for (size_t di = 0; di < ns_sym->decls_len; ++di) {
+        CtscNode* d = ns_sym->decls[di];
+        if (!d || d->kind != CTSC_SK_ModuleDeclaration) continue;
+        const CtscNode* body = d->data.moduleDeclaration.body;
+        /* Unwrap dotted-name namespaces (`namespace a.b {}` parses as nested
+         * ModuleDeclarations); stop at the innermost ModuleBlock. */
+        while (body && body->kind == CTSC_SK_ModuleDeclaration) {
+            body = body->data.moduleDeclaration.body;
+        }
+        if (!body || body->kind != CTSC_SK_ModuleBlock) continue;
+        const CtscNodeArray* stmts = &body->data.moduleBlock.statements;
+        for (size_t si = 0; si < stmts->len; ++si) {
+            const CtscNode* s = stmts->items[si];
+            if (!s) continue;
+            if (s->kind != CTSC_SK_VariableStatement) continue;
+            const CtscNode* list = s->data.variableStatement.declarationList;
+            if (!list || list->kind != CTSC_SK_VariableDeclarationList) continue;
+            bool is_const = is_const_decl_list(list);
+            const CtscNodeArray* vds = &list->data.variableDeclarationList.declarations;
+            for (size_t vi = 0; vi < vds->len; ++vi) {
+                const CtscNode* vd = vds->items[vi];
+                if (!vd || vd->kind != CTSC_SK_VariableDeclaration) continue;
+                const CtscNode* nm = vd->data.variableDeclaration.name;
+                if (!nm || nm->kind != CTSC_SK_Identifier) continue;
+                const CtscIdentifierData* nid = &nm->data.identifier;
+                if (nid->text_len != prop_len
+                    || memcmp(nid->text, prop_name, prop_len * sizeof(uint16_t)) != 0) {
+                    continue;
+                }
+                return variable_declaration_type(w, vd, is_const);
+            }
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Locate a `function <name>(...)` declaration inside a namespace body.
+ * Mirrors the namespace-member resolution path of checker.ts
+ * resolveEntityName (~34822-34842) / getSymbol on symbol.exports (~2520-2560)
+ * for the M5.0 slice: walks each ModuleDeclaration → ModuleBlock of
+ * `ns_sym`, descending through nested ModuleDeclarations (dotted-name
+ * namespaces), and returns the first FunctionDeclaration whose name
+ * matches. `declare function` inside the namespace counts.
+ *
+ * Used by callers (e.g. type_of_expression CallExpression branch) that
+ * need the signature's return type; namespaces aren't modeled as
+ * CtscTypes so we resolve via AST scan instead of a property lookup.
+ */
+static const CtscNode* function_declaration_in_namespace(CtscSymbol* ns_sym,
+                                                         const uint16_t* prop_name, size_t prop_len) {
+    if (!ns_sym || !prop_name || prop_len == 0) return NULL;
+    for (size_t di = 0; di < ns_sym->decls_len; ++di) {
+        CtscNode* d = ns_sym->decls[di];
+        if (!d || d->kind != CTSC_SK_ModuleDeclaration) continue;
+        const CtscNode* body = d->data.moduleDeclaration.body;
+        while (body && body->kind == CTSC_SK_ModuleDeclaration) {
+            body = body->data.moduleDeclaration.body;
+        }
+        if (!body || body->kind != CTSC_SK_ModuleBlock) continue;
+        const CtscNodeArray* stmts = &body->data.moduleBlock.statements;
+        for (size_t si = 0; si < stmts->len; ++si) {
+            const CtscNode* s = stmts->items[si];
+            if (!s || s->kind != CTSC_SK_FunctionDeclaration) continue;
+            const CtscNode* nm = s->data.functionDeclaration.name;
+            if (!nm || nm->kind != CTSC_SK_Identifier) continue;
+            const CtscIdentifierData* nid = &nm->data.identifier;
+            if (nid->text_len != prop_len
+                || memcmp(nid->text, prop_name, prop_len * sizeof(uint16_t)) != 0) {
+                continue;
+            }
+            return s;
+        }
+    }
+    return NULL;
 }
 
 /*
@@ -2164,7 +2340,11 @@ static CtscType* maybe_instantiate_class_member_type(Walk* w, CtscTypeRegistry* 
                                                      CtscType* member_type, CtscType** instance_args,
                                                      size_t instance_arg_count) {
     (void)w;
-    if (!class_node || class_node->kind != CTSC_SK_ClassDeclaration || !member_type) return member_type;
+    if (!class_node || !member_type) return member_type;
+    if (class_node->kind != CTSC_SK_ClassDeclaration
+        && class_node->kind != CTSC_SK_InterfaceDeclaration) {
+        return member_type;
+    }
     const CtscNodeArray* tps = &class_node->data.classDeclaration.type_parameters;
     if (!instance_args || instance_arg_count == 0 || tps->len != instance_arg_count) return member_type;
     return instantiate_type_params_in_type(w, reg, member_type, tps, instance_args, instance_arg_count, 0);
@@ -4455,6 +4635,28 @@ static void visit(Walk* w, const CtscNode* n) {
 
         case CTSC_SK_InterfaceDeclaration:
             push_property_signatures_from_interface_declaration(w, n);
+            return;
+
+        case CTSC_SK_ModuleDeclaration: {
+            /*
+             * Mirrors the oracle walk in harness/src/oracle-checker-types.ts:
+             * ts.forEachChild descends into every ModuleDeclaration body, so
+             * `declare namespace N { const x: number; }` emits an entry for
+             * `x` with type `number` from checker.ts
+             * getTypeOfVariableOrParameterOrPropertyWorker (~12537).
+             *
+             * Body is either a ModuleBlock (single-segment namespace) or a
+             * nested ModuleDeclaration (dotted-name: `namespace a.b {}`).
+             * We recurse through `visit` so nested modules also contribute
+             * entries.
+             */
+            const CtscNode* body = n->data.moduleDeclaration.body;
+            if (body) visit(w, body);
+            return;
+        }
+
+        case CTSC_SK_ModuleBlock:
+            walk_children_nodearray(w, &n->data.moduleBlock.statements);
             return;
 
         case CTSC_SK_TypeAliasDeclaration: {

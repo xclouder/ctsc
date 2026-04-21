@@ -1979,5 +1979,34 @@ int test_checker(void) {
         ctsc_arena_free(&a);
     }
 
+    /*
+     * `declare namespace N { const x: number; } const y = N.x;`
+     * (fixtures/checker/declare/11_declare_namespace_const.ts). The oracle
+     * walks the module body so both `x` (inside N) and `y` (top level) must
+     * appear in entries, each with type `number`. Mirrors
+     * upstream/TypeScript/src/compiler/checker.ts
+     * getTypeOfVariableOrParameterOrPropertyWorker (~12537) for the
+     * annotated `const x: number` and resolveEntityName (~34822) for `N.x`.
+     */
+    {
+        const char* src =
+            "// @checker: types\ndeclare namespace N {\n  const x: number;\n}\nconst y = N.x;\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 2);
+        if (cr->entries_len >= 2) {
+            EXPECT(cr->entries[0].name_len == 1 && cr->entries[0].name[0] == (uint16_t)'x');
+            EXPECT(cr->entries[0].type && cr->entries[0].type->kind == CTSC_TYPE_NUMBER);
+            EXPECT(cr->entries[1].name_len == 1 && cr->entries[1].name[0] == (uint16_t)'y');
+            EXPECT(cr->entries[1].type && cr->entries[1].type->kind == CTSC_TYPE_NUMBER);
+        }
+        ctsc_arena_free(&a);
+    }
+
     return failed;
 }

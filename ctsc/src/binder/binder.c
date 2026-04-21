@@ -322,6 +322,32 @@ static void bind_node(CtscBindResult* r, CtscArena* a,
             }
             break;
         }
+        case CTSC_SK_ModuleDeclaration: {
+            /*
+             * Mirrors binder.ts bindModuleDeclaration (~2352) /
+             * declareModuleSymbol (~2389) / getModuleInstanceState (~171): an
+             * instantiated `namespace N { ... }` or `declare namespace N { ... }`
+             * declares N as SymbolFlags.ValueModule in the enclosing container.
+             * tsc picks ValueModule vs NamespaceModule from
+             * getModuleInstanceState; for M5.0 we assume the "instantiated"
+             * default because every namespace in the current curriculum has a
+             * block body with value declarations (ValueModule matches the
+             * oracle output for fixtures/checker/declare/11_*).
+             *
+             * We deliberately do NOT recurse into the module body here: the
+             * checker's `type_of_namespace_member` walks the ModuleBlock's AST
+             * directly to resolve `N.member`, which keeps inner names out of
+             * the enclosing SourceFile locals (binder.ts createLocals ~1790
+             * would give the ModuleDeclaration its own SymbolTable for
+             * `exports`; we model that lazily via AST scan for now).
+             */
+            const CtscNode* name = node->data.moduleDeclaration.name;
+            if (name && name->kind == CTSC_SK_Identifier) {
+                declare_symbol_in_scope(a, container_scope, name,
+                                        CTSC_SYMBOL_FLAG_ValueModule, node);
+            }
+            break;
+        }
         case CTSC_SK_VariableStatement: {
             /* Mirrors binder.ts bindVariableDeclarationOrBindingElement (~3648):
              * each VariableDeclaration contributes a symbol. `let`/`const`
