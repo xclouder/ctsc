@@ -695,6 +695,13 @@ static bool split_type_annotation_element_list(const uint16_t* s, int inner_a, i
 /*
  * Tuple type node text `[T0, T1, ...]` recovered from a parser fallback span
  * (checker.ts getTypeFromArrayOrTupleTypeNode ~17824-17840).
+ *
+ * Accepts an optional leading `readonly` TypeOperator keyword
+ * (parser.ts parseTypeOperator ~4580-4595; checker.ts
+ * getArrayOrTupleTargetType ~17745-17752 sets TupleType.readonly when the
+ * TupleTypeNode's parent is a readonly TypeOperatorNode). When present,
+ * the resulting tuple carries `tuple_readonly = true` so typeToString can
+ * re-emit `readonly [T, U]`.
  */
 static CtscType* tuple_type_from_annotation_span(CtscTypeRegistry* reg, const uint16_t* s, size_t src_len, int a,
                                                 int b) {
@@ -702,6 +709,25 @@ static CtscType* tuple_type_from_annotation_span(CtscTypeRegistry* reg, const ui
     a = u16_span_trim_bounds(s, a, b, &te);
     b = te;
     if (!s || a < 0 || b < 0 || a > (int)src_len || b > (int)src_len || a >= b) return NULL;
+
+    bool is_readonly = false;
+    if (a + 8 < b) {
+        static const uint16_t kw[] = {(uint16_t)'r', (uint16_t)'e', (uint16_t)'a', (uint16_t)'d',
+                                      (uint16_t)'o', (uint16_t)'n', (uint16_t)'l', (uint16_t)'y'};
+        bool match = true;
+        for (int k = 0; k < 8; ++k) {
+            if (s[a + k] != kw[k]) { match = false; break; }
+        }
+        if (match && !u16_is_ident_part_ascii(s[a + 8])) {
+            int after = a + 8;
+            while (after < b && ctsc_is_ws_u16(s[after])) after++;
+            if (after < b && s[after] == (uint16_t)'[') {
+                is_readonly = true;
+                a = after;
+            }
+        }
+    }
+
     if (s[a] != (uint16_t)'[') return NULL;
 
     int depth = 0;
@@ -756,11 +782,117 @@ static CtscType* tuple_type_from_annotation_span(CtscTypeRegistry* reg, const ui
     if (!split_type_annotation_element_list(s, ia, ib, el_st, el_en, &nel, 32)) return NULL;
 
     CtscType* elems_storage[32];
+    uint8_t   elems_flags[32] = {0};
+    const uint16_t* elems_labels[32] = {0};
+    size_t          elems_label_lens[32] = {0};
     for (size_t ei = 0; ei < nel; ++ei) {
         if (el_st[ei] >= el_en[ei]) return NULL;
-        elems_storage[ei] = type_from_annotation_fallback_span(reg, s, src_len, el_st[ei], el_en[ei]);
+        int est = el_st[ei];
+        int een = el_en[ei];
+        uint8_t flag = CTSC_TUPLE_ELEMENT_REQUIRED;
+        /*
+         * Leading `...` marker (parser.ts parseTupleElementType / parseTupleElementName...
+         * ~4464-4477). Consumed up front because it applies equally to a plain
+         * type element (RestTypeNode) and to a NamedTupleMember whose
+         * dotDotDotToken is set. Rest vs Variadic is decided below from the
+         * element type shape (Rest if T is `X[]`, Variadic otherwise) so that
+         * typeToTypeNodeHelper ~7447-7452 can re-wrap via createArrayTypeNode.
+         */
+        bool leading_dots = false;
+        {
+            int t_dots = een;
+            int ds = u16_span_trim_bounds(s, est, een, &t_dots);
+            if (t_dots - ds >= 3
+                && s[ds] == (uint16_t)'.' && s[ds + 1] == (uint16_t)'.' && s[ds + 2] == (uint16_t)'.') {
+                leading_dots = true;
+                est = ds + 3;
+                een = t_dots;
+            }
+        }
+
+        /*
+         * NamedTupleMember lookahead (parser.ts parseTupleElementNameOrTupleElementType
+         * ~4464-4477 / isTupleElementName ~4457-4462): an identifier followed
+         * by optional `?` and a required `:` turns this element into a labeled
+         * tuple member. The name text is stored on TupleType.labeledElementDeclarations
+         * so typeToTypeNodeHelper ~7437-7449 can re-emit via
+         * factory.createNamedTupleMember.
+         */
+        const uint16_t* label_ptr = NULL;
+        size_t label_len = 0;
+        bool named_optional = false;
+        {
+            int te_n = een;
+            int ns = u16_span_trim_bounds(s, est, een, &te_n);
+            int ne = te_n;
+            if (ns < ne && u16_is_ident_start_ascii(s[ns])) {
+                int ni = ns + 1;
+                while (ni < ne && u16_is_ident_part_ascii(s[ni])) ni++;
+                /* after-ident cursor, skipping whitespace */
+                int after_ident = ni;
+                while (after_ident < ne && ctsc_is_ws_u16(s[after_ident])) after_ident++;
+                bool q = false;
+                int colon_pos = -1;
+                if (after_ident < ne && s[after_ident] == (uint16_t)'?') {
+                    int after_q = after_ident + 1;
+                    while (after_q < ne && ctsc_is_ws_u16(s[after_q])) after_q++;
+                    if (after_q < ne && s[after_q] == (uint16_t)':') {
+                        q = true;
+                        colon_pos = after_q;
+                    }
+                } else if (after_ident < ne && s[after_ident] == (uint16_t)':') {
+                    colon_pos = after_ident;
+                }
+                if (colon_pos >= 0) {
+                    label_ptr = s + ns;
+                    label_len = (size_t)(ni - ns);
+                    named_optional = q;
+                    /* Strip `name[?]:` prefix so the remainder is the type node span. */
+                    est = colon_pos + 1;
+                }
+            }
+        }
+
+        /*
+         * Determine element flag (parser.ts parseTupleElementType ~4670-4698;
+         * checker.ts typeToTypeNodeHelper ~7447-7454). Rest uses `T[]` so we
+         * strip a trailing `[]` suffix and remember we need Rest (the printer
+         * re-wraps it in createArrayTypeNode). Optional applies only when
+         * there was no leading `...`.
+         */
+        if (leading_dots) {
+            int inner_end = een;
+            if (consume_trailing_empty_array_suffix(s, est, &inner_end)) {
+                een = inner_end;
+                flag = CTSC_TUPLE_ELEMENT_REST;
+            } else {
+                flag = CTSC_TUPLE_ELEMENT_VARIADIC;
+            }
+        } else if (named_optional) {
+            flag = CTSC_TUPLE_ELEMENT_OPTIONAL;
+        } else if (!label_ptr) {
+            /*
+             * OptionalTypeNode in the *un*-named form: a trailing `?` at the
+             * end of the element span attaches to the type (parser.ts
+             * parseTupleElementNameOrTupleElementType ~4677-4698). For the
+             * named form the `?` was already consumed above as questionToken.
+             */
+            int te_q = een;
+            int q_start = u16_span_trim_bounds(s, est, een, &te_q);
+            int q_end = te_q;
+            if (q_start < q_end && s[q_end - 1] == (uint16_t)'?') {
+                flag = CTSC_TUPLE_ELEMENT_OPTIONAL;
+                een = q_end - 1;
+            }
+        }
+
+        elems_flags[ei] = flag;
+        elems_labels[ei] = label_ptr;
+        elems_label_lens[ei] = label_len;
+        elems_storage[ei] = type_from_annotation_fallback_span(reg, s, src_len, est, een);
     }
-    return ctsc_type_tuple(reg, elems_storage, nel);
+    return ctsc_type_tuple_with_element_flags_and_labels(reg, elems_storage, elems_flags, elems_labels,
+                                                         elems_label_lens, nel, is_readonly);
 }
 
 /*
@@ -2142,9 +2274,40 @@ static CtscType* type_of_expression(Walk* w, CtscTypeRegistry* reg, const CtscNo
             if (obj_t && obj_t->kind == CTSC_TYPE_TUPLE) {
                 size_t idx;
                 if (!tuple_index_from_access_argument(ea->argumentExpression, &idx)) return reg->t_any;
-                if (idx >= obj_t->tuple_elements_len) return reg->t_any;
-                CtscType* el = obj_t->tuple_elements[idx];
-                return el ? el : reg->t_any;
+                /*
+                 * Tuple element access with a numeric literal name
+                 * (checker.ts getPropertyTypeForIndexType ~19262-19279 /
+                 * getTupleElementTypeOutOfStartCount). When the tuple has
+                 * a Rest/Variadic slot, indices past the fixed head
+                 * resolve to that slot's element type (the Rest element's
+                 * stored type is the inner `T` of `...T[]`).
+                 */
+                size_t rest_idx = obj_t->tuple_elements_len;
+                if (obj_t->tuple_element_flags) {
+                    for (size_t i = 0; i < obj_t->tuple_elements_len; ++i) {
+                        uint8_t f = obj_t->tuple_element_flags[i];
+                        if (f & (CTSC_TUPLE_ELEMENT_REST | CTSC_TUPLE_ELEMENT_VARIADIC)) {
+                            rest_idx = i;
+                            break;
+                        }
+                    }
+                }
+                if (idx < obj_t->tuple_elements_len) {
+                    uint8_t f = obj_t->tuple_element_flags
+                                    ? obj_t->tuple_element_flags[idx]
+                                    : (uint8_t)CTSC_TUPLE_ELEMENT_REQUIRED;
+                    if (f & (CTSC_TUPLE_ELEMENT_REST | CTSC_TUPLE_ELEMENT_VARIADIC)) {
+                        CtscType* el = obj_t->tuple_elements[idx];
+                        return el ? el : reg->t_any;
+                    }
+                    CtscType* el = obj_t->tuple_elements[idx];
+                    return el ? el : reg->t_any;
+                }
+                if (rest_idx < obj_t->tuple_elements_len) {
+                    CtscType* el = obj_t->tuple_elements[rest_idx];
+                    return el ? el : reg->t_any;
+                }
+                return reg->t_any;
             }
             /*
              * String index signature: getPropertyTypeForIndexType (checker.ts ~19262-19279)
@@ -2542,7 +2705,15 @@ static CtscType* instantiate_type_params_in_type(Walk* w, CtscTypeRegistry* reg,
             if (new_el[i] != t->tuple_elements[i]) changed = true;
         }
         if (!changed) return t;
-        return ctsc_type_tuple(reg, new_el, t->tuple_elements_len);
+        /*
+         * Preserve TupleType.labeledElementDeclarations / readonly on
+         * substitution (checker.ts instantiateType on a TupleType passes
+         * target.labeledElementDeclarations through createTupleType ~15442,
+         * ~20947, etc.).
+         */
+        return ctsc_type_tuple_with_element_flags_and_labels(reg, new_el, t->tuple_element_flags,
+                                                             t->tuple_element_labels, t->tuple_element_label_lens,
+                                                             t->tuple_elements_len, t->tuple_readonly);
     }
     return t;
 }

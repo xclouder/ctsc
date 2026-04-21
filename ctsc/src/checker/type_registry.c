@@ -128,16 +128,92 @@ CtscType* ctsc_type_reference_with_type_args(CtscTypeRegistry* reg, const uint16
 }
 
 CtscType* ctsc_type_tuple(CtscTypeRegistry* reg, CtscType** elements, size_t element_count) {
+    return ctsc_type_tuple_with_element_flags(reg, elements, NULL, element_count);
+}
+
+CtscType* ctsc_type_readonly_tuple_with_element_flags(CtscTypeRegistry* reg, CtscType** elements,
+                                                      const uint8_t* element_flags, size_t element_count) {
+    CtscType* t = ctsc_type_tuple_with_element_flags(reg, elements, element_flags, element_count);
+    if (t) t->tuple_readonly = true;
+    return t;
+}
+
+CtscType* ctsc_type_tuple_with_element_flags(CtscTypeRegistry* reg, CtscType** elements, const uint8_t* element_flags,
+                                             size_t element_count) {
+    return ctsc_type_tuple_with_element_flags_and_labels(reg, elements, element_flags, NULL, NULL, element_count,
+                                                         false);
+}
+
+CtscType* ctsc_type_tuple_with_element_flags_and_labels(CtscTypeRegistry* reg, CtscType** elements,
+                                                        const uint8_t* element_flags,
+                                                        const uint16_t* const* labels, const size_t* label_lens,
+                                                        size_t element_count, bool readonly_tuple) {
     CtscType* t = ctsc_type_new(reg, CTSC_TYPE_TUPLE);
     if (element_count > 0 && elements) {
         CtscType** slot = (CtscType**)ctsc_arena_alloc(reg->arena, element_count * sizeof(CtscType*));
         memcpy(slot, elements, element_count * sizeof(CtscType*));
         t->tuple_elements = slot;
         t->tuple_elements_len = element_count;
+        if (element_flags) {
+            /*
+             * Only allocate the parallel flag array when at least one slot is
+             * non-Required; tsc similarly elides elementFlags when all bits
+             * are `Required` to keep TupleType payloads small (types.ts
+             * TupleType ~6702; createTupleType ~17955 short-circuits for the
+             * all-Required case). NULL is the canonical "all Required" shape.
+             */
+            bool any_non_required = false;
+            for (size_t i = 0; i < element_count; ++i) {
+                uint8_t f = element_flags[i];
+                if (f && f != CTSC_TUPLE_ELEMENT_REQUIRED) { any_non_required = true; break; }
+            }
+            if (any_non_required) {
+                uint8_t* fslot = (uint8_t*)ctsc_arena_alloc(reg->arena, element_count * sizeof(uint8_t));
+                memcpy(fslot, element_flags, element_count * sizeof(uint8_t));
+                t->tuple_element_flags = fslot;
+            } else {
+                t->tuple_element_flags = NULL;
+            }
+        } else {
+            t->tuple_element_flags = NULL;
+        }
+        /*
+         * Labels are elided when every slot is unlabeled, matching tsc's
+         * optional `labeledElementDeclarations` on TupleType (types.ts
+         * TupleType; set only when a tuple had NamedTupleMember nodes in
+         * parser.ts ~4464-4477).
+         */
+        if (labels && label_lens) {
+            bool any_labeled = false;
+            for (size_t i = 0; i < element_count; ++i) {
+                if (labels[i] && label_lens[i] > 0) { any_labeled = true; break; }
+            }
+            if (any_labeled) {
+                const uint16_t** lslot =
+                    (const uint16_t**)ctsc_arena_alloc(reg->arena, element_count * sizeof(const uint16_t*));
+                size_t* nslot = (size_t*)ctsc_arena_alloc(reg->arena, element_count * sizeof(size_t));
+                for (size_t i = 0; i < element_count; ++i) {
+                    lslot[i] = labels[i];
+                    nslot[i] = label_lens[i];
+                }
+                t->tuple_element_labels = lslot;
+                t->tuple_element_label_lens = nslot;
+            } else {
+                t->tuple_element_labels = NULL;
+                t->tuple_element_label_lens = NULL;
+            }
+        } else {
+            t->tuple_element_labels = NULL;
+            t->tuple_element_label_lens = NULL;
+        }
     } else {
         t->tuple_elements = NULL;
         t->tuple_elements_len = 0;
+        t->tuple_element_flags = NULL;
+        t->tuple_element_labels = NULL;
+        t->tuple_element_label_lens = NULL;
     }
+    t->tuple_readonly = readonly_tuple;
     return t;
 }
 
@@ -313,10 +389,53 @@ void ctsc_type_to_string(const CtscType* t, CtscBuffer* out) {
             return;
         }
         case CTSC_TYPE_TUPLE: {
+            /*
+             * Mirrors checker.ts typeToTypeNodeHelper for a tuple type
+             * reference (~7432-7454). Per-element rendering is driven by
+             * TupleType.elementFlags:
+             *   Required → `T`
+             *   Optional → `T?` (createOptionalTypeNode)
+             *   Rest     → `...T[]` (createRestTypeNode(createArrayTypeNode(T)))
+             *   Variadic → `...T`   (createRestTypeNode(T))
+             *
+             * Labeled elements (NamedTupleMember; checker.ts ~7442-7449) use
+             * a different wrapping: the flags surface inside the member as
+             * `[...]name[?]: T[? for rest]`, where the `[]` for Rest is
+             * pulled inside the type (createArrayTypeNode), the `?` attaches
+             * to the name (questionToken), and `...` prefixes the name:
+             *   Required  → `name: T`
+             *   Optional  → `name?: T`
+             *   Rest      → `...name: T[]`
+             *   Variadic  → `...name: T`
+             * (emitter.ts emitNamedTupleMember ~2431-2438.)
+             *
+             * A readonly target wraps the TupleTypeNode in
+             * TypeOperatorNode(ReadonlyKeyword) which the printer emits as
+             * a `readonly ` prefix (checker.ts ~7458; types.ts TupleType.readonly).
+             */
+            if (t->tuple_readonly) ctsc_buf_append_cstr(out, "readonly ");
             ctsc_buf_append_char(out, '[');
             for (size_t i = 0; i < t->tuple_elements_len; ++i) {
                 if (i > 0) ctsc_buf_append_cstr(out, ", ");
-                ctsc_type_to_string(t->tuple_elements[i], out);
+                uint8_t f = t->tuple_element_flags ? t->tuple_element_flags[i] : CTSC_TUPLE_ELEMENT_REQUIRED;
+                bool is_rest     = (f & CTSC_TUPLE_ELEMENT_REST)     != 0;
+                bool is_variadic = (f & CTSC_TUPLE_ELEMENT_VARIADIC) != 0;
+                bool is_optional = (f & CTSC_TUPLE_ELEMENT_OPTIONAL) != 0;
+                const uint16_t* label = t->tuple_element_labels ? t->tuple_element_labels[i] : NULL;
+                size_t label_len = t->tuple_element_label_lens ? t->tuple_element_label_lens[i] : 0;
+                if (label && label_len > 0) {
+                    if (is_rest || is_variadic) ctsc_buf_append_cstr(out, "...");
+                    append_utf16_ascii_identifier_prop_name(out, label, label_len);
+                    if (is_optional) ctsc_buf_append_char(out, '?');
+                    ctsc_buf_append_cstr(out, ": ");
+                    ctsc_type_to_string(t->tuple_elements[i], out);
+                    if (is_rest) ctsc_buf_append_cstr(out, "[]");
+                } else {
+                    if (is_rest || is_variadic) ctsc_buf_append_cstr(out, "...");
+                    ctsc_type_to_string(t->tuple_elements[i], out);
+                    if (is_rest)     ctsc_buf_append_cstr(out, "[]");
+                    if (is_optional) ctsc_buf_append_char(out, '?');
+                }
             }
             ctsc_buf_append_char(out, ']');
             return;

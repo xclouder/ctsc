@@ -600,6 +600,152 @@ int test_checker(void) {
         ctsc_arena_free(&a);
     }
 
+    /* Optional tuple element annotation `[number, string?]` (checker.ts
+     * typeToTypeNodeHelper ~7432-7454, ElementFlags.Optional; fixtures/checker/
+     * tuples_advanced/01_optional_tuple_element.ts). */
+    {
+        const char* src = "// @checker: types\ndeclare const t: [number, string?];\nconst a = t[0];\nconst b = t[1];\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 8192);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 3);
+        if (cr->entries_len == 3 && cr->entries[0].type && cr->entries[1].type && cr->entries[2].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[0].type, &ts);
+            const char* want0 = "[number, string?]";
+            EXPECT(ts.len == strlen(want0) && memcmp(ts.data, want0, ts.len) == 0);
+            ctsc_buf_free(&ts);
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[1].type, &ts);
+            EXPECT(ts.len == 6 && memcmp(ts.data, "number", 6) == 0);
+            ctsc_buf_free(&ts);
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[2].type, &ts);
+            EXPECT(ts.len == 6 && memcmp(ts.data, "string", 6) == 0);
+            ctsc_buf_free(&ts);
+        }
+        ctsc_arena_free(&a);
+    }
+
+    /* Rest tuple element annotation `[string, ...number[]]` (checker.ts
+     * typeToTypeNodeHelper ~7447-7452, ElementFlags.Rest; fixtures/checker/
+     * tuples_advanced/02_rest_tuple_element.ts). Index past the fixed head
+     * resolves to the rest element's inner type (getPropertyTypeForIndexType
+     * ~19262-19279 / getTupleElementTypeOutOfStartCount). */
+    {
+        const char* src = "// @checker: types\ndeclare const t: [string, ...number[]];\n"
+                          "const a = t[0];\nconst b = t[1];\nconst c = t[2];\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 8192);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 4);
+        if (cr->entries_len == 4 && cr->entries[0].type && cr->entries[1].type && cr->entries[2].type
+            && cr->entries[3].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[0].type, &ts);
+            const char* want0 = "[string, ...number[]]";
+            EXPECT(ts.len == strlen(want0) && memcmp(ts.data, want0, ts.len) == 0);
+            ctsc_buf_free(&ts);
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[1].type, &ts);
+            EXPECT(ts.len == 6 && memcmp(ts.data, "string", 6) == 0);
+            ctsc_buf_free(&ts);
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[2].type, &ts);
+            EXPECT(ts.len == 6 && memcmp(ts.data, "number", 6) == 0);
+            ctsc_buf_free(&ts);
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[3].type, &ts);
+            EXPECT(ts.len == 6 && memcmp(ts.data, "number", 6) == 0);
+            ctsc_buf_free(&ts);
+        }
+        ctsc_arena_free(&a);
+    }
+
+    /* Readonly tuple annotation `readonly [number, string]` (checker.ts
+     * getArrayOrTupleTargetType ~17745-17752 sets TupleType.readonly when the
+     * TupleTypeNode's parent is a readonly TypeOperatorNode; typeToTypeNodeHelper
+     * ~7457-7463 wraps the printed TupleTypeNode in TypeOperator(ReadonlyKeyword).
+     * Element access still yields the element type unchanged (readonly is a
+     * mutation-time guard, not a type substitution). fixtures/checker/
+     * tuples_advanced/03_readonly_tuple.ts. */
+    {
+        const char* src = "// @checker: types\ndeclare const t: readonly [number, string];\n"
+                          "const a = t[0];\nconst b = t[1];\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 8192);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 3);
+        if (cr->entries_len == 3 && cr->entries[0].type && cr->entries[1].type && cr->entries[2].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[0].type, &ts);
+            const char* want0 = "readonly [number, string]";
+            EXPECT(ts.len == strlen(want0) && memcmp(ts.data, want0, ts.len) == 0);
+            ctsc_buf_free(&ts);
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[1].type, &ts);
+            EXPECT(ts.len == 6 && memcmp(ts.data, "number", 6) == 0);
+            ctsc_buf_free(&ts);
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[2].type, &ts);
+            EXPECT(ts.len == 6 && memcmp(ts.data, "string", 6) == 0);
+            ctsc_buf_free(&ts);
+        }
+        ctsc_arena_free(&a);
+    }
+
+    /* NamedTupleMember annotation `[id: number, name: string]` (parser.ts
+     * parseTupleElementNameOrTupleElementType ~4464-4477; checker.ts
+     * typeToTypeNodeHelper ~7437-7449 re-emits labeled members via
+     * factory.createNamedTupleMember). Element access by numeric literal
+     * still yields the element's type (labels are purely for display;
+     * checker.ts getPropertyTypeForIndexType ~19262-19279 ignores labels).
+     * fixtures/checker/tuples_advanced/04_named_tuple.ts. */
+    {
+        const char* src = "// @checker: types\ndeclare const t: [id: number, name: string];\n"
+                          "const a = t[0];\nconst b = t[1];\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 8192);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 3);
+        if (cr->entries_len == 3 && cr->entries[0].type && cr->entries[1].type && cr->entries[2].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[0].type, &ts);
+            const char* want0 = "[id: number, name: string]";
+            EXPECT(ts.len == strlen(want0) && memcmp(ts.data, want0, ts.len) == 0);
+            ctsc_buf_free(&ts);
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[1].type, &ts);
+            EXPECT(ts.len == 6 && memcmp(ts.data, "number", 6) == 0);
+            ctsc_buf_free(&ts);
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[2].type, &ts);
+            EXPECT(ts.len == 6 && memcmp(ts.data, "string", 6) == 0);
+            ctsc_buf_free(&ts);
+        }
+        ctsc_arena_free(&a);
+    }
+
     /* Simple object literal: checkObjectLiteral + widened property types (checker.ts ~33527, ~41503). */
     {
         const char* src = "// @checker: types\nconst o = { a: 1 };\n";

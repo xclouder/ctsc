@@ -144,6 +144,35 @@ struct CtscType {
     /* TUPLE: element types in source order (arena-backed pointer array). */
     CtscType** tuple_elements;
     size_t     tuple_elements_len;
+    /*
+     * Per-element flag bitmask parallel to tuple_elements (may be NULL when
+     * every slot is Required). Mirrors TypeScript's TupleType.elementFlags
+     * (types.ts ElementFlags ~6691): Required=1, Optional=2, Rest=4,
+     * Variadic=8. Used by ctsc_type_to_string to re-emit `T?` for Optional
+     * and `...T[]` for Rest (checker.ts typeToTypeNodeHelper ~7432-7454).
+     */
+    uint8_t*   tuple_element_flags;
+    /*
+     * Optional parallel arrays of per-element labels (names) for a
+     * NamedTupleMember (parser.ts parseTupleElementNameOrTupleElementType
+     * ~4464-4477). Mirrors TypeScript's TupleType.labeledElementDeclarations
+     * (types.ts TupleType; checker.ts typeToTypeNodeHelper ~7437-7449 which
+     * re-emits `name: T`, `name?: T`, and `...name: T[]` via
+     * factory.createNamedTupleMember). `tuple_element_labels[i]` is NULL
+     * for an unlabeled slot; the whole array is NULL when no slot is labeled.
+     * Name text points into the source (UTF-16 code units), no ownership.
+     */
+    const uint16_t** tuple_element_labels;
+    size_t*          tuple_element_label_lens;
+    /*
+     * Whether the tuple was written under a `readonly` TypeOperator (e.g.
+     * `readonly [number, string]`). Mirrors TypeScript's TupleType.readonly
+     * flag on the target (types.ts TupleType.readonly; checker.ts
+     * getArrayOrTupleTargetType ~17745-17752 + typeToTypeNodeHelper
+     * ~7457-7463 which wraps a TupleTypeNode in a
+     * TypeOperatorNode(ReadonlyKeyword) when the target is readonly).
+     */
+    bool       tuple_readonly;
 
     /*
      * CTSC_TYPE_REFERENCE: optional type arguments for an instantiated generic
@@ -227,8 +256,52 @@ CtscType* ctsc_type_enum_member_literal(CtscTypeRegistry* reg, const uint16_t* e
 CtscType* ctsc_type_reference_with_type_args(CtscTypeRegistry* reg, const uint16_t* name, size_t name_len,
                                                CtscType** args, size_t arg_count);
 
+/*
+ * Per-element flag bits for a TUPLE type; mirrors types.ts ElementFlags
+ * (~6691). Tuple constructors take an optional parallel `uint8_t*` array
+ * where each entry is a bitmask of these values.
+ */
+#define CTSC_TUPLE_ELEMENT_REQUIRED  (1u << 0)
+#define CTSC_TUPLE_ELEMENT_OPTIONAL  (1u << 1)
+#define CTSC_TUPLE_ELEMENT_REST      (1u << 2)
+#define CTSC_TUPLE_ELEMENT_VARIADIC  (1u << 3)
+
 /* Tuple type: `elements` copied into the arena (may be NULL when count is 0). */
 CtscType* ctsc_type_tuple(CtscTypeRegistry* reg, CtscType** elements, size_t element_count);
+
+/*
+ * Tuple type with a parallel per-element flag bitmask (mirrors TypeScript's
+ * TupleType.elementFlags; checker.ts typeToTypeNodeHelper ~7432-7454).
+ * `element_flags` may be NULL to mean "all Required" (equivalent to
+ * ctsc_type_tuple). Both arrays are copied into the arena.
+ */
+CtscType* ctsc_type_tuple_with_element_flags(CtscTypeRegistry* reg, CtscType** elements, const uint8_t* element_flags,
+                                             size_t element_count);
+
+/*
+ * Tuple type wrapped with `readonly` (e.g. `readonly [T, U]`). Mirrors
+ * TupleType.readonly on the target (checker.ts getArrayOrTupleTargetType
+ * ~17745-17752; typeToTypeNodeHelper ~7457-7463 wraps in TypeOperatorNode
+ * ReadonlyKeyword). `element_flags` follows the same semantics as
+ * ctsc_type_tuple_with_element_flags.
+ */
+CtscType* ctsc_type_readonly_tuple_with_element_flags(CtscTypeRegistry* reg, CtscType** elements,
+                                                      const uint8_t* element_flags, size_t element_count);
+
+/*
+ * Tuple with optional per-element labels for NamedTupleMember nodes
+ * (parser.ts parseTupleElementNameOrTupleElementType ~4464-4477; checker.ts
+ * typeToTypeNodeHelper ~7437-7449 emits labels via createNamedTupleMember).
+ * `labels` / `label_lens` may be NULL for no labels, or parallel arrays of
+ * length `element_count` where entry `i` is NULL (no label) or a UTF-16
+ * slice. Both label arrays + `element_flags` are copied into the arena.
+ * `readonly_tuple` sets TupleType.readonly (checker.ts
+ * getArrayOrTupleTargetType ~17745-17752).
+ */
+CtscType* ctsc_type_tuple_with_element_flags_and_labels(CtscTypeRegistry* reg, CtscType** elements,
+                                                        const uint8_t* element_flags,
+                                                        const uint16_t* const* labels, const size_t* label_lens,
+                                                        size_t element_count, bool readonly_tuple);
 
 /* Intersection: `members` copied into the arena; count must be >= 1. */
 CtscType* ctsc_type_intersection(CtscTypeRegistry* reg, CtscType** members, size_t member_count);
