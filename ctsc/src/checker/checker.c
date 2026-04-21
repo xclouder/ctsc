@@ -1463,6 +1463,12 @@ static CtscType* type_from_type_literal_span(CtscTypeRegistry* reg, const uint16
     return lit;
 }
 
+/* Forward declaration for default-type substitution in TypeReference path
+ * (checker.ts fillMissingTypeArguments ~16151 + instantiateType ~19000+). */
+static CtscType* instantiate_type_params_in_type(Walk* w, CtscTypeRegistry* reg, CtscType* t,
+                                                 const CtscNodeArray* type_params, CtscType** type_arg_values,
+                                                 size_t type_arg_count, unsigned depth);
+
 /*
  * Maps TypeNode → CtscType for the M4.0 subset. Unknown types collapse to
  * `any` so downstream formatters never emit garbage.
@@ -1532,7 +1538,82 @@ static CtscType* type_of_type_node(Walk* w, CtscTypeRegistry* reg, const uint16_
                  * createTypeReference(type, typeArguments)). Without this, a
                  * `Box<number>` annotation would stringify back as just `Box`
                  * and property access would never substitute type parameters.
+                 *
+                 * When the reference has fewer (or zero) type arguments than the
+                 * class/interface declares type parameters, fill the trailing
+                 * slots with each TypeParameterDeclaration's `default` TypeNode
+                 * (parser.ts parseTypeParameter ~3955). Mirrors
+                 * fillMissingTypeArguments (checker.ts ~16151) which maps
+                 * later-default forward references through a type mapper built
+                 * from already-filled slots so `class C<T = number, U = T>`
+                 * resolves `C` to `C<number, number>`.
                  */
+                const CtscNodeArray* class_tps = NULL;
+                if (w) {
+                    CtscSymbol* class_sym = resolve_name(&w->scopes, id->text, id->text_len);
+                    if (class_sym) {
+                        for (size_t di = 0; di < class_sym->decls_len; ++di) {
+                            CtscNode* d = class_sym->decls[di];
+                            if (d && d->kind == CTSC_SK_ClassDeclaration) {
+                                class_tps = &d->data.classDeclaration.type_parameters;
+                                break;
+                            }
+                            if (d && d->kind == CTSC_SK_InterfaceDeclaration) {
+                                /* Interface shares classDeclaration storage
+                                 * (parser.ts parseInterfaceDeclaration; see
+                                 * parser.c parseInterfaceDeclaration ~4094). */
+                                class_tps = &d->data.classDeclaration.type_parameters;
+                                break;
+                            }
+                        }
+                    }
+                }
+                size_t explicit_na = tr->has_type_arguments ? tr->type_arguments.len : 0;
+                size_t tp_count = class_tps ? class_tps->len : 0;
+                if (explicit_na > 0 && explicit_na <= 32 && explicit_na >= tp_count) {
+                    size_t na = explicit_na;
+                    CtscType* args_buf[32];
+                    for (size_t ai = 0; ai < na; ++ai) {
+                        CtscNode* tnode = tr->type_arguments.items[ai];
+                        args_buf[ai] = type_of_type_node(w, reg, src, src_len, tnode, alias_depth + 1);
+                        if (!args_buf[ai]) args_buf[ai] = reg->t_any;
+                    }
+                    CtscType** slot = (CtscType**)ctsc_arena_alloc(reg->arena, na * sizeof(CtscType*));
+                    memcpy(slot, args_buf, na * sizeof(CtscType*));
+                    return ctsc_type_reference_with_type_args(reg, id->text, id->text_len, slot, na);
+                }
+                if (tp_count > 0 && tp_count <= 32 && explicit_na <= tp_count) {
+                    CtscType* args_buf[32];
+                    for (size_t ai = 0; ai < explicit_na; ++ai) {
+                        CtscNode* tnode = tr->type_arguments.items[ai];
+                        args_buf[ai] = type_of_type_node(w, reg, src, src_len, tnode, alias_depth + 1);
+                        if (!args_buf[ai]) args_buf[ai] = reg->t_any;
+                    }
+                    bool all_defaults_ok = true;
+                    for (size_t ai = explicit_na; ai < tp_count; ++ai) {
+                        const CtscNode* tp = class_tps->items[ai];
+                        if (!tp || tp->kind != CTSC_SK_TypeParameter) {
+                            all_defaults_ok = false;
+                            break;
+                        }
+                        const CtscNode* dn = tp->data.typeParameter.default_type;
+                        if (!dn) {
+                            all_defaults_ok = false;
+                            break;
+                        }
+                        CtscType* dt = type_of_type_node(w, reg, src, src_len, dn, alias_depth + 1);
+                        if (!dt) dt = reg->t_any;
+                        dt = instantiate_type_params_in_type(w, reg, dt, class_tps, args_buf, ai, 0);
+                        args_buf[ai] = dt;
+                    }
+                    if (all_defaults_ok) {
+                        CtscType** slot =
+                            (CtscType**)ctsc_arena_alloc(reg->arena, tp_count * sizeof(CtscType*));
+                        memcpy(slot, args_buf, tp_count * sizeof(CtscType*));
+                        return ctsc_type_reference_with_type_args(reg, id->text, id->text_len, slot,
+                                                                  tp_count);
+                    }
+                }
                 if (tr->has_type_arguments && tr->type_arguments.len > 0 && tr->type_arguments.len <= 32) {
                     size_t na = tr->type_arguments.len;
                     CtscType* args_buf[32];
@@ -4555,9 +4636,21 @@ static const CtscNode* type_parameter_for_parameter(const CtscNode* fn_decl, con
  * parameters keep the narrow literal so `<K extends string>(k: K)` with
  * `pair("name", ...)` infers `K = "name"`.
  */
-static void collect_generic_call_inferences(Walk* w, CtscTypeRegistry* reg, const CtscNode* fn_decl,
-                                             const CtscCallExpressionData* ce, CtscType** out_infer,
-                                             size_t out_infer_cap) {
+static CtscType* substitute_type_parameters_in_type(CtscTypeRegistry* reg, const CtscNode* fn_decl,
+                                                    CtscType* t, CtscType* const* infer, size_t infer_len);
+
+/*
+ * Core inference. `widen_unconstrained_literals` mirrors checker.ts
+ * getWidenedLiteralType behaviour inside getInferredType (~36000): widening
+ * applies when an inferred literal flows through a structural return position
+ * (e.g. a property of a TypeLiteral return). When the type parameter is the
+ * direct return type (`: T`), tsc's inference keeps the fresh literal (tsc
+ * probe: `const n = id(42)` → type `42`), matching the body-inferred path
+ * used for generics/01_identity_number.ts.
+ */
+static void collect_generic_call_inferences_ex(Walk* w, CtscTypeRegistry* reg, const CtscNode* fn_decl,
+                                                const CtscCallExpressionData* ce, CtscType** out_infer,
+                                                size_t out_infer_cap, bool widen_unconstrained_literals) {
     for (size_t i = 0; i < out_infer_cap; ++i) out_infer[i] = NULL;
     if (!w || !reg || !fn_decl || fn_decl->kind != CTSC_SK_FunctionDeclaration || !ce) return;
     const CtscFunctionDeclarationData* fd = &fn_decl->data.functionDeclaration;
@@ -4599,11 +4692,50 @@ static void collect_generic_call_inferences(Walk* w, CtscTypeRegistry* reg, cons
              * constrained ones (e.g. `K extends string`) keep the narrow literal
              * since the literal type satisfies the constraint. */
             bool has_constraint = tp->data.typeParameter.constraint != NULL;
-            CtscType* inferred = has_constraint ? arg_t : ctsc_type_widen(reg, arg_t);
+            CtscType* inferred =
+                (!has_constraint && widen_unconstrained_literals) ? ctsc_type_widen(reg, arg_t) : arg_t;
             out_infer[ti] = widen_nullish_when_not_strict_null(reg, inferred);
             break;
         }
     }
+
+    /*
+     * Fill remaining slots from the TypeParameterDeclaration `default` TypeNode
+     * (parser.ts parseTypeParameter ~3955). Mirrors checker.ts
+     * fillMissingTypeArguments / getDefaultFromTypeParameter ~14150-14200:
+     * when inference produced no argument for a type parameter that has a
+     * default, use the default's type. A default can only reference earlier
+     * type parameters, so resolve defaults in declaration order. Required for
+     * fixture checker/generic_defaults/02_default_no_args.ts (`make<T = string>()`).
+     */
+    for (size_t ti = 0; ti < fd->type_parameters.len && ti < out_infer_cap; ++ti) {
+        if (out_infer[ti]) continue;
+        const CtscNode* tp = fd->type_parameters.items[ti];
+        if (!tp || tp->kind != CTSC_SK_TypeParameter) continue;
+        const CtscNode* dn = tp->data.typeParameter.default_type;
+        if (!dn) continue;
+        CtscType* def_t = type_of_type_node(w, reg, w->source_utf16, w->source_utf16_len, dn, 0);
+        if (!def_t) continue;
+        /* Default may itself reference an earlier type parameter
+         * (`<K, V = K>`): substitute using already-filled slots. */
+        def_t = substitute_type_parameters_in_type(reg, fn_decl, def_t, out_infer, out_infer_cap);
+        out_infer[ti] = widen_nullish_when_not_strict_null(reg, def_t);
+    }
+}
+
+/*
+ * Default inference entry point used by the TypeLiteral return-type path
+ * (fixture checker/generic_constraints/05_two_params_one_constrained.ts):
+ * widen literal arguments for unconstrained type parameters so a property of
+ * the object literal return gets the widened type (`v: number` not `v: 42`).
+ * Direct-return paths (`: T`) use collect_generic_call_inferences_ex with
+ * widening disabled.
+ */
+static void collect_generic_call_inferences(Walk* w, CtscTypeRegistry* reg, const CtscNode* fn_decl,
+                                             const CtscCallExpressionData* ce, CtscType** out_infer,
+                                             size_t out_infer_cap) {
+    collect_generic_call_inferences_ex(w, reg, fn_decl, ce, out_infer, out_infer_cap,
+                                        /*widen_unconstrained_literals*/ true);
 }
 
 /*
@@ -4648,7 +4780,82 @@ static CtscType* substitute_type_parameters_in_type(CtscTypeRegistry* reg, const
         nt->object_string_index_value_type = t->object_string_index_value_type;
         return nt;
     }
+    /*
+     * Union return annotation such as `T | undefined` (checker.ts
+     * instantiateType on UnionType ~17390+): rebuild with each constituent
+     * substituted. Required for generic signatures whose declared return type
+     * is a nullable type parameter (fixture
+     * checker/generic_defaults/02_default_no_args.ts).
+     */
+    if (t->kind == CTSC_TYPE_UNION && t->union_members_len > 0) {
+        CtscType** copy = (CtscType**)ctsc_arena_alloc(
+            reg->arena, t->union_members_len * sizeof(CtscType*));
+        bool any_changed = false;
+        for (size_t i = 0; i < t->union_members_len; ++i) {
+            copy[i] = substitute_type_parameters_in_type(reg, fn_decl, t->union_members[i], infer, infer_len);
+            if (copy[i] != t->union_members[i]) any_changed = true;
+        }
+        if (!any_changed) return t;
+        CtscType* nu = ctsc_type_new(reg, CTSC_TYPE_UNION);
+        nu->union_members = copy;
+        nu->union_members_len = t->union_members_len;
+        sort_intrinsic_union_members(nu);
+        return nu;
+    }
+    if (t->kind == CTSC_TYPE_INTERSECTION && t->intersection_members_len > 0) {
+        CtscType** copy = (CtscType**)ctsc_arena_alloc(
+            reg->arena, t->intersection_members_len * sizeof(CtscType*));
+        bool any_changed = false;
+        for (size_t i = 0; i < t->intersection_members_len; ++i) {
+            copy[i] = substitute_type_parameters_in_type(reg, fn_decl, t->intersection_members[i], infer, infer_len);
+            if (copy[i] != t->intersection_members[i]) any_changed = true;
+        }
+        if (!any_changed) return t;
+        return ctsc_type_intersection(reg, copy, t->intersection_members_len);
+    }
     return t;
+}
+
+/*
+ * True when `t` structurally references any of `fn_decl`'s type parameters at
+ * the top level or within a UNION / INTERSECTION / OBJECT_LITERAL the
+ * substituter can rewrite. Used to decide whether a declared return annotation
+ * needs instantiation at a generic call site.
+ */
+static bool type_depends_on_fn_type_parameters(const CtscNode* fn_decl, CtscType* t, unsigned depth) {
+    if (!t || !fn_decl || fn_decl->kind != CTSC_SK_FunctionDeclaration || depth > 8) return false;
+    const CtscFunctionDeclarationData* fd = &fn_decl->data.functionDeclaration;
+    if (t->kind == CTSC_TYPE_REFERENCE && t->reference_type_args_len == 0) {
+        for (size_t ti = 0; ti < fd->type_parameters.len; ++ti) {
+            const CtscNode* tp = fd->type_parameters.items[ti];
+            if (!tp || tp->kind != CTSC_SK_TypeParameter) continue;
+            const CtscNode* tnm = tp->data.typeParameter.name;
+            if (!tnm || tnm->kind != CTSC_SK_Identifier) continue;
+            const CtscIdentifierData* tid = &tnm->data.identifier;
+            if (utf16_type_text_equal(t->text, t->text_len, tid->text, tid->text_len)) return true;
+        }
+        return false;
+    }
+    if (t->kind == CTSC_TYPE_UNION) {
+        for (size_t i = 0; i < t->union_members_len; ++i) {
+            if (type_depends_on_fn_type_parameters(fn_decl, t->union_members[i], depth + 1)) return true;
+        }
+        return false;
+    }
+    if (t->kind == CTSC_TYPE_INTERSECTION) {
+        for (size_t i = 0; i < t->intersection_members_len; ++i) {
+            if (type_depends_on_fn_type_parameters(fn_decl, t->intersection_members[i], depth + 1)) return true;
+        }
+        return false;
+    }
+    if (t->kind == CTSC_TYPE_OBJECT_LITERAL) {
+        for (size_t i = 0; i < t->object_properties_len; ++i) {
+            if (type_depends_on_fn_type_parameters(fn_decl, t->object_properties[i].value_type, depth + 1))
+                return true;
+        }
+        return false;
+    }
+    return false;
 }
 
 /*
@@ -4665,14 +4872,14 @@ static CtscType* generic_call_instantiated_return_type(Walk* w, CtscTypeRegistry
                                                       const CtscCallExpressionData* ce) {
     if (!w || !reg || !fn_decl || fn_decl->kind != CTSC_SK_FunctionDeclaration || !ce) return NULL;
     const CtscFunctionDeclarationData* fd = &fn_decl->data.functionDeclaration;
-    if (fd->type_parameters.len < 1 || fd->parameters.len < 1) return NULL;
+    if (fd->type_parameters.len < 1) return NULL;
 
     /*
      * TypeLiteral return annotation (`: { k: K; v: V }`): substitute inferred
      * type arguments into each property's value_type. Mirrors
      * instantiateType on an anonymous object type (checker.ts ~17500+).
      */
-    if (fd->type && fd->type->kind == CTSC_SK_TypeLiteral) {
+    if (fd->type && fd->type->kind == CTSC_SK_TypeLiteral && fd->parameters.len >= 1) {
         CtscType* decl_ret = type_of_type_node(w, reg, w->source_utf16, w->source_utf16_len, fd->type, 0);
         if (!decl_ret || decl_ret->kind != CTSC_TYPE_OBJECT_LITERAL) return NULL;
         CtscType* infer[16];
@@ -4682,7 +4889,32 @@ static CtscType* generic_call_instantiated_return_type(Walk* w, CtscTypeRegistry
         return substitute_type_parameters_in_type(reg, fn_decl, decl_ret, infer, used);
     }
 
-    if (ce->arguments.len < 1) return NULL;
+    /*
+     * General declared-return-annotation substitution: when the return TypeNode
+     * references one of this signature's type parameters (e.g. `: T | undefined`,
+     * `: T`), instantiate it using the inference map (which now honours
+     * `<T = default>` TypeParameterDeclaration defaults — checker.ts
+     * getDefaultFromTypeParameter ~14180). Required for fixture
+     * checker/generic_defaults/02_default_no_args.ts where the only inference
+     * signal comes from the default because the call has no arguments and no
+     * explicit type arguments. Direct-return inference keeps fresh literals
+     * (`const n = id(42)` → `42`, fixture generics/01_identity_number.ts) —
+     * unlike the TypeLiteral return path, which widens inner properties.
+     */
+    if (fd->type) {
+        CtscType* decl_ret = type_of_type_node(w, reg, w->source_utf16, w->source_utf16_len, fd->type, 0);
+        if (decl_ret && type_depends_on_fn_type_parameters(fn_decl, decl_ret, 0)) {
+            CtscType* infer[16];
+            size_t cap = sizeof(infer) / sizeof(infer[0]);
+            collect_generic_call_inferences_ex(w, reg, fn_decl, ce, infer, cap,
+                                                /*widen_unconstrained_literals*/ false);
+            size_t used = fd->type_parameters.len < cap ? fd->type_parameters.len : cap;
+            CtscType* sub = substitute_type_parameters_in_type(reg, fn_decl, decl_ret, infer, used);
+            if (sub && sub != decl_ret) return sub;
+        }
+    }
+
+    if (ce->arguments.len < 1 || fd->parameters.len < 1) return NULL;
     CtscType* inferred_ret =
         infer_return_type_for_function_body(w, reg, w->arena, fd->body, fn_decl);
     if (!inferred_ret || inferred_ret->kind != CTSC_TYPE_REFERENCE) return NULL;
@@ -4755,6 +4987,16 @@ static void emit_type_parameters_for_signature(CtscBuffer* out, const CtscNodeAr
             if (cn && reg) {
                 ctsc_buf_append_cstr(out, " extends ");
                 append_type_for_signature(out, reg, cn, src, src_len);
+            }
+            /* Generic defaults: tsc's typeParameterToDeclarationWithConstraint
+             * (~8340) writes ` = <default>` after the optional constraint
+             * when a TypeParameterDeclaration has a `default` TypeNode
+             * (parseTypeParameter ~3955). Rendered at signatureToString
+             * default flags (checker.ts ~6202). */
+            const CtscNode* dn = tp->data.typeParameter.default_type;
+            if (dn && reg) {
+                ctsc_buf_append_cstr(out, " = ");
+                append_type_for_signature(out, reg, dn, src, src_len);
             }
         }
     }

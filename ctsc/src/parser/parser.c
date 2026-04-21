@@ -2298,21 +2298,90 @@ static CtscNode* parse_property_name(Parser* p) {
 }
 
 /*
+ * Try to parse a simple TypeNode that the checker's signature renderer can
+ * spell back out from a type-parameter constraint or default position: a
+ * `{ ... }` TypeLiteral, a bare keyword type (`string`/`number`/...), a
+ * single-identifier TypeReference (`Named`), or a LiteralTypeNode
+ * (`"x"` / `42` / `1n` / `true` / `false`). Mirrors the identifier /
+ * keyword / LiteralTypeNode branches of upstream parseNonArrayType
+ * (~4591-4612, parser.ts). Commits only when we land on a TypeParameter
+ * list terminator (`>` / `,` / `=`); otherwise reverts and falls back to
+ * skip_type_in_type_parameter_position so complex types (function types,
+ * unions, conditionals, etc.) still balance correctly. Returns NULL when
+ * no simple form matches.
+ */
+static CtscNode* try_parse_simple_type_parameter_type_node(Parser* p) {
+    if (cur(p) == CTSC_SK_OpenBraceToken) {
+        /* `{ ... }` TypeLiteral is well-delimited at `}`; parse_type_literal
+         * brace-balances and returns at the token after the closing `}`,
+         * which is the `>` / `,` / `=` that terminates the type parameter
+         * position. */
+        return parse_type_literal(p);
+    }
+    CtscScanner saved = p->scanner;
+    size_t saved_diag_count = p->diagnostics->count;
+    CtscSyntaxKind kk = cur(p);
+    CtscNode* t = NULL;
+    if (kk == CTSC_SK_AnyKeyword || kk == CTSC_SK_UnknownKeyword
+        || kk == CTSC_SK_StringKeyword || kk == CTSC_SK_NumberKeyword
+        || kk == CTSC_SK_BooleanKeyword || kk == CTSC_SK_VoidKeyword
+        || kk == CTSC_SK_UndefinedKeyword || kk == CTSC_SK_NeverKeyword
+        || kk == CTSC_SK_ObjectKeyword || kk == CTSC_SK_SymbolKeyword) {
+        int fs = cur_full_start(p);
+        advance(p);
+        int end = cur_full_start(p);
+        t = ctsc_node_new(p->arena, kk, fs, end);
+    } else if (kk == CTSC_SK_Identifier
+               || kk == CTSC_SK_StringLiteral
+               || kk == CTSC_SK_NumericLiteral
+               || kk == CTSC_SK_BigIntLiteral
+               || kk == CTSC_SK_TrueKeyword
+               || kk == CTSC_SK_FalseKeyword) {
+        /* Speculatively run the normal type-node parser; parse_type_node
+         * already produces the correct LiteralTypeNode variants
+         * (parser.ts parseLiteralTypeNode ~4610-4612). We commit only if
+         * the result is one of the kinds append_type_for_signature knows
+         * how to spell back out (checker.c ~316) and the next token is a
+         * TypeParameter list terminator. */
+        t = parse_type_node(p);
+        if (t) {
+            CtscSyntaxKind tk = t->kind;
+            bool renderable =
+                (tk == CTSC_SK_TypeReference
+                 || tk == CTSC_SK_StringLiteral
+                 || tk == CTSC_SK_NumericLiteral
+                 || tk == CTSC_SK_BigIntLiteral
+                 || tk == CTSC_SK_TrueKeyword
+                 || tk == CTSC_SK_FalseKeyword);
+            if (!renderable) t = NULL;
+        }
+    }
+    CtscSyntaxKind nk = cur(p);
+    bool terminates =
+        (nk == CTSC_SK_GreaterThanToken || nk == CTSC_SK_CommaToken
+         || nk == CTSC_SK_EqualsToken);
+    if (t && terminates) return t;
+    p->scanner = saved;
+    ctsc_diag_truncate(p->diagnostics, saved_diag_count);
+    return NULL;
+}
+
+/*
  * Mirrors upstream/TypeScript/src/compiler/parser.ts parseTypeParameter (~3955):
  *     TypeParameter: (modifiers)? Identifier (`extends` Type)? (`=` Type)?
- * Modifiers are still skipped. The `extends` constraint is captured as a
- * real TypeNode only for the simple forms we can reliably delimit at the
- * type-parameter closing `>`: `{ ... }` TypeLiteral, a bare keyword type
- * (`string`/`number`/`boolean`/...), or a single identifier TypeReference.
- * More complex constraints (function types, unions, conditionals; e.g.
- * `<T extends (...args: any[]) => void>` in 74_export_generic_rest.ts)
+ * Modifiers are still skipped. The `extends` constraint and `=` default are
+ * each captured as a real TypeNode only for the simple forms we can reliably
+ * delimit at the type-parameter closing `>`: `{ ... }` TypeLiteral, a bare
+ * keyword type (`string`/`number`/`boolean`/...), or a single-identifier
+ * TypeReference. More complex forms (function types, unions, conditionals;
+ * e.g. `<T extends (...args: any[]) => void>` in 74_export_generic_rest.ts)
  * fall through to the brace-balanced skip_type_in_type_parameter_position
- * path which is `>`-terminated; the constraint is left NULL there because
- * the signature renderer does not yet spell those forms back out. The
- * checker uses the parsed constraint to emit `<T extends X>` via
- * typeParameterToDeclarationWithConstraint (checker.ts ~8340). The `=`
- * default is still brace-balanced until a fixture needs its type node.
- * finishNode end = scanner.getTokenFullStart() after the constraint/default.
+ * path which is `>`-terminated; the constraint / default is left NULL there
+ * because the signature renderer does not yet spell those forms back out.
+ * The checker uses the parsed constraint to emit `<T extends X>` and the
+ * default to emit `<T = X>` (both via typeParameterToDeclarationWithConstraint,
+ * checker.ts ~8340). finishNode end = scanner.getTokenFullStart() after the
+ * constraint/default.
  */
 static CtscNode* parse_type_parameter(Parser* p) {
     int pos = cur_full_start(p);
@@ -2323,58 +2392,24 @@ static CtscNode* parse_type_parameter(Parser* p) {
     CtscNode* constraint = NULL;
     if (cur(p) == CTSC_SK_ExtendsKeyword) {
         advance(p);
-        if (cur(p) == CTSC_SK_OpenBraceToken) {
-            /* `{ ... }` TypeLiteral is well-delimited at `}`; parse_type_literal
-             * brace-balances and returns at the token after the closing `}`,
-             * which is the `>` / `,` that terminates the type parameter list. */
-            constraint = parse_type_literal(p);
-        } else {
-            /* Speculatively build a simple constraint TypeNode for the cases
-             * the checker's signature renderer can spell back out: a bare
-             * keyword type (`string`/`number`/...) or a single-identifier
-             * TypeReference (`<T extends Named>`). Mirrors the identifier /
-             * keyword branches of upstream parseNonArrayType (~4591-4602,
-             * parser.ts). Commit only when we land on a TypeParameter list
-             * terminator (`>` / `,` / `=`); otherwise revert and fall back
-             * to skip_type_in_type_parameter_position so complex constraints
-             * (function types, unions, etc.) still balance correctly. */
-            CtscScanner saved = p->scanner;
-            size_t saved_diag_count = p->diagnostics->count;
-            CtscSyntaxKind kk = cur(p);
-            CtscNode* t = NULL;
-            if (kk == CTSC_SK_AnyKeyword || kk == CTSC_SK_UnknownKeyword
-                || kk == CTSC_SK_StringKeyword || kk == CTSC_SK_NumberKeyword
-                || kk == CTSC_SK_BooleanKeyword || kk == CTSC_SK_VoidKeyword
-                || kk == CTSC_SK_UndefinedKeyword || kk == CTSC_SK_NeverKeyword
-                || kk == CTSC_SK_ObjectKeyword || kk == CTSC_SK_SymbolKeyword) {
-                int fs = cur_full_start(p);
-                advance(p);
-                int end = cur_full_start(p);
-                t = ctsc_node_new(p->arena, kk, fs, end);
-            } else if (kk == CTSC_SK_Identifier) {
-                t = parse_type_node(p);
-            }
-            CtscSyntaxKind nk = cur(p);
-            bool terminates =
-                (nk == CTSC_SK_GreaterThanToken || nk == CTSC_SK_CommaToken
-                 || nk == CTSC_SK_EqualsToken);
-            if (t && terminates) {
-                constraint = t;
-            } else {
-                p->scanner = saved;
-                ctsc_diag_truncate(p->diagnostics, saved_diag_count);
-                skip_type_in_type_parameter_position(p);
-            }
+        constraint = try_parse_simple_type_parameter_type_node(p);
+        if (!constraint) {
+            skip_type_in_type_parameter_position(p);
         }
     }
+    CtscNode* default_type = NULL;
     if (cur(p) == CTSC_SK_EqualsToken) {
         advance(p);
-        skip_type_in_type_parameter_position(p);
+        default_type = try_parse_simple_type_parameter_type_node(p);
+        if (!default_type) {
+            skip_type_in_type_parameter_position(p);
+        }
     }
     int end = cur_full_start(p);
     CtscNode* tp = ctsc_node_new(p->arena, CTSC_SK_TypeParameter, pos, end);
     tp->data.typeParameter.name = name;
     tp->data.typeParameter.constraint = constraint;
+    tp->data.typeParameter.default_type = default_type;
     return tp;
 }
 
