@@ -57,6 +57,12 @@ typedef enum {
     CTSC_TYPE_OBJECT_LITERAL,
 
     /*
+     * Tuple type from a TupleTypeNode / `[T, U, ...]` annotation (checker.ts
+     * getTypeFromArrayOrTupleTypeNode ~17824-17840).
+     */
+    CTSC_TYPE_TUPLE,
+
+    /*
      * Nominal reference to a named class (instance type). typeToString is the
      * class identifier (checker.ts getTypeOfSymbol / class instance ~12537).
      * Payload uses `text` / `text_len` (UTF-16), same storage as literals.
@@ -74,6 +80,7 @@ typedef struct {
     const uint16_t* name;
     size_t          name_len;
     CtscType*       value_type;
+    bool            optional; /* PropertySignature / type literal `name?: T` */
 } CtscObjectProperty;
 
 struct CtscType {
@@ -95,6 +102,18 @@ struct CtscType {
     /* OBJECT_LITERAL */
     CtscObjectProperty* object_properties;
     size_t                object_properties_len;
+
+    /* TUPLE: element types in source order (arena-backed pointer array). */
+    CtscType** tuple_elements;
+    size_t     tuple_elements_len;
+
+    /*
+     * CTSC_TYPE_REFERENCE: optional type arguments for an instantiated generic
+     * class (e.g. Box<number>). When reference_type_args_len is 0, typeToString
+     * is the bare class name (checker.ts typeToString on generic instantiation).
+     */
+    CtscType** reference_type_args;
+    size_t     reference_type_args_len;
 
     /*
      * Optional alias name for typeToString when a TypeReference resolved
@@ -146,6 +165,16 @@ CtscType* ctsc_type_object_literal(CtscTypeRegistry* reg, CtscObjectProperty* pr
 
 /* Class instance / nominal named type: typeToString is the identifier text. */
 CtscType* ctsc_type_reference(CtscTypeRegistry* reg, const uint16_t* name, size_t name_len);
+
+/*
+ * Same as ctsc_type_reference but with type arguments (e.g. Box<number>).
+ * `args` is copied into the arena; pointers must remain valid for the type's lifetime.
+ */
+CtscType* ctsc_type_reference_with_type_args(CtscTypeRegistry* reg, const uint16_t* name, size_t name_len,
+                                               CtscType** args, size_t arg_count);
+
+/* Tuple type: `elements` copied into the arena (may be NULL when count is 0). */
+CtscType* ctsc_type_tuple(CtscTypeRegistry* reg, CtscType** elements, size_t element_count);
 
 /* Widening rules (types.ts getWidenedLiteralType): narrow literal -> base. */
 CtscType* ctsc_type_widen(CtscTypeRegistry* reg, const CtscType* t);

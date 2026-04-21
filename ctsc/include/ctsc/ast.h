@@ -327,13 +327,16 @@ typedef struct {
  * (~4036) + forEachChildInParameter (~528): a ParameterDeclaration carries
  * `modifiers`, `dotDotDotToken`, `name`, `questionToken`, `type`, and
  * `initializer`. ctsc models `name`, `type`, `initializer`, plus rest-param
- * state. The TS-only `?` after the name is consumed by the parser so the
- * scanner advances, but is not surfaced to the emitter (the JS printer drops
- * it via transformers/ts.ts visitParameter).
+ * and `is_optional` (the `?` after the name is omitted in JS emit per
+ * transformers/ts.ts visitParameter).
  *
  * `has_dot_dot_dot` is true for rest parameters. The token's span is kept
  * purely so future AST-JSON / forEachChild work can produce a synthetic
  * DotDotDotToken leaf at the right position without another parser pass.
+ *
+ * `is_optional` is true after parseOptionalToken(QuestionToken) following the
+ * binding name (parser.ts parseParameterWorker ~4081). Used by the checker for
+ * signature type strings and arity (mirrors checker.ts optional parameters).
  */
 typedef struct {
     CtscNode* name;        /* Identifier | ObjectBindingPattern | ArrayBindingPattern */
@@ -346,6 +349,7 @@ typedef struct {
      * modifier (mirrors isParameterPropertyDeclaration in utilitiesPublic.ts).
      * Used by the emitter to inject this.<name> = <name> in constructors. */
     bool      is_parameter_property;
+    bool      is_optional;
 } CtscParameterData;
 
 /*

@@ -381,6 +381,55 @@ int test_checker(void) {
         ctsc_arena_free(&a);
     }
 
+    /* Tuple annotation + array literal initializer (fixtures/checker/tuples/01_simple_tuple.ts;
+     * checker.ts getTypeFromArrayOrTupleTypeNode ~17824-17840). */
+    {
+        const char* src = "// @checker: types\nconst t: [number, string] = [1, \"a\"];\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 8192);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 1);
+        if (cr->entries_len == 1 && cr->entries[0].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[0].type, &ts);
+            const char* want = "[number, string]";
+            EXPECT(ts.len == strlen(want) && memcmp(ts.data, want, ts.len) == 0);
+            ctsc_buf_free(&ts);
+        }
+        ctsc_arena_free(&a);
+    }
+
+    /* Tuple element access with numeric literal index (checker.ts getPropertyTypeForIndexType ~19262-19279;
+     * fixtures/checker/tuples/02_tuple_access.ts). */
+    {
+        const char* src = "// @checker: types\nconst t: [number, string] = [1, \"a\"];\nconst n = t[0];\nconst s = t[1];\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 8192);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 3);
+        if (cr->entries_len == 3 && cr->entries[1].type && cr->entries[2].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[1].type, &ts);
+            EXPECT(ts.len == 6 && memcmp(ts.data, "number", 6) == 0);
+            ctsc_buf_free(&ts);
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[2].type, &ts);
+            EXPECT(ts.len == 6 && memcmp(ts.data, "string", 6) == 0);
+            ctsc_buf_free(&ts);
+        }
+        ctsc_arena_free(&a);
+    }
+
     /* Simple object literal: checkObjectLiteral + widened property types (checker.ts ~33527, ~41503). */
     {
         const char* src = "// @checker: types\nconst o = { a: 1 };\n";
@@ -883,6 +932,65 @@ int test_checker(void) {
         ctsc_arena_free(&a);
     }
 
+    /* Optional PropertySignature (fixtures/checker/optional/01_optional_field.ts;
+     * parser.ts parsePropertyOrMethodSignature ~4268–4282). */
+    {
+        const char* src = "// @checker: types\r\n"
+                          "interface P {\r\n"
+                          "  x?: number;\r\n"
+                          "}\r\n"
+                          "const p: P = {};\r\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 2);
+        const CtscCheckTypeEntry* ps = NULL;
+        const CtscCheckTypeEntry* vd = NULL;
+        for (size_t i = 0; i < cr->entries_len; i++) {
+            if (cr->entries[i].decl_kind_name
+                && strcmp(cr->entries[i].decl_kind_name, "PropertySignature") == 0)
+                ps = &cr->entries[i];
+            if (cr->entries[i].decl_kind_name
+                && strcmp(cr->entries[i].decl_kind_name, "VariableDeclaration") == 0)
+                vd = &cr->entries[i];
+        }
+        EXPECT(ps != NULL && vd != NULL);
+        if (ps && ps->type) {
+            CtscBuffer t0;
+            ctsc_buf_init(&t0);
+            ctsc_type_to_string(ps->type, &t0);
+            EXPECT(t0.len == 6 && memcmp(t0.data, "number", 6) == 0);
+            ctsc_buf_free(&t0);
+        }
+        if (ps) EXPECT(ps->pos == 33 && ps->end == 38);
+        if (vd) EXPECT(vd->pos == 58 && vd->end == 60);
+        ctsc_arena_free(&a);
+    }
+
+    /* Optional parameter on FunctionDeclaration (fixtures/checker/optional/02_optional_param.ts;
+     * parser.ts parseParameterWorker ~4081, checker.ts signatureToString / typeToString ~6202). */
+    {
+        const char* src = "// @checker: types\nfunction f(x?: number): number {\n  return 1;\n}\nconst n = f();\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 8192);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 3);
+        if (cr->entries_len >= 1 && cr->entries[0].type_string && cr->entries[0].type_string_len > 0) {
+            const char* want = "(x?: number) => number";
+            EXPECT(cr->entries[0].type_string_len == strlen(want));
+            EXPECT(memcmp(cr->entries[0].type_string, want, strlen(want)) == 0);
+        }
+        ctsc_arena_free(&a);
+    }
+
     /* Two-field interface + const: second PropertySignature name pos includes trivia
      * after `;` (fixtures/checker/interfaces/02_interface_two_fields.ts, CRLF; tsc
      * Identifier fullStart; checker.ts createIdentifier ~2648). */
@@ -1162,6 +1270,110 @@ int test_checker(void) {
                 EXPECT(t3.len == 6 && memcmp(t3.data, "number", 6) == 0);
                 ctsc_buf_free(&t3);
             }
+        }
+        ctsc_arena_free(&a);
+    }
+
+    /* Generic class + constructor: types oracle omits MethodDeclaration for
+     * `constructor` but still lists parameters (fixtures/checker/generics/06_generic_class.ts;
+     * CRLF matches on-disk 101-byte fixture). */
+    {
+        const char* src = "// @checker: types\r\nclass Box<T> {\r\n  value: T;\r\n  constructor(v: T) {\r\n    this.value = v;\r\n  }\r\n}\r\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 2);
+        if (cr->entries_len >= 2) {
+            EXPECT(cr->entries[0].decl_kind_name
+                   && strcmp(cr->entries[0].decl_kind_name, "PropertyDeclaration") == 0);
+            EXPECT(cr->entries[0].pos == 34 && cr->entries[0].end == 43);
+            EXPECT(cr->entries[1].decl_kind_name && strcmp(cr->entries[1].decl_kind_name, "Parameter") == 0);
+            EXPECT(cr->entries[1].pos == 63 && cr->entries[1].end == 64);
+            if (cr->entries[0].type && cr->entries[1].type) {
+                CtscBuffer t0, t1;
+                ctsc_buf_init(&t0);
+                ctsc_buf_init(&t1);
+                ctsc_type_to_string(cr->entries[0].type, &t0);
+                ctsc_type_to_string(cr->entries[1].type, &t1);
+                EXPECT(t0.len == 1 && memcmp(t0.data, "T", 1) == 0);
+                EXPECT(t1.len == 1 && memcmp(t1.data, "T", 1) == 0);
+                ctsc_buf_free(&t0);
+                ctsc_buf_free(&t1);
+            }
+        }
+        ctsc_arena_free(&a);
+    }
+
+    /* Instantiated generic class: new Box<number>(1) → Box<number>; b.value → number
+     * (fixtures/checker/generics/07_generic_class_usage.ts; checker.ts resolveNewExpression ~37131). */
+    {
+        const char* src =
+            "// @checker: types\n"
+            "class Box<T> {\n"
+            "  value: T;\n"
+            "  constructor(v: T) {\n"
+            "    this.value = v;\n"
+            "  }\n"
+            "}\n"
+            "const b = new Box<number>(1);\n"
+            "const n = b.value;\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 32768);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 4);
+        if (cr->entries_len >= 4 && cr->entries[2].type && cr->entries[3].type) {
+            CtscBuffer tb, tn;
+            ctsc_buf_init(&tb);
+            ctsc_buf_init(&tn);
+            ctsc_type_to_string(cr->entries[2].type, &tb);
+            ctsc_type_to_string(cr->entries[3].type, &tn);
+            EXPECT(tb.len == 11 && memcmp(tb.data, "Box<number>", 11) == 0);
+            EXPECT(tn.len == 6 && memcmp(tn.data, "number", 6) == 0);
+            ctsc_buf_free(&tb);
+            ctsc_buf_free(&tn);
+        }
+        ctsc_arena_free(&a);
+    }
+
+    /* Inferred type arguments: new Box(1) → Box<number>; b.value → number
+     * (fixtures/checker/generics/08_generic_class_inferred.ts; inferTypeArguments ~35827). */
+    {
+        const char* src =
+            "// @checker: types\n"
+            "class Box<T> {\n"
+            "  value: T;\n"
+            "  constructor(v: T) {\n"
+            "    this.value = v;\n"
+            "  }\n"
+            "}\n"
+            "const b = new Box(1);\n"
+            "const n = b.value;\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 32768);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 4);
+        if (cr->entries_len >= 4 && cr->entries[2].type && cr->entries[3].type) {
+            CtscBuffer tb, tn;
+            ctsc_buf_init(&tb);
+            ctsc_buf_init(&tn);
+            ctsc_type_to_string(cr->entries[2].type, &tb);
+            ctsc_type_to_string(cr->entries[3].type, &tn);
+            EXPECT(tb.len == 11 && memcmp(tb.data, "Box<number>", 11) == 0);
+            EXPECT(tn.len == 6 && memcmp(tn.data, "number", 6) == 0);
+            ctsc_buf_free(&tb);
+            ctsc_buf_free(&tn);
         }
         ctsc_arena_free(&a);
     }

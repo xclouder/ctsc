@@ -4713,13 +4713,13 @@ static CtscNode* parse_parameter(Parser* p) {
     }
     CtscNode* name = parse_identifier_or_pattern(p);
     if (!name) return NULL;
-    /* parseOptionalToken(QuestionToken) at parser.ts:4081 — consumed to
-     * advance the scanner. Its span is not stored: the JS emitter drops it
-     * (TS-only) and no AST-JSON oracle fixture currently inspects a
-     * Parameter's questionToken child. */
+    /* parseOptionalToken(QuestionToken) at parser.ts ~4081 — consumed here;
+     * optional flag is stored for checker signature strings / arity. */
     int q_end = -1;
+    bool is_optional = false;
     if (cur(p) == CTSC_SK_QuestionToken) {
         q_end = cur_end(p);
+        is_optional = true;
         advance(p);
     }
     /* parseTypeAnnotation (~4961): `: Type`. parse_type_annotation already
@@ -4743,6 +4743,7 @@ static CtscNode* parse_parameter(Parser* p) {
     pm->data.parameter.dot_dot_dot_pos = ddd_pos;
     pm->data.parameter.dot_dot_dot_end = ddd_end;
     pm->data.parameter.is_parameter_property = is_parameter_property;
+    pm->data.parameter.is_optional = is_optional;
     return pm;
 }
 

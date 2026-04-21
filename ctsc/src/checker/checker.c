@@ -3,6 +3,7 @@
 #include "ctsc/scanner.h"
 
 #include <limits.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -327,6 +328,146 @@ static CtscType* primitive_type_from_trimmed_span(CtscTypeRegistry* reg,
     return NULL;
 }
 
+static CtscType* type_from_annotation_fallback_span(CtscTypeRegistry* reg, const uint16_t* src, size_t src_len,
+                                                    int pos, int end);
+
+/*
+ * Comma-separated type list inside `[` ... `]` (tuple) or similar, respecting
+ * nesting and string literals (mirrors delimiter logic in
+ * type_from_annotation_fallback_span).
+ */
+static bool split_type_annotation_element_list(const uint16_t* s, int inner_a, int inner_b, int* el_starts,
+                                              int* el_ends, size_t* out_n, size_t max_n) {
+    int bd = 0, brd = 0, pd = 0, ad = 0;
+    bool in_dbl = false, in_sgl = false;
+    int seg0 = inner_a;
+    size_t n = 0;
+    for (int i = inner_a; i < inner_b; ++i) {
+        uint16_t c = s[i];
+        if (in_dbl) {
+            if (c == (uint16_t)'\\' && i + 1 < inner_b) {
+                i++;
+                continue;
+            }
+            if (c == (uint16_t)'"') in_dbl = false;
+            continue;
+        }
+        if (in_sgl) {
+            if (c == (uint16_t)'\\' && i + 1 < inner_b) {
+                i++;
+                continue;
+            }
+            if (c == (uint16_t)'\'') in_sgl = false;
+            continue;
+        }
+        if (c == (uint16_t)'"') {
+            in_dbl = true;
+            continue;
+        }
+        if (c == (uint16_t)'\'') {
+            in_sgl = true;
+            continue;
+        }
+
+        if (c == (uint16_t)'{') bd++;
+        else if (c == (uint16_t)'}' && bd > 0) bd--;
+        else if (c == (uint16_t)'[') brd++;
+        else if (c == (uint16_t)']' && brd > 0) brd--;
+        else if (c == (uint16_t)'(') pd++;
+        else if (c == (uint16_t)')' && pd > 0) pd--;
+        else if (c == (uint16_t)'<') ad++;
+        else if (c == (uint16_t)'>' && ad > 0) ad--;
+        else if (c == (uint16_t)',' && bd == 0 && brd == 0 && pd == 0 && ad == 0) {
+            if (n >= max_n) return false;
+            int te2 = inner_b;
+            int ss = u16_span_trim_bounds(s, seg0, i, &te2);
+            el_starts[n] = ss;
+            el_ends[n] = te2;
+            n++;
+            seg0 = i + 1;
+        }
+    }
+    if (n >= max_n) return false;
+    int te2 = inner_b;
+    int ss = u16_span_trim_bounds(s, seg0, inner_b, &te2);
+    el_starts[n] = ss;
+    el_ends[n] = te2;
+    n++;
+    *out_n = n;
+    return true;
+}
+
+/*
+ * Tuple type node text `[T0, T1, ...]` recovered from a parser fallback span
+ * (checker.ts getTypeFromArrayOrTupleTypeNode ~17824-17840).
+ */
+static CtscType* tuple_type_from_annotation_span(CtscTypeRegistry* reg, const uint16_t* s, size_t src_len, int a,
+                                                int b) {
+    int te = b;
+    a = u16_span_trim_bounds(s, a, b, &te);
+    b = te;
+    if (!s || a < 0 || b < 0 || a > (int)src_len || b > (int)src_len || a >= b) return NULL;
+    if (s[a] != (uint16_t)'[') return NULL;
+
+    int depth = 0;
+    bool in_dbl = false, in_sgl = false;
+    int close_i = -1;
+    for (int i = a; i < b; ++i) {
+        uint16_t c = s[i];
+        if (in_dbl) {
+            if (c == (uint16_t)'\\' && i + 1 < b) {
+                i++;
+                continue;
+            }
+            if (c == (uint16_t)'"') in_dbl = false;
+            continue;
+        }
+        if (in_sgl) {
+            if (c == (uint16_t)'\\' && i + 1 < b) {
+                i++;
+                continue;
+            }
+            if (c == (uint16_t)'\'') in_sgl = false;
+            continue;
+        }
+        if (c == (uint16_t)'"') {
+            in_dbl = true;
+            continue;
+        }
+        if (c == (uint16_t)'\'') {
+            in_sgl = true;
+            continue;
+        }
+
+        if (c == (uint16_t)'[') depth++;
+        else if (c == (uint16_t)']') {
+            depth--;
+            if (depth == 0) {
+                close_i = i;
+                break;
+            }
+        }
+    }
+    if (close_i < 0 || close_i != b - 1) return NULL;
+
+    int inner_a = a + 1;
+    int inner_b = close_i;
+    int ia = u16_span_trim_bounds(s, inner_a, inner_b, &te);
+    int ib = te;
+    if (ia >= ib) return ctsc_type_tuple(reg, NULL, 0);
+
+    int el_st[32], el_en[32];
+    size_t nel = 0;
+    if (!split_type_annotation_element_list(s, ia, ib, el_st, el_en, &nel, 32)) return NULL;
+
+    CtscType* elems_storage[32];
+    for (size_t ei = 0; ei < nel; ++ei) {
+        if (el_st[ei] >= el_en[ei]) return NULL;
+        elems_storage[ei] = type_from_annotation_fallback_span(reg, s, src_len, el_st[ei], el_en[ei]);
+    }
+    return ctsc_type_tuple(reg, elems_storage, nel);
+}
+
 /*
  * Intrinsic-only unions are ordered for typeToString the same way tsc orders
  * union constituents (checker.ts getUnionType ~14780+ / typeToString).
@@ -445,7 +586,8 @@ static CtscType* type_from_annotation_fallback_span(CtscTypeRegistry* reg, const
     CtscType* parts[32];
     size_t np = 0;
     for (size_t si = 0; si < nsp; ++si) {
-        CtscType* p = primitive_type_from_trimmed_span(reg, src, span_starts[si], span_ends[si]);
+        CtscType* p = tuple_type_from_annotation_span(reg, src, src_len, span_starts[si], span_ends[si]);
+        if (!p) p = primitive_type_from_trimmed_span(reg, src, span_starts[si], span_ends[si]);
         if (!p) return reg->t_any;
         parts[np++] = p;
     }
@@ -623,6 +765,7 @@ typedef struct {
     const uint16_t* name_ptr;
     size_t       name_len;
     CtscType*    value_type;
+    bool         optional;
 } TypeLiteralMember;
 
 /* Returns NULL → caller uses t_any. */
@@ -666,7 +809,17 @@ static CtscType* type_from_type_literal_span(CtscTypeRegistry* reg, const uint16
             *out_n = 0;
             return NULL;
         }
+        bool member_optional = false;
         while (i < inner_end && ctsc_is_ws_u16(src[i])) i++;
+        /*
+         * Optional PropertySignature / MethodSignature: Name `?` Type (parser.ts
+         * parsePropertyOrMethodSignature ~4268–4271, parseOptionalToken(QuestionToken)).
+         */
+        if (i < inner_end && src[i] == (uint16_t)'?') {
+            member_optional = true;
+            i++;
+            while (i < inner_end && ctsc_is_ws_u16(src[i])) i++;
+        }
         if (i >= inner_end || src[i] != (uint16_t)':') {
             *out_n = 0;
             return NULL;
@@ -685,6 +838,7 @@ static CtscType* type_from_type_literal_span(CtscTypeRegistry* reg, const uint16
         members_buf[count].name_ptr = src + name_start;
         members_buf[count].name_len = (size_t)(name_end - name_start);
         members_buf[count].value_type = pt;
+        members_buf[count].optional = member_optional;
         count++;
         i = type_end;
         while (i < inner_end && ctsc_is_ws_u16(src[i])) i++;
@@ -703,6 +857,7 @@ static CtscType* type_from_type_literal_span(CtscTypeRegistry* reg, const uint16
         props[k].name = members_buf[k].name_ptr;
         props[k].name_len = members_buf[k].name_len;
         props[k].value_type = members_buf[k].value_type;
+        props[k].optional = members_buf[k].optional;
     }
     return ctsc_type_object_literal(reg, props, count);
 }
@@ -811,6 +966,20 @@ static CtscType* infer_return_type_for_function_body(Walk* w, CtscTypeRegistry* 
                                                      const CtscNode* body, const CtscNode* scope_container);
 static CtscType* generic_call_instantiated_return_type(Walk* w, CtscTypeRegistry* reg, const CtscNode* fn_decl,
                                                       const CtscCallExpressionData* ce);
+static CtscType* instantiate_type_params_in_type(Walk* w, CtscTypeRegistry* reg, CtscType* t,
+                                                 const CtscNodeArray* type_params, CtscType** type_arg_values,
+                                                 size_t type_arg_count, unsigned depth);
+static CtscType* maybe_instantiate_class_member_type(Walk* w, CtscTypeRegistry* reg, const CtscNode* class_node,
+                                                     CtscType* member_type, CtscType** instance_args,
+                                                     size_t instance_arg_count);
+static bool identifier_is_class_constructor_name(const CtscNode* name_id);
+static const CtscNode* constructor_method_declaration(const CtscNode* class_decl);
+static bool constructor_parameter_matches_class_type_parameter(const CtscNode* class_decl, const CtscNode* param,
+                                                               size_t tp_index);
+static CtscType* inferred_generic_class_instance_from_new(Walk* w, CtscTypeRegistry* reg,
+                                                          const CtscNode* class_decl,
+                                                          const CtscIdentifierData* class_name_id,
+                                                          const CtscNewExpressionData* ne);
 
 /* Operand classification for binary `+` / ordering (checker.ts ~40837-40848). */
 static bool type_is_number_like(const CtscType* t) {
@@ -861,9 +1030,16 @@ static bool conditional_branch_types_identical(const CtscType* a, const CtscType
             return a->boolean_value == b->boolean_value;
         case CTSC_TYPE_REFERENCE: {
             if (a->text_len != b->text_len) return false;
-            if (a->text_len == 0) return true;
-            if (!a->text || !b->text) return a->text == b->text;
-            return memcmp(a->text, b->text, a->text_len * sizeof(uint16_t)) == 0;
+            if (a->text_len > 0) {
+                if (!a->text || !b->text) return a->text == b->text;
+                if (memcmp(a->text, b->text, a->text_len * sizeof(uint16_t)) != 0) return false;
+            }
+            if (a->reference_type_args_len != b->reference_type_args_len) return false;
+            for (size_t i = 0; i < a->reference_type_args_len; ++i) {
+                if (!conditional_branch_types_identical(a->reference_type_args[i], b->reference_type_args[i]))
+                    return false;
+            }
+            return true;
         }
         default:
             return false;
@@ -886,10 +1062,35 @@ static CtscType* union_conditional_branch_types(CtscTypeRegistry* reg, CtscType*
 }
 
 /*
+ * Numeric index for tuple element access when the argument is a numeric literal
+ * (checker.ts getPropertyTypeForIndexType ~19262-19279: tuple + numeric literal
+ * name → getTupleElementTypeOutOfStartCount).
+ */
+static bool tuple_index_from_access_argument(const CtscNode* arg, size_t* out_index) {
+    if (!arg || !out_index) return false;
+    if (arg->kind == CTSC_SK_NumericLiteral) {
+        double v = numeric_literal_to_double(&arg->data.numericLiteral);
+        if (v < 0 || v > (double)SIZE_MAX) return false;
+        size_t idx = (size_t)v;
+        if ((double)idx != v) return false;
+        *out_index = idx;
+        return true;
+    }
+    if (arg->kind == CTSC_SK_PrefixUnaryExpression) {
+        const CtscPrefixUnaryExpressionData* pu = &arg->data.prefixUnaryExpression;
+        if (pu->operator_kind == CTSC_SK_PlusToken && pu->operand) {
+            return tuple_index_from_access_argument(pu->operand, out_index);
+        }
+    }
+    return false;
+}
+
+/*
  * Instance type of a class declaration (`new C()` result type). Mirrors
  * checker.ts resolveNewExpression (~37131) + checkCallExpression NewExpression
  * branch (~37826): construct signature return type is the class instance type,
- * typeToString is the class name.
+ * typeToString is the class name. Generic classes without explicit `<...>` infer
+ * type arguments from constructor parameters (inferTypeArguments ~35827).
  */
 static CtscType* type_of_new_expression(Walk* w, CtscTypeRegistry* reg, const CtscNode* expr) {
     const CtscNewExpressionData* ne = &expr->data.newExpression;
@@ -903,9 +1104,30 @@ static CtscType* type_of_new_expression(Walk* w, CtscTypeRegistry* reg, const Ct
     for (size_t i = 0; i < sym->decls_len; ++i) {
         CtscNode* d = sym->decls[i];
         if (d && d->kind == CTSC_SK_ClassDeclaration) {
-            const CtscNode* cname = d->data.classDeclaration.name;
+            const CtscClassDeclarationData* cd = &d->data.classDeclaration;
+            const CtscNode* cname = cd->name;
             if (cname && cname->kind == CTSC_SK_Identifier) {
                 const CtscIdentifierData* id = &cname->data.identifier;
+                if (ne->has_type_arguments && ne->type_arguments.len > 0
+                    && cd->type_parameters.len == ne->type_arguments.len
+                    && cd->type_parameters.len <= 32) {
+                    CtscType* args_buf[32];
+                    size_t na = ne->type_arguments.len;
+                    for (size_t ai = 0; ai < na; ++ai) {
+                        CtscNode* tnode = ne->type_arguments.items[ai];
+                        args_buf[ai] =
+                            type_of_type_node(w, reg, w->source_utf16, w->source_utf16_len, tnode, 0);
+                        if (!args_buf[ai]) args_buf[ai] = reg->t_any;
+                    }
+                    CtscType** slot = (CtscType**)ctsc_arena_alloc(w->arena, na * sizeof(CtscType*));
+                    memcpy(slot, args_buf, na * sizeof(CtscType*));
+                    return ctsc_type_reference_with_type_args(reg, id->text, id->text_len, slot, na);
+                }
+                if (cd->type_parameters.len > 0 && cd->type_parameters.len <= 32) {
+                    CtscType* inferred_inst =
+                        inferred_generic_class_instance_from_new(w, reg, d, id, ne);
+                    if (inferred_inst) return inferred_inst;
+                }
                 return ctsc_type_reference(reg, id->text, id->text_len);
             }
             break;
@@ -1100,6 +1322,16 @@ static CtscType* type_of_expression(Walk* w, CtscTypeRegistry* reg, const CtscNo
             const CtscIdentifierData* id = &pa->name->data.identifier;
             return type_of_property_of_object_type(w, reg, obj_t, id->text, id->text_len);
         }
+        case CTSC_SK_ElementAccessExpression: {
+            const CtscElementAccessExpressionData* ea = &expr->data.elementAccessExpression;
+            CtscType* obj_t = type_of_expression(w, reg, ea->expression);
+            if (!obj_t || obj_t->kind != CTSC_TYPE_TUPLE) return reg->t_any;
+            size_t idx;
+            if (!tuple_index_from_access_argument(ea->argumentExpression, &idx)) return reg->t_any;
+            if (idx >= obj_t->tuple_elements_len) return reg->t_any;
+            CtscType* el = obj_t->tuple_elements[idx];
+            return el ? el : reg->t_any;
+        }
         default:
             /* All other expressions → any, for M4.0. */
             return reg->t_any;
@@ -1139,6 +1371,7 @@ static CtscType* type_of_object_literal_expression(Walk* w, CtscTypeRegistry* re
         props[count].name = pname;
         props[count].name_len = plen;
         props[count].value_type = vt;
+        props[count].optional = false;
         count++;
     }
     return ctsc_type_object_literal(reg, props, count);
@@ -1169,6 +1402,10 @@ static CtscType* type_of_property_of_object_type(Walk* w, CtscTypeRegistry* reg,
                 CtscNode* d = sym->decls[i];
                 if (d && d->kind == CTSC_SK_ClassDeclaration) {
                     CtscType* pt = property_type_from_class_declaration(w, d, prop_name, prop_len, 0);
+                    if (pt) {
+                        pt = maybe_instantiate_class_member_type(w, reg, d, pt, object_type->reference_type_args,
+                                                                 object_type->reference_type_args_len);
+                    }
                     if (pt) return pt;
                 }
             }
@@ -1187,6 +1424,94 @@ static bool utf16_type_text_equal(const uint16_t* a, size_t alen, const uint16_t
     if (alen == 0) return true;
     if (!a || !b) return a == b;
     return memcmp(a, b, alen * sizeof(uint16_t)) == 0;
+}
+
+/*
+ * Substitute class type parameters (checker.ts instantiateType ~19000+,
+ * getTypeOfPropertyOfType on generic class instance).
+ */
+static CtscType* instantiate_type_params_in_type(Walk* w, CtscTypeRegistry* reg, CtscType* t,
+                                                 const CtscNodeArray* type_params, CtscType** type_arg_values,
+                                                 size_t type_arg_count, unsigned depth) {
+    (void)w;
+    if (!t || !type_params || !type_arg_values || type_arg_count == 0 || depth > 48u) return t;
+
+    if (t->kind == CTSC_TYPE_REFERENCE) {
+        for (size_t i = 0; i < type_params->len && i < type_arg_count; ++i) {
+            const CtscNode* tp = type_params->items[i];
+            if (!tp || tp->kind != CTSC_SK_TypeParameter) continue;
+            const CtscNode* tname = tp->data.typeParameter.name;
+            if (!tname || tname->kind != CTSC_SK_Identifier) continue;
+            const CtscIdentifierData* tid = &tname->data.identifier;
+            if (utf16_type_text_equal(t->text, t->text_len, tid->text, tid->text_len)) {
+                return type_arg_values[i] ? type_arg_values[i] : reg->t_any;
+            }
+        }
+        if (t->reference_type_args_len > 0 && t->reference_type_args) {
+            CtscType** new_args =
+                (CtscType**)ctsc_arena_alloc(reg->arena, t->reference_type_args_len * sizeof(CtscType*));
+            bool changed = false;
+            for (size_t j = 0; j < t->reference_type_args_len; ++j) {
+                new_args[j] = instantiate_type_params_in_type(w, reg, t->reference_type_args[j], type_params,
+                                                              type_arg_values, type_arg_count, depth + 1);
+                if (new_args[j] != t->reference_type_args[j]) changed = true;
+            }
+            if (!changed) return t;
+            return ctsc_type_reference_with_type_args(reg, t->text, t->text_len, new_args,
+                                                      t->reference_type_args_len);
+        }
+        return t;
+    }
+    if (t->kind == CTSC_TYPE_UNION) {
+        CtscType** new_mem = (CtscType**)ctsc_arena_alloc(reg->arena, t->union_members_len * sizeof(CtscType*));
+        bool changed = false;
+        for (size_t i = 0; i < t->union_members_len; ++i) {
+            new_mem[i] = instantiate_type_params_in_type(w, reg, t->union_members[i], type_params, type_arg_values,
+                                                         type_arg_count, depth + 1);
+            if (new_mem[i] != t->union_members[i]) changed = true;
+        }
+        if (!changed) return t;
+        CtscType* u = ctsc_type_new(reg, CTSC_TYPE_UNION);
+        u->union_members = new_mem;
+        u->union_members_len = t->union_members_len;
+        return u;
+    }
+    if (t->kind == CTSC_TYPE_OBJECT_LITERAL) {
+        CtscObjectProperty* new_props =
+            (CtscObjectProperty*)ctsc_arena_alloc(reg->arena, t->object_properties_len * sizeof(CtscObjectProperty));
+        bool changed = false;
+        for (size_t i = 0; i < t->object_properties_len; ++i) {
+            new_props[i] = t->object_properties[i];
+            new_props[i].value_type =
+                instantiate_type_params_in_type(w, reg, t->object_properties[i].value_type, type_params,
+                                                type_arg_values, type_arg_count, depth + 1);
+            if (new_props[i].value_type != t->object_properties[i].value_type) changed = true;
+        }
+        if (!changed) return t;
+        return ctsc_type_object_literal(reg, new_props, t->object_properties_len);
+    }
+    if (t->kind == CTSC_TYPE_TUPLE) {
+        CtscType** new_el = (CtscType**)ctsc_arena_alloc(reg->arena, t->tuple_elements_len * sizeof(CtscType*));
+        bool changed = false;
+        for (size_t i = 0; i < t->tuple_elements_len; ++i) {
+            new_el[i] = instantiate_type_params_in_type(w, reg, t->tuple_elements[i], type_params, type_arg_values,
+                                                        type_arg_count, depth + 1);
+            if (new_el[i] != t->tuple_elements[i]) changed = true;
+        }
+        if (!changed) return t;
+        return ctsc_type_tuple(reg, new_el, t->tuple_elements_len);
+    }
+    return t;
+}
+
+static CtscType* maybe_instantiate_class_member_type(Walk* w, CtscTypeRegistry* reg, const CtscNode* class_node,
+                                                     CtscType* member_type, CtscType** instance_args,
+                                                     size_t instance_arg_count) {
+    (void)w;
+    if (!class_node || class_node->kind != CTSC_SK_ClassDeclaration || !member_type) return member_type;
+    const CtscNodeArray* tps = &class_node->data.classDeclaration.type_parameters;
+    if (!instance_args || instance_arg_count == 0 || tps->len != instance_arg_count) return member_type;
+    return instantiate_type_params_in_type(w, reg, member_type, tps, instance_args, instance_arg_count, 0);
 }
 
 /*
@@ -1371,6 +1696,26 @@ static bool try_emit_ts2322_object_literal_structural_mismatch(Walk* w, const Ct
 
 static bool is_assignable_to(Walk* w, CtscTypeRegistry* reg, CtscType* source, CtscType* target) {
     if (!source || !target) return true;
+    /*
+     * `const x: T = {}` gives the initializer type CTSC_TYPE_EMPTY_OBJECT
+     * (object literal with no properties). Assignable to an object type iff
+     * every target property is optional (checker.ts excess / missing checks
+     * ~13500+).
+     */
+    if (source->kind == CTSC_TYPE_EMPTY_OBJECT) {
+        if (target->kind == CTSC_TYPE_OBJECT_LITERAL) {
+            for (size_t ti = 0; ti < target->object_properties_len; ti++) {
+                if (!target->object_properties[ti].optional) return false;
+            }
+            return true;
+        }
+        if (target->kind == CTSC_TYPE_REFERENCE && w) {
+            CtscType* expanded = resolve_type_reference_to_object_literal(w, reg, target);
+            if (expanded && expanded->kind == CTSC_TYPE_OBJECT_LITERAL) {
+                return is_assignable_to(w, reg, source, expanded);
+            }
+        }
+    }
     if (source->kind == CTSC_TYPE_OBJECT_LITERAL && target->kind == CTSC_TYPE_REFERENCE && w) {
         CtscType* expanded = resolve_type_reference_to_object_literal(w, reg, target);
         if (expanded && expanded->kind == CTSC_TYPE_OBJECT_LITERAL) {
@@ -1426,13 +1771,30 @@ static bool is_assignable_to(Walk* w, CtscTypeRegistry* reg, CtscType* source, C
                     break;
                 }
             }
-            if (!sp_val) return false;
+            if (!sp_val) {
+                if (tp->optional) continue;
+                return false;
+            }
             if (!is_assignable_to(w, reg, sp_val, tp->value_type)) return false;
         }
         return true;
     }
+    if (source->kind == CTSC_TYPE_TUPLE && target->kind == CTSC_TYPE_TUPLE) {
+        if (source->tuple_elements_len != target->tuple_elements_len) return false;
+        for (size_t ti = 0; ti < target->tuple_elements_len; ti++) {
+            if (!is_assignable_to(w, reg, source->tuple_elements[ti], target->tuple_elements[ti])) return false;
+        }
+        return true;
+    }
     if (source->kind == CTSC_TYPE_REFERENCE && target->kind == CTSC_TYPE_REFERENCE) {
-        return utf16_type_text_equal(source->text, source->text_len, target->text, target->text_len);
+        if (!utf16_type_text_equal(source->text, source->text_len, target->text, target->text_len)) return false;
+        if (source->reference_type_args_len != target->reference_type_args_len) return false;
+        for (size_t i = 0; i < source->reference_type_args_len; ++i) {
+            CtscType* sa = source->reference_type_args[i];
+            CtscType* ta = target->reference_type_args[i];
+            if (!is_assignable_to(w, reg, sa, ta)) return false;
+        }
+        return true;
     }
     {
         CtscType* sw = ctsc_type_widen(reg, source);
@@ -1541,7 +1903,7 @@ static int function_declaration_min_arguments(const CtscNode* fn_decl) {
             min = i;
             continue;
         }
-        if (pd->initializer) {
+        if (pd->initializer || pd->is_optional) {
             min = i;
             continue;
         }
@@ -1639,6 +2001,88 @@ static CtscType* widen_nullish_when_not_strict_null(CtscTypeRegistry* reg, CtscT
     if (!t) return reg->t_any;
     if (t->kind == CTSC_TYPE_NULL || t->kind == CTSC_TYPE_UNDEFINED) return reg->t_any;
     return t;
+}
+
+static const CtscNode* constructor_method_declaration(const CtscNode* class_decl) {
+    if (!class_decl || class_decl->kind != CTSC_SK_ClassDeclaration) return NULL;
+    const CtscNodeArray* members = &class_decl->data.classDeclaration.members;
+    for (size_t i = 0; i < members->len; ++i) {
+        CtscNode* m = members->items[i];
+        if (!m || m->kind != CTSC_SK_MethodDeclaration) continue;
+        const CtscNode* nm = m->data.methodDeclaration.name;
+        if (identifier_is_class_constructor_name(nm)) return m;
+    }
+    return NULL;
+}
+
+static bool constructor_parameter_matches_class_type_parameter(const CtscNode* class_decl, const CtscNode* param,
+                                                                 size_t tp_index) {
+    if (!class_decl || class_decl->kind != CTSC_SK_ClassDeclaration || !param
+        || param->kind != CTSC_SK_Parameter) {
+        return false;
+    }
+    const CtscNodeArray* tps = &class_decl->data.classDeclaration.type_parameters;
+    if (tp_index >= tps->len) return false;
+    const CtscNode* tp = tps->items[tp_index];
+    if (!tp || tp->kind != CTSC_SK_TypeParameter) return false;
+    const CtscNode* tnm = tp->data.typeParameter.name;
+    if (!tnm || tnm->kind != CTSC_SK_Identifier) return false;
+    const CtscIdentifierData* tid = &tnm->data.identifier;
+
+    const CtscNode* pty = param->data.parameter.type;
+    if (!pty || pty->kind != CTSC_SK_TypeReference) return false;
+    const CtscTypeReferenceData* tr = &pty->data.typeReference;
+    if (!tr->typeName || tr->typeName->kind != CTSC_SK_Identifier) return false;
+    const CtscIdentifierData* pid = &tr->typeName->data.identifier;
+    return utf16_type_text_equal(pid->text, pid->text_len, tid->text, tid->text_len);
+}
+
+/*
+ * Infer `Box<number>` from `new Box(1)` by matching constructor parameters typed
+ * with class type parameters to `new` arguments (checker.ts inferTypeArguments
+ * / resolveCall on construct signatures ~35827, ~37131).
+ */
+static CtscType* inferred_generic_class_instance_from_new(Walk* w, CtscTypeRegistry* reg,
+                                                          const CtscNode* class_decl,
+                                                          const CtscIdentifierData* class_name_id,
+                                                          const CtscNewExpressionData* ne) {
+    if (!w || !reg || !class_decl || class_decl->kind != CTSC_SK_ClassDeclaration || !class_name_id || !ne)
+        return NULL;
+    const CtscClassDeclarationData* cd = &class_decl->data.classDeclaration;
+    size_t nt = cd->type_parameters.len;
+    if (nt == 0 || nt > 32) return NULL;
+
+    const CtscNode* ctor = constructor_method_declaration(class_decl);
+    if (!ctor || ctor->kind != CTSC_SK_MethodDeclaration) return NULL;
+    const CtscMethodDeclarationData* md = &ctor->data.methodDeclaration;
+    if (!ne->has_arguments) return NULL;
+
+    CtscType* inferred[32];
+    for (size_t i = 0; i < nt; ++i) inferred[i] = NULL;
+
+    for (size_t pi = 0; pi < md->parameters.len; ++pi) {
+        const CtscNode* param = md->parameters.items[pi];
+        if (!param || param->kind != CTSC_SK_Parameter) continue;
+        for (size_t ti = 0; ti < nt; ++ti) {
+            if (!constructor_parameter_matches_class_type_parameter(class_decl, param, ti)) continue;
+            if (inferred[ti] != NULL) break;
+            if (pi >= ne->arguments.len) break;
+            CtscType* arg_t = type_of_expression(w, reg, ne->arguments.items[pi]);
+            if (!arg_t) break;
+            /* Widen literals for type-parameter inference (checker.ts inferTypesFromArguments ~35827). */
+            inferred[ti] =
+                widen_nullish_when_not_strict_null(reg, ctsc_type_widen(reg, arg_t));
+            break;
+        }
+    }
+
+    for (size_t i = 0; i < nt; ++i) {
+        if (!inferred[i]) return NULL;
+    }
+
+    CtscType** slot = (CtscType**)ctsc_arena_alloc(w->arena, nt * sizeof(CtscType*));
+    memcpy(slot, inferred, nt * sizeof(CtscType*));
+    return ctsc_type_reference_with_type_args(reg, class_name_id->text, class_name_id->text_len, slot, nt);
 }
 
 /*
@@ -1857,6 +2301,26 @@ static void close_scope_if_container(Walk* w, const CtscNode* n) {
 }
 
 /*
+ * Array literal checked against a tuple annotation (checker.ts checkTypeRelatedTo
+ * for tuple targets ~22000+ / elementwise checks).
+ */
+static bool array_literal_assignable_to_tuple_type(Walk* w, const CtscNode* initializer, CtscType* tuple_ann) {
+    if (!initializer || initializer->kind != CTSC_SK_ArrayLiteralExpression || !tuple_ann
+        || tuple_ann->kind != CTSC_TYPE_TUPLE) {
+        return false;
+    }
+    const CtscArrayLiteralExpressionData* ar = &initializer->data.arrayLiteralExpression;
+    if (ar->elements.len != tuple_ann->tuple_elements_len) return false;
+    for (size_t i = 0; i < ar->elements.len; i++) {
+        CtscNode* el = ar->elements.items[i];
+        if (!el || el->kind == CTSC_SK_SpreadElement) return false;
+        CtscType* et = type_of_expression(w, &w->r->registry, el);
+        if (!is_assignable_to(w, &w->r->registry, et, tuple_ann->tuple_elements[i])) return false;
+    }
+    return true;
+}
+
+/*
  * VariableDeclarationList from a VariableStatement or a C-style ForStatement
  * initializer. Mirrors checker visiting order with bindVariableDeclaration in
  * binder.ts bindVariableDeclaration (~3648) scoped to ForStatement as
@@ -1916,7 +2380,13 @@ static void visit_variable_declaration_list(Walk* w, const CtscNode* list) {
         if (vd->type && vd->initializer) {
             CtscType* ann = type_of_type_node(w, &w->r->registry, w->source_utf16, w->source_utf16_len, vd->type, 0);
             CtscType* init_t = type_of_expression(w, &w->r->registry, vd->initializer);
-            if (!is_assignable_to(w, &w->r->registry, init_t, ann)) {
+            bool assign_ok;
+            if (ann->kind == CTSC_TYPE_TUPLE && vd->initializer->kind == CTSC_SK_ArrayLiteralExpression) {
+                assign_ok = array_literal_assignable_to_tuple_type(w, vd->initializer, ann);
+            } else {
+                assign_ok = is_assignable_to(w, &w->r->registry, init_t, ann);
+            }
+            if (!assign_ok) {
                 bool emitted = false;
                 if (vd->initializer->kind == CTSC_SK_ObjectLiteralExpression && init_t
                     && init_t->kind == CTSC_TYPE_OBJECT_LITERAL) {
@@ -2130,7 +2600,15 @@ static bool inferred_return_type_equal(CtscArena* arena, const CtscType* a, cons
                     || !utf16_type_text_equal(ap->name, ap->name_len, bp->name, bp->name_len)) {
                     return false;
                 }
+                if (ap->optional != bp->optional) return false;
                 if (!inferred_return_type_equal(arena, ap->value_type, bp->value_type)) return false;
+            }
+            return true;
+        }
+        case CTSC_TYPE_TUPLE: {
+            if (a->tuple_elements_len != b->tuple_elements_len) return false;
+            for (size_t i = 0; i < a->tuple_elements_len; ++i) {
+                if (!inferred_return_type_equal(arena, a->tuple_elements[i], b->tuple_elements[i])) return false;
             }
             return true;
         }
@@ -2419,6 +2897,7 @@ static void emit_function_signature_string(CtscBuffer* out, const CtscNodeArray*
         } else {
             ctsc_buf_append_cstr(out, "arg");
         }
+        if (p->data.parameter.is_optional) ctsc_buf_append_char(out, '?');
         ctsc_buf_append_cstr(out, ": ");
         if (p->data.parameter.type) {
             append_type_for_signature(out, p->data.parameter.type, src, src_len);
@@ -2549,6 +3028,24 @@ static void visit_call_expression(Walk* w, const CtscNode* n) {
     }
 }
 
+/*
+ * Class `constructor(...)` is parsed as MethodDeclaration with the synthetic
+ * name "constructor" (parser.ts parseClassElement ~8088). The types-channel
+ * oracle (oracle-checker-types) does not emit a MethodDeclaration entry for
+ * it—only constructor parameters—matching tsc's walk for this fixture
+ * (checker/generics/06_generic_class.ts).
+ */
+static bool identifier_is_class_constructor_name(const CtscNode* name_id) {
+    if (!name_id || name_id->kind != CTSC_SK_Identifier) return false;
+    const uint16_t* t = name_id->data.identifier.text;
+    size_t len = name_id->data.identifier.text_len;
+    static const uint16_t ctor_utf16[] = {
+        (uint16_t)'c', (uint16_t)'o', (uint16_t)'n', (uint16_t)'s', (uint16_t)'t',
+        (uint16_t)'r', (uint16_t)'u', (uint16_t)'c', (uint16_t)'t', (uint16_t)'o', (uint16_t)'r'};
+    if (len != sizeof(ctor_utf16) / sizeof(ctor_utf16[0])) return false;
+    return memcmp(t, ctor_utf16, len * sizeof(uint16_t)) == 0;
+}
+
 static void check_property_access_expression(Walk* w, const CtscNode* n) {
     if (!w || !n || n->kind != CTSC_SK_PropertyAccessExpression) return;
     const CtscPropertyAccessExpressionData* pa = &n->data.propertyAccessExpression;
@@ -2589,17 +3086,19 @@ static void visit_class_declaration(Walk* w, const CtscNode* n) {
             const CtscMethodDeclarationData* md = &m->data.methodDeclaration;
             const CtscNode* name_node = md->name;
             if (!name_node || name_node->kind != CTSC_SK_Identifier) continue;
-            CtscType* inferred_ret =
-                infer_return_type_for_function_body(w, &w->r->registry, w->arena, md->body, m);
-            CtscBuffer sig;
-            ctsc_buf_init(&sig);
-            emit_function_signature_string(&sig, &md->type_parameters, &md->parameters, &w->r->registry, md->type,
-                                           inferred_ret, w->source_utf16, w->source_utf16_len);
-            char* s = (char*)ctsc_arena_alloc(w->arena, sig.len);
-            memcpy(s, sig.data, sig.len);
-            size_t slen = sig.len;
-            ctsc_buf_free(&sig);
-            push_entry_with_string(w, m, name_node, s, slen);
+            if (!identifier_is_class_constructor_name(name_node)) {
+                CtscType* inferred_ret =
+                    infer_return_type_for_function_body(w, &w->r->registry, w->arena, md->body, m);
+                CtscBuffer sig;
+                ctsc_buf_init(&sig);
+                emit_function_signature_string(&sig, &md->type_parameters, &md->parameters, &w->r->registry, md->type,
+                                               inferred_ret, w->source_utf16, w->source_utf16_len);
+                char* s = (char*)ctsc_arena_alloc(w->arena, sig.len);
+                memcpy(s, sig.data, sig.len);
+                size_t slen = sig.len;
+                ctsc_buf_free(&sig);
+                push_entry_with_string(w, m, name_node, s, slen);
+            }
             /* Parameters: same types channel as FunctionDeclaration (checker.ts
              * getTypeOfVariableOrParameterOrPropertyWorker ~12554). */
             for (size_t pi = 0; pi < md->parameters.len; ++pi) {

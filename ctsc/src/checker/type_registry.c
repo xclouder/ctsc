@@ -88,6 +88,34 @@ CtscType* ctsc_type_reference(CtscTypeRegistry* reg, const uint16_t* name, size_
     return t;
 }
 
+CtscType* ctsc_type_reference_with_type_args(CtscTypeRegistry* reg, const uint16_t* name, size_t name_len,
+                                               CtscType** args, size_t arg_count) {
+    CtscType* t = ctsc_type_new(reg, CTSC_TYPE_REFERENCE);
+    t->text = name;
+    t->text_len = name_len;
+    if (arg_count > 0 && args) {
+        CtscType** slot = (CtscType**)ctsc_arena_alloc(reg->arena, arg_count * sizeof(CtscType*));
+        memcpy(slot, args, arg_count * sizeof(CtscType*));
+        t->reference_type_args = slot;
+        t->reference_type_args_len = arg_count;
+    }
+    return t;
+}
+
+CtscType* ctsc_type_tuple(CtscTypeRegistry* reg, CtscType** elements, size_t element_count) {
+    CtscType* t = ctsc_type_new(reg, CTSC_TYPE_TUPLE);
+    if (element_count > 0 && elements) {
+        CtscType** slot = (CtscType**)ctsc_arena_alloc(reg->arena, element_count * sizeof(CtscType*));
+        memcpy(slot, elements, element_count * sizeof(CtscType*));
+        t->tuple_elements = slot;
+        t->tuple_elements_len = element_count;
+    } else {
+        t->tuple_elements = NULL;
+        t->tuple_elements_len = 0;
+    }
+    return t;
+}
+
 /*
  * Literal → base widening (types.ts getWidenedLiteralType ~35395):
  *   42 → number,  "hi" → string,  true/false → boolean,  42n → bigint.
@@ -226,14 +254,32 @@ void ctsc_type_to_string(const CtscType* t, CtscBuffer* out) {
                 if (i > 0) ctsc_buf_append_cstr(out, "; ");
                 CtscObjectProperty* p = &t->object_properties[i];
                 append_utf16_ascii_identifier_prop_name(out, p->name, p->name_len);
+                if (p->optional) ctsc_buf_append_cstr(out, "?");
                 ctsc_buf_append_cstr(out, ": ");
                 ctsc_type_to_string(p->value_type, out);
             }
             ctsc_buf_append_cstr(out, "; }");
             return;
         }
+        case CTSC_TYPE_TUPLE: {
+            ctsc_buf_append_char(out, '[');
+            for (size_t i = 0; i < t->tuple_elements_len; ++i) {
+                if (i > 0) ctsc_buf_append_cstr(out, ", ");
+                ctsc_type_to_string(t->tuple_elements[i], out);
+            }
+            ctsc_buf_append_char(out, ']');
+            return;
+        }
         case CTSC_TYPE_REFERENCE:
             append_utf16_ascii_identifier_prop_name(out, t->text, t->text_len);
+            if (t->reference_type_args_len > 0 && t->reference_type_args) {
+                ctsc_buf_append_char(out, '<');
+                for (size_t i = 0; i < t->reference_type_args_len; ++i) {
+                    if (i > 0) ctsc_buf_append_cstr(out, ", ");
+                    ctsc_type_to_string(t->reference_type_args[i], out);
+                }
+                ctsc_buf_append_char(out, '>');
+            }
             return;
         default:
             ctsc_buf_append_cstr(out, "any");
