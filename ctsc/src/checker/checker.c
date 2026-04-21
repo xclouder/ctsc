@@ -274,11 +274,46 @@ static void append_trimmed_type_span_for_signature(CtscBuffer* out, const uint16
 static double numeric_literal_to_double(const CtscNumericLiteralData* d);
 
 /*
+ * Parsed-member row used by type_from_type_literal_span and the TypeLiteral
+ * branch of append_type_for_signature; defined up-front so the signature
+ * renderer can recover a CtscType from a `{ ... }` TypeLiteral span and
+ * stringify it via ctsc_type_to_string (checker.ts typeToString on an
+ * anonymous object ~6820+).
+ */
+typedef struct TypeLiteralMember {
+    int          name_pos;
+    int          name_end;
+    const uint16_t* name_ptr;
+    size_t       name_len;
+    CtscType*    value_type;
+    bool         optional;
+} TypeLiteralMember;
+
+/*
+ * Index signature `[key: string]: T` parsed from a type literal span
+ * (checker.ts IndexSignatureDeclaration / getTypeFromTypeNode).
+ */
+typedef struct TypeLiteralStringIndexInfo {
+    bool has_string_index;
+    int          param_name_pos;
+    int          param_name_end;
+    const uint16_t* param_name_ptr;
+    size_t       param_name_len;
+    CtscType*    key_type;
+    CtscType*    value_type;
+} TypeLiteralStringIndexInfo;
+
+static CtscType* type_from_type_literal_span(CtscTypeRegistry* reg, const uint16_t* src,
+                                            size_t src_len, int pos, int end,
+                                            TypeLiteralMember* members_buf, size_t members_cap, size_t* out_n,
+                                            TypeLiteralStringIndexInfo* out_idx);
+
+/*
  * Text used inside synthetic function signatures `(a: T) => R`. tsc keeps
  * postfix `T[]` spelling here even though getTypeAtLocation on `a` is `{}`
  * under noLib (oracle-checker-types.ts vs checker typeToString paths).
  */
-static void append_type_for_signature(CtscBuffer* out, const CtscNode* type_node,
+static void append_type_for_signature(CtscBuffer* out, CtscTypeRegistry* reg, const CtscNode* type_node,
                                      const uint16_t* src, size_t src_len) {
     if (!type_node) { ctsc_buf_append_cstr(out, "any"); return; }
     if (!src || type_node->pos < 0 || type_node->end < 0 || type_node->end > (int)src_len) {
@@ -320,7 +355,7 @@ static void append_type_for_signature(CtscBuffer* out, const CtscNode* type_node
                 ctsc_buf_append_char(out, '<');
                 for (size_t ai = 0; ai < tr->type_arguments.len; ++ai) {
                     if (ai > 0) ctsc_buf_append_cstr(out, ", ");
-                    append_type_for_signature(out, tr->type_arguments.items[ai], src, src_len);
+                    append_type_for_signature(out, reg, tr->type_arguments.items[ai], src, src_len);
                 }
                 ctsc_buf_append_char(out, '>');
                 {
@@ -404,6 +439,31 @@ static void append_type_for_signature(CtscBuffer* out, const CtscNode* type_node
         }
         case CTSC_SK_TrueKeyword:  ctsc_buf_append_cstr(out, "true");  return;
         case CTSC_SK_FalseKeyword: ctsc_buf_append_cstr(out, "false"); return;
+        case CTSC_SK_TypeLiteral: {
+            /*
+             * Anonymous object type used as a TypeNode (e.g. an overload
+             * return type `(url: "users"): { id: number; name: string }`).
+             * Mirrors checker.ts typeToString on an anonymous object type
+             * (~6820+): `{ a: T; b: U; }` with a trailing "; " before `}`.
+             * Without this branch the overload emitter falls through to
+             * `any`, which regresses fixtures where a TypeLiteral is used
+             * as a signature return annotation.
+             */
+            if (!reg) {
+                ctsc_buf_append_cstr(out, "any");
+                return;
+            }
+            TypeLiteralMember tmp[32];
+            size_t n = 0;
+            CtscType* t = type_from_type_literal_span(reg, src, src_len, type_node->pos, type_node->end,
+                                                      tmp, sizeof(tmp) / sizeof(tmp[0]), &n, NULL);
+            if (!t) {
+                ctsc_buf_append_cstr(out, "any");
+                return;
+            }
+            ctsc_type_to_string(t, out);
+            return;
+        }
         default:
             ctsc_buf_append_cstr(out, "any");
             return;
@@ -1202,28 +1262,9 @@ static int type_literal_scan_member_type_end(const uint16_t* s, int type_start, 
     return body_end;
 }
 
-typedef struct {
-    int          name_pos;
-    int          name_end;
-    const uint16_t* name_ptr;
-    size_t       name_len;
-    CtscType*    value_type;
-    bool         optional;
-} TypeLiteralMember;
-
-/*
- * Index signature `[key: string]: T` parsed from a type literal span
- * (checker.ts IndexSignatureDeclaration / getTypeFromTypeNode).
- */
-typedef struct {
-    bool has_string_index;
-    int          param_name_pos;
-    int          param_name_end;
-    const uint16_t* param_name_ptr;
-    size_t       param_name_len;
-    CtscType*    key_type;
-    CtscType*    value_type;
-} TypeLiteralStringIndexInfo;
+/* TypeLiteralMember / TypeLiteralStringIndexInfo are declared above (near
+ * append_type_for_signature) so the overload signature emitter can also
+ * recover a TypeLiteral into a CtscType. */
 
 /*
  * `readonly` before PropertySignature / MethodSignature (parser.ts parsePropertySignature
@@ -1545,6 +1586,13 @@ static CtscType* return_type_of_get_accessor_declaration(Walk* w, const CtscNode
 static CtscType* method_return_type_from_class_declaration(Walk* w, const CtscNode* class_node,
                                                            const uint16_t* prop_name, size_t prop_len,
                                                            unsigned depth, bool static_side);
+static CtscType* method_return_type_from_class_declaration_for_call(Walk* w, const CtscNode* class_node,
+                                                                    const uint16_t* prop_name, size_t prop_len,
+                                                                    unsigned depth, bool static_side,
+                                                                    const CtscCallExpressionData* ce);
+static size_t class_collect_method_overload_signature_decls(const CtscNode* class_node,
+                                                            const uint16_t* name_text, size_t name_len,
+                                                            bool static_side, const CtscNode** out, size_t out_cap);
 static CtscType* return_type_of_function_declaration(Walk* w, const CtscNode* fn_decl);
 static const CtscNode* symbol_function_declaration_decl(CtscSymbol* sym);
 static const CtscNode* symbol_resolve_overload_for_call(Walk* w, CtscSymbol* sym,
@@ -1941,9 +1989,13 @@ static CtscType* type_of_expression(Walk* w, CtscTypeRegistry* reg, const CtscNo
                         for (size_t i = 0; i < sym->decls_len; ++i) {
                             CtscNode* d = sym->decls[i];
                             if (d && d->kind == CTSC_SK_ClassDeclaration) {
-                                CtscType* rt = method_return_type_from_class_declaration(w, d, id->text,
-                                                                                       id->text_len, 0,
-                                                                                       static_member);
+                                /* Overload-aware method return type: mirrors
+                                 * checker.ts resolveCall / chooseOverload
+                                 * (~36750-36900) for class methods. Falls
+                                 * back to the first declaration when no
+                                 * signature matches. */
+                                CtscType* rt = method_return_type_from_class_declaration_for_call(
+                                    w, d, id->text, id->text_len, 0, static_member, ce);
                                 if (rt) return rt;
                             }
                         }
@@ -2980,16 +3032,14 @@ static void emit_ts2339_missing_property(CtscCheckResult* r, CtscArena* arena, C
 }
 
 /*
- * Minimum argument count for a FunctionDeclaration parameter list.
- * Mirrors checker.ts getMinArgumentCount / signature.minArgumentCount for the
- * simple cases we model: parameters after the first rest are ignored; a rest
- * parameter does not consume a required slot; parameters with default
- * initializers are optional from the right.
+ * Minimum argument count for a parameter list (kind-agnostic; shared between
+ * FunctionDeclaration and MethodDeclaration). Mirrors checker.ts
+ * getMinArgumentCount / signature.minArgumentCount: parameters after the
+ * first rest are ignored; a rest parameter does not consume a required slot;
+ * parameters with default initializers are optional from the right.
  */
-static int function_declaration_min_arguments(const CtscNode* fn_decl) {
-    if (!fn_decl || fn_decl->kind != CTSC_SK_FunctionDeclaration) return 0;
-    const CtscNodeArray* params = &fn_decl->data.functionDeclaration.parameters;
-    if (params->len == 0) return 0;
+static int parameters_min_arguments(const CtscNodeArray* params) {
+    if (!params || params->len == 0) return 0;
     int min = (int)params->len;
     for (int i = (int)params->len - 1; i >= 0; --i) {
         const CtscNode* p = params->items[i];
@@ -3013,20 +3063,44 @@ static int function_declaration_min_arguments(const CtscNode* fn_decl) {
 }
 
 /*
- * Maximum argument count for a FunctionDeclaration (no rest): parameter list
+ * Maximum argument count for a parameter list (no rest): parameter list
  * length. Rest parameters absorb extra arguments, so max is unbounded
  * (INT_MAX). Mirrors checker.ts getParameterCount (~38559-38567) for the
  * non-tuple-rest cases we model.
  */
-static int function_declaration_max_arguments(const CtscNode* fn_decl) {
-    if (!fn_decl || fn_decl->kind != CTSC_SK_FunctionDeclaration) return 0;
-    const CtscNodeArray* params = &fn_decl->data.functionDeclaration.parameters;
-    if (params->len == 0) return 0;
+static int parameters_max_arguments(const CtscNodeArray* params) {
+    if (!params || params->len == 0) return 0;
     const CtscNode* last = params->items[params->len - 1];
     if (last && last->kind == CTSC_SK_Parameter && last->data.parameter.has_dot_dot_dot) {
         return INT_MAX;
     }
     return (int)params->len;
+}
+
+static int function_declaration_min_arguments(const CtscNode* fn_decl) {
+    if (!fn_decl || fn_decl->kind != CTSC_SK_FunctionDeclaration) return 0;
+    return parameters_min_arguments(&fn_decl->data.functionDeclaration.parameters);
+}
+
+static int function_declaration_max_arguments(const CtscNode* fn_decl) {
+    if (!fn_decl || fn_decl->kind != CTSC_SK_FunctionDeclaration) return 0;
+    return parameters_max_arguments(&fn_decl->data.functionDeclaration.parameters);
+}
+
+/*
+ * Arity helpers for MethodDeclaration, paralleling the FunctionDeclaration
+ * variants above. Used by class-method overload resolution (fixtures
+ * checker/overload/07-11). Mirrors checker.ts getMinArgumentCount /
+ * getParameterCount applied to SyntaxKind.MethodDeclaration.
+ */
+static int method_declaration_min_arguments(const CtscNode* m) {
+    if (!m || m->kind != CTSC_SK_MethodDeclaration) return 0;
+    return parameters_min_arguments(&m->data.methodDeclaration.parameters);
+}
+
+static int method_declaration_max_arguments(const CtscNode* m) {
+    if (!m || m->kind != CTSC_SK_MethodDeclaration) return 0;
+    return parameters_max_arguments(&m->data.methodDeclaration.parameters);
 }
 
 /*
@@ -4210,6 +4284,102 @@ static CtscType* return_type_of_get_accessor_declaration(Walk* w, const CtscNode
 }
 
 /*
+ * Collect all MethodDeclaration members of `class_node` whose name matches
+ * `name_text` / `name_len` and whose static-ness matches `static_side`, in
+ * source order. Used as the starting point for overload-signature selection
+ * and overload resolution.
+ */
+static size_t class_collect_method_decls(const CtscNode* class_node,
+                                         const uint16_t* name_text, size_t name_len,
+                                         bool static_side, const CtscNode** out, size_t out_cap) {
+    if (!class_node || class_node->kind != CTSC_SK_ClassDeclaration || !out || out_cap == 0) return 0;
+    const CtscNodeArray* members = &class_node->data.classDeclaration.members;
+    size_t n = 0;
+    for (size_t i = 0; i < members->len && n < out_cap; ++i) {
+        CtscNode* mem = members->items[i];
+        if (!mem || mem->kind != CTSC_SK_MethodDeclaration) continue;
+        if (modifier_list_has_static(&mem->data.methodDeclaration.modifiers) != static_side) continue;
+        const CtscNode* pname = mem->data.methodDeclaration.name;
+        if (!pname || pname->kind != CTSC_SK_Identifier) continue;
+        if (pname->data.identifier.text_len != name_len) continue;
+        if (memcmp(pname->data.identifier.text, name_text, name_len * sizeof(uint16_t)) != 0) continue;
+        out[n++] = mem;
+    }
+    return n;
+}
+
+/*
+ * Canonical overload signatures for an overloaded class method, mirroring
+ * checker.ts getSignaturesOfSymbol (~16366+): when a method has both bodyless
+ * and bodied declarations on the same class, the bodied one is the
+ * implementation and is excluded from the type's call signatures. When all
+ * matching declarations are bodied (i.e. a single, non-overloaded method), we
+ * return that one. When all are bodyless (ambient / `declare class`), all are
+ * surfaced.
+ */
+static size_t class_collect_method_overload_signature_decls(const CtscNode* class_node,
+                                                            const uint16_t* name_text, size_t name_len,
+                                                            bool static_side, const CtscNode** out, size_t out_cap) {
+    const CtscNode* all[32];
+    size_t total = class_collect_method_decls(class_node, name_text, name_len, static_side, all,
+                                              sizeof(all) / sizeof(all[0]));
+    if (total == 0) return 0;
+    bool has_bodyless = false;
+    bool has_bodied   = false;
+    for (size_t i = 0; i < total; ++i) {
+        const CtscMethodDeclarationData* md = &all[i]->data.methodDeclaration;
+        if (md->body) has_bodied = true; else has_bodyless = true;
+    }
+    bool skip_bodied = has_bodyless && has_bodied;
+    size_t n = 0;
+    for (size_t i = 0; i < total && n < out_cap; ++i) {
+        const CtscMethodDeclarationData* md = &all[i]->data.methodDeclaration;
+        if (skip_bodied && md->body) continue;
+        out[n++] = all[i];
+    }
+    return n;
+}
+
+/*
+ * Overload resolution for a class-method CallExpression. Mirrors checker.ts
+ * resolveCall / chooseOverload (~36750-36900): iterate the canonical overload
+ * signatures for the method symbol in source order and return the first whose
+ * arity admits `args->len` and whose parameter types each accept the
+ * corresponding argument type. Returns NULL if no signature matches.
+ */
+static const CtscNode* class_resolve_method_overload_for_call(Walk* w, const CtscNode* class_node,
+                                                              const uint16_t* name_text, size_t name_len,
+                                                              bool static_side,
+                                                              const CtscCallExpressionData* ce) {
+    if (!w || !class_node || !ce) return NULL;
+    const CtscNode* sigs[16];
+    size_t sig_count = class_collect_method_overload_signature_decls(class_node, name_text, name_len,
+                                                                     static_side, sigs,
+                                                                     sizeof(sigs) / sizeof(sigs[0]));
+    if (sig_count == 0) return NULL;
+    const CtscNodeArray* args = &ce->arguments;
+    for (size_t i = 0; i < sig_count; ++i) {
+        const CtscNode* m = sigs[i];
+        int min = method_declaration_min_arguments(m);
+        int max = method_declaration_max_arguments(m);
+        if ((int)args->len < min) continue;
+        if (max != INT_MAX && (int)args->len > max) continue;
+        const CtscNodeArray* params = &m->data.methodDeclaration.parameters;
+        bool all_ok = true;
+        for (size_t ai = 0; ai < args->len; ++ai) {
+            if (ai >= params->len) break;
+            const CtscNode* p = params->items[ai];
+            if (!p || p->kind != CTSC_SK_Parameter) continue;
+            CtscType* pt = param_type(w, p);
+            CtscType* at = type_of_expression(w, &w->r->registry, args->items[ai]);
+            if (!is_assignable_to(w, &w->r->registry, at, pt)) { all_ok = false; break; }
+        }
+        if (all_ok) return m;
+    }
+    return NULL;
+}
+
+/*
  * Instance method lookup by name, including `extends` (checker.ts getPropertyOfType
  * feeding signature resolution ~11575+).
  */
@@ -4252,6 +4422,38 @@ static CtscType* method_return_type_from_class_declaration(Walk* w, const CtscNo
             }
         }
     }
+    return NULL;
+}
+
+/*
+ * Call-aware variant of method_return_type_from_class_declaration: when the
+ * method is overloaded (symbol has multiple bodyless signatures), pick the
+ * first overload whose parameters accept the call arguments. Falls back to
+ * the plain first-match lookup for single-signature methods or when nothing
+ * matches (so TS2769 diagnostics elsewhere still have a target).
+ */
+static CtscType* method_return_type_from_class_declaration_for_call(Walk* w, const CtscNode* class_node,
+                                                                    const uint16_t* prop_name, size_t prop_len,
+                                                                    unsigned depth, bool static_side,
+                                                                    const CtscCallExpressionData* ce) {
+    if (!class_node || class_node->kind != CTSC_SK_ClassDeclaration) return NULL;
+    if (depth > 64) return NULL;
+    const CtscNode* sigs[16];
+    size_t sig_count = class_collect_method_overload_signature_decls(class_node, prop_name, prop_len,
+                                                                     static_side, sigs,
+                                                                     sizeof(sigs) / sizeof(sigs[0]));
+    if (sig_count >= 2 && ce) {
+        const CtscNode* matched = class_resolve_method_overload_for_call(w, class_node, prop_name, prop_len,
+                                                                         static_side, ce);
+        if (matched) return return_type_of_method_declaration(w, matched);
+        /* No overload matched: fall through to first-decl lookup so the type
+         * channel still reports *something* (checker.ts ~36704-36748 picks
+         * the first candidate for error recovery before synthesising the
+         * TS2769 message). */
+    }
+    CtscType* local = method_return_type_from_class_declaration(w, class_node, prop_name, prop_len, depth,
+                                                                static_side);
+    if (local) return local;
     return NULL;
 }
 
@@ -4405,14 +4607,14 @@ static void emit_function_signature_string(CtscBuffer* out, const CtscNodeArray*
         if (p->data.parameter.is_optional) ctsc_buf_append_char(out, '?');
         ctsc_buf_append_cstr(out, ": ");
         if (p->data.parameter.type) {
-            append_type_for_signature(out, p->data.parameter.type, src, src_len);
+            append_type_for_signature(out, reg, p->data.parameter.type, src, src_len);
         } else {
             ctsc_type_to_string(reg->t_any, out);
         }
     }
     ctsc_buf_append_cstr(out, ") => ");
     if (return_type_node) {
-        append_type_for_signature(out, return_type_node, src, src_len);
+        append_type_for_signature(out, reg, return_type_node, src, src_len);
     } else if (inferred_return_type) {
         ctsc_type_to_string(inferred_return_type, out);
     } else {
@@ -4505,44 +4707,47 @@ static size_t symbol_collect_overload_signature_decls(CtscSymbol* sym, const Cts
  * signatures in a TypeLiteralNode is "; ".
  */
 /*
- * Write a single call-signature string `(p0: T0, ...): R` for one
- * FunctionDeclaration. Shared by the overloaded-function type literal
- * emitter (`emit_overload_object_type_string`) and the TS2769 message
- * formatter (`emit_ts2769_no_overload_match`). Mirrors checker.ts
- * signatureToString ~6202 with SignatureKind.Call and the colon separator.
+ * Write a single call-signature string `(p0: T0, ...): R` from the parts of a
+ * FunctionDeclaration / MethodDeclaration. Shared between the overloaded
+ * function and method type-literal emitters plus the TS2769 message
+ * formatter. Mirrors checker.ts signatureToString ~6202 with
+ * SignatureKind.Call and the colon separator.
  */
-static void emit_call_signature_decl_string(CtscBuffer* out, CtscTypeRegistry* reg, const CtscNode* fn,
-                                             const uint16_t* src, size_t src_len) {
-    if (!fn || fn->kind != CTSC_SK_FunctionDeclaration) return;
-    const CtscFunctionDeclarationData* fd = &fn->data.functionDeclaration;
-    emit_type_parameters_for_signature(out, &fd->type_parameters);
+static void emit_call_signature_decl_string_parts(CtscBuffer* out, CtscTypeRegistry* reg,
+                                                  const CtscNodeArray* type_parameters,
+                                                  const CtscNodeArray* parameters,
+                                                  const CtscNode* return_type_node,
+                                                  const uint16_t* src, size_t src_len) {
+    if (type_parameters) emit_type_parameters_for_signature(out, type_parameters);
     ctsc_buf_append_char(out, '(');
-    for (size_t pi = 0; pi < fd->parameters.len; ++pi) {
-        const CtscNode* p = fd->parameters.items[pi];
-        if (pi > 0) ctsc_buf_append_cstr(out, ", ");
-        if (!p || p->kind != CTSC_SK_Parameter) continue;
-        if (p->data.parameter.has_dot_dot_dot) ctsc_buf_append_cstr(out, "...");
-        const CtscNode* name = p->data.parameter.name;
-        if (name && name->kind == CTSC_SK_Identifier) {
-            const CtscIdentifierData* id = &name->data.identifier;
-            for (size_t k = 0; k < id->text_len; ++k) {
-                uint16_t u = id->text[k];
-                if (u < 0x80) ctsc_buf_append_char(out, (char)u);
+    if (parameters) {
+        for (size_t pi = 0; pi < parameters->len; ++pi) {
+            const CtscNode* p = parameters->items[pi];
+            if (pi > 0) ctsc_buf_append_cstr(out, ", ");
+            if (!p || p->kind != CTSC_SK_Parameter) continue;
+            if (p->data.parameter.has_dot_dot_dot) ctsc_buf_append_cstr(out, "...");
+            const CtscNode* name = p->data.parameter.name;
+            if (name && name->kind == CTSC_SK_Identifier) {
+                const CtscIdentifierData* id = &name->data.identifier;
+                for (size_t k = 0; k < id->text_len; ++k) {
+                    uint16_t u = id->text[k];
+                    if (u < 0x80) ctsc_buf_append_char(out, (char)u);
+                }
+            } else {
+                ctsc_buf_append_cstr(out, "arg");
             }
-        } else {
-            ctsc_buf_append_cstr(out, "arg");
-        }
-        if (p->data.parameter.is_optional) ctsc_buf_append_char(out, '?');
-        ctsc_buf_append_cstr(out, ": ");
-        if (p->data.parameter.type) {
-            append_type_for_signature(out, p->data.parameter.type, src, src_len);
-        } else {
-            ctsc_type_to_string(reg->t_any, out);
+            if (p->data.parameter.is_optional) ctsc_buf_append_char(out, '?');
+            ctsc_buf_append_cstr(out, ": ");
+            if (p->data.parameter.type) {
+                append_type_for_signature(out, reg, p->data.parameter.type, src, src_len);
+            } else {
+                ctsc_type_to_string(reg->t_any, out);
+            }
         }
     }
     ctsc_buf_append_cstr(out, "): ");
-    if (fd->type) {
-        append_type_for_signature(out, fd->type, src, src_len);
+    if (return_type_node) {
+        append_type_for_signature(out, reg, return_type_node, src, src_len);
     } else {
         /* Bodyless with no return annotation would be `any` in ambient
          * contexts; for an implementation that slipped through we fall
@@ -4552,12 +4757,27 @@ static void emit_call_signature_decl_string(CtscBuffer* out, CtscTypeRegistry* r
     }
 }
 
+static void emit_call_signature_decl_string(CtscBuffer* out, CtscTypeRegistry* reg, const CtscNode* fn,
+                                             const uint16_t* src, size_t src_len) {
+    if (!fn) return;
+    if (fn->kind == CTSC_SK_FunctionDeclaration) {
+        const CtscFunctionDeclarationData* fd = &fn->data.functionDeclaration;
+        emit_call_signature_decl_string_parts(out, reg, &fd->type_parameters, &fd->parameters, fd->type,
+                                              src, src_len);
+    } else if (fn->kind == CTSC_SK_MethodDeclaration) {
+        const CtscMethodDeclarationData* md = &fn->data.methodDeclaration;
+        emit_call_signature_decl_string_parts(out, reg, &md->type_parameters, &md->parameters, md->type,
+                                              src, src_len);
+    }
+}
+
 static void emit_overload_object_type_string(CtscBuffer* out, CtscTypeRegistry* reg, const CtscNode** sigs,
                                               size_t sig_count, const uint16_t* src, size_t src_len) {
     ctsc_buf_append_cstr(out, "{ ");
     for (size_t i = 0; i < sig_count; ++i) {
         const CtscNode* fn = sigs[i];
-        if (!fn || fn->kind != CTSC_SK_FunctionDeclaration) continue;
+        if (!fn) continue;
+        if (fn->kind != CTSC_SK_FunctionDeclaration && fn->kind != CTSC_SK_MethodDeclaration) continue;
         emit_call_signature_decl_string(out, reg, fn, src, src_len);
         ctsc_buf_append_cstr(out, "; ");
     }
@@ -4685,33 +4905,56 @@ static const CtscNode* symbol_resolve_overload_for_call(Walk* w, CtscSymbol* sym
 }
 
 /*
+ * Parameters of a signature-bearing declaration (FunctionDeclaration or
+ * MethodDeclaration). Returns NULL for any other kind. Mirrors checker.ts
+ * getParametersOfSignature: the two declaration kinds we model share the
+ * same parameter-list shape (NodeArray<ParameterDeclaration>).
+ */
+static const CtscNodeArray* signature_decl_parameters(const CtscNode* fn) {
+    if (!fn) return NULL;
+    if (fn->kind == CTSC_SK_FunctionDeclaration) return &fn->data.functionDeclaration.parameters;
+    if (fn->kind == CTSC_SK_MethodDeclaration) return &fn->data.methodDeclaration.parameters;
+    return NULL;
+}
+
+/*
  * Append one "Argument of type 'X' is not assignable to parameter of type 'Y'."
  * line (same text as TS2345) for the first mismatched argument of `fn` relative
  * to `args`. Returns true if a mismatch was found and appended. Mirrors
  * checker.ts getSignatureApplicabilityError (~36712) restricted to the single
- * top-level argument mismatch we model in M4.
+ * top-level argument mismatch we model in M4. Accepts both FunctionDeclaration
+ * and MethodDeclaration signatures (class-method overloads route here too).
  */
 static bool append_overload_argument_error(CtscBuffer* out, Walk* w, const CtscNode* fn,
                                            const CtscNodeArray* args) {
-    if (!fn || fn->kind != CTSC_SK_FunctionDeclaration) return false;
-    const CtscNodeArray* params = &fn->data.functionDeclaration.parameters;
+    const CtscNodeArray* params = signature_decl_parameters(fn);
+    if (!params) return false;
+    const bool is_fn = (fn->kind == CTSC_SK_FunctionDeclaration);
     for (size_t ai = 0; ai < args->len; ++ai) {
         if (ai >= params->len) break;
         const CtscNode* p = params->items[ai];
         if (!p || p->kind != CTSC_SK_Parameter) continue;
-        if (parameter_type_is_declared_type_parameter(fn, p)) continue;
+        if (is_fn && parameter_type_is_declared_type_parameter(fn, p)) continue;
         CtscType* pt = param_type(w, p);
         CtscType* at = type_of_expression(w, &w->r->registry, args->items[ai]);
         if (is_assignable_to(w, &w->r->registry, at, pt)) continue;
         CtscTypeRegistry* reg = &w->r->registry;
-        const bool both_str_lit = at && pt
-            && at->kind == CTSC_TYPE_STRING_LITERAL
-            && pt->kind == CTSC_TYPE_STRING_LITERAL;
-        const bool both_num_lit = at && pt
-            && at->kind == CTSC_TYPE_NUMBER_LITERAL
-            && pt->kind == CTSC_TYPE_NUMBER_LITERAL;
-        CtscType* src_m = (both_str_lit || both_num_lit) ? at : ctsc_type_widen(reg, at);
-        CtscType* tgt_m = (both_str_lit || both_num_lit) ? pt : ctsc_type_widen(reg, pt);
+        /*
+         * When the target parameter type is itself a literal type, tsc
+         * narrows the argument via getContextualTypeForArgument so the
+         * reported `source` keeps its literal form (checker.ts
+         * getSignatureApplicabilityError → checkTypeRelatedTo, ~36712).
+         * Mirror that by skipping widening on BOTH sides whenever `target`
+         * is a literal (e.g. `"name"`, `42`, `true`), not just when source
+         * and target happen to be the same literal kind.
+         */
+        const bool target_is_literal = pt && (
+            pt->kind == CTSC_TYPE_STRING_LITERAL
+            || pt->kind == CTSC_TYPE_NUMBER_LITERAL
+            || pt->kind == CTSC_TYPE_BOOLEAN_LITERAL
+            || pt->kind == CTSC_TYPE_BIGINT_LITERAL);
+        CtscType* src_m = target_is_literal ? at : ctsc_type_widen(reg, at);
+        CtscType* tgt_m = target_is_literal ? pt : ctsc_type_widen(reg, pt);
         ctsc_buf_append_cstr(out, "Argument of type '");
         ctsc_type_to_string(src_m, out);
         ctsc_buf_append_cstr(out, "' is not assignable to parameter of type '");
@@ -4750,12 +4993,13 @@ static void emit_ts2769_no_overload_match(Walk* w, const CtscNode* call_node,
         bool any_mismatch = false;
         for (size_t si = 0; si < sig_count; ++si) {
             const CtscNode* fn = sigs[si];
-            if (!fn || fn->kind != CTSC_SK_FunctionDeclaration) continue;
-            const CtscNodeArray* params = &fn->data.functionDeclaration.parameters;
+            const CtscNodeArray* params = signature_decl_parameters(fn);
+            if (!params) continue;
             if (ai >= params->len) continue;
             const CtscNode* p = params->items[ai];
             if (!p || p->kind != CTSC_SK_Parameter) continue;
-            if (parameter_type_is_declared_type_parameter(fn, p)) continue;
+            if (fn->kind == CTSC_SK_FunctionDeclaration
+                && parameter_type_is_declared_type_parameter(fn, p)) continue;
             CtscType* pt = param_type(w, p);
             CtscType* at = type_of_expression(w, &w->r->registry, arg);
             if (!is_assignable_to(w, &w->r->registry, at, pt)) { any_mismatch = true; break; }
@@ -4774,7 +5018,8 @@ static void emit_ts2769_no_overload_match(Walk* w, const CtscNode* call_node,
     size_t appended = 0;
     for (size_t i = 0; i < sig_count; ++i) {
         const CtscNode* fn = sigs[i];
-        if (!fn || fn->kind != CTSC_SK_FunctionDeclaration) continue;
+        if (!fn) continue;
+        if (fn->kind != CTSC_SK_FunctionDeclaration && fn->kind != CTSC_SK_MethodDeclaration) continue;
         CtscBuffer inner;
         ctsc_buf_init(&inner);
         bool has_err = append_overload_argument_error(&inner, w, fn, args);
@@ -4823,6 +5068,53 @@ static void visit_call_expression(Walk* w, const CtscNode* n) {
     const CtscNode* overload_sigs[16];
     size_t overload_sig_count = 0;
     bool overload_no_match = false;
+    /*
+     * Class-method call: `obj.m(args)` where `obj` has a class reference
+     * type and `m` resolves to an overloaded MethodDeclaration set. Mirrors
+     * the resolveCall / chooseOverload path in checker.ts (~36750-36900) for
+     * method symbols; when none of the arity-compatible signatures accept
+     * the arguments, tsc reports a single TS2769 chain the same way it does
+     * for plain function overloads (~36704-36748).
+     */
+    if (callee && callee->kind == CTSC_SK_PropertyAccessExpression) {
+        const CtscPropertyAccessExpressionData* pa = &callee->data.propertyAccessExpression;
+        if (pa->name && pa->name->kind == CTSC_SK_Identifier) {
+            const CtscIdentifierData* mid = &pa->name->data.identifier;
+            CtscType* obj_t = type_of_expression(w, &w->r->registry, pa->expression);
+            bool static_member = (obj_t && obj_t->kind == CTSC_TYPE_CLASS_CONSTRUCTOR);
+            if (obj_t && (obj_t->kind == CTSC_TYPE_REFERENCE || static_member)) {
+                CtscSymbol* class_sym = resolve_name(&w->scopes, obj_t->text, obj_t->text_len);
+                const CtscNode* class_decl = NULL;
+                if (class_sym) {
+                    for (size_t i = 0; i < class_sym->decls_len; ++i) {
+                        CtscNode* d = class_sym->decls[i];
+                        if (d && d->kind == CTSC_SK_ClassDeclaration) { class_decl = d; break; }
+                    }
+                }
+                if (class_decl) {
+                    overload_sig_count = class_collect_method_overload_signature_decls(
+                        class_decl, mid->text, mid->text_len, static_member,
+                        overload_sigs, sizeof(overload_sigs) / sizeof(overload_sigs[0]));
+                    if (overload_sig_count >= 2) {
+                        size_t arity_ok = 0;
+                        for (size_t i = 0; i < overload_sig_count; ++i) {
+                            const CtscNode* m = overload_sigs[i];
+                            int min = method_declaration_min_arguments(m);
+                            int max = method_declaration_max_arguments(m);
+                            if ((int)args->len < min) continue;
+                            if (max != INT_MAX && (int)args->len > max) continue;
+                            ++arity_ok;
+                        }
+                        if (arity_ok >= 2) {
+                            const CtscNode* matched = class_resolve_method_overload_for_call(
+                                w, class_decl, mid->text, mid->text_len, static_member, ce);
+                            if (!matched) overload_no_match = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
     if (callee && callee->kind == CTSC_SK_Identifier) {
         const uint16_t* nm = callee->data.identifier.text;
         size_t nl = callee->data.identifier.text_len;
@@ -4961,22 +5253,50 @@ static void visit_class_declaration(Walk* w, const CtscNode* n) {
              * checker.ts getTypeOfSymbol / typeToString on a method signature
              * (~12537+): oracle records MethodDeclaration name nodes with the
              * `() => Return` form (same as FunctionDeclaration entries).
+             *
+             * For an *overloaded* method (multiple MethodDeclaration siblings
+             * on the same class with the same name, where at least one is
+             * bodyless and at least one is bodied), getTypeOfSymbol returns an
+             * anonymous type with one call signature per bodyless overload.
+             * Mirrors checker.ts getSignaturesOfSymbol (~16366+) + the
+             * createAnonymousTypeNode path used by typeToString for resolved
+             * function types with >1 call signatures. typeToString renders
+             * such types with the `CallSignature` `(params): R` form (colon
+             * separator, no `=>`) and a `; ` separator between signatures.
              */
             const CtscMethodDeclarationData* md = &m->data.methodDeclaration;
             const CtscNode* name_node = md->name;
             if (!name_node || name_node->kind != CTSC_SK_Identifier) continue;
             if (!identifier_is_class_constructor_name(name_node)) {
-                CtscType* inferred_ret =
-                    infer_return_type_for_function_body(w, &w->r->registry, w->arena, md->body, m);
-                CtscBuffer sig;
-                ctsc_buf_init(&sig);
-                emit_function_signature_string(&sig, &md->type_parameters, &md->parameters, &w->r->registry, md->type,
-                                               inferred_ret, w->source_utf16, w->source_utf16_len);
-                char* s = (char*)ctsc_arena_alloc(w->arena, sig.len);
-                memcpy(s, sig.data, sig.len);
-                size_t slen = sig.len;
-                ctsc_buf_free(&sig);
-                push_entry_with_string(w, m, name_node, s, slen);
+                const CtscIdentifierData* nmid = &name_node->data.identifier;
+                const bool is_static = modifier_list_has_static(&md->modifiers);
+                const CtscNode* sigs[16];
+                size_t sig_count = class_collect_method_overload_signature_decls(
+                    n, nmid->text, nmid->text_len, is_static, sigs, sizeof(sigs) / sizeof(sigs[0]));
+                if (sig_count > 1) {
+                    CtscBuffer sig;
+                    ctsc_buf_init(&sig);
+                    emit_overload_object_type_string(&sig, &w->r->registry, sigs, sig_count,
+                                                     w->source_utf16, w->source_utf16_len);
+                    char* s = (char*)ctsc_arena_alloc(w->arena, sig.len);
+                    memcpy(s, sig.data, sig.len);
+                    size_t slen = sig.len;
+                    ctsc_buf_free(&sig);
+                    push_entry_with_string(w, m, name_node, s, slen);
+                } else {
+                    CtscType* inferred_ret =
+                        infer_return_type_for_function_body(w, &w->r->registry, w->arena, md->body, m);
+                    CtscBuffer sig;
+                    ctsc_buf_init(&sig);
+                    emit_function_signature_string(&sig, &md->type_parameters, &md->parameters,
+                                                   &w->r->registry, md->type, inferred_ret,
+                                                   w->source_utf16, w->source_utf16_len);
+                    char* s = (char*)ctsc_arena_alloc(w->arena, sig.len);
+                    memcpy(s, sig.data, sig.len);
+                    size_t slen = sig.len;
+                    ctsc_buf_free(&sig);
+                    push_entry_with_string(w, m, name_node, s, slen);
+                }
             }
             /* Parameters: same types channel as FunctionDeclaration (checker.ts
              * getTypeOfVariableOrParameterOrPropertyWorker ~12554). */
@@ -4984,6 +5304,26 @@ static void visit_class_declaration(Walk* w, const CtscNode* n) {
                 const CtscNode* p = md->parameters.items[pi];
                 if (!p || p->kind != CTSC_SK_Parameter) continue;
                 push_entry_for_name(w, p, p->data.parameter.name, param_type(w, p));
+                /*
+                 * Parameter type annotations that are TypeLiteral yield a
+                 * PropertySignature entry per member (oracle walks children
+                 * via ts.forEachChild; checker.ts PropertySignature dumps
+                 * its own type via getTypeOfSymbol, same path used for
+                 * variable-declaration TypeLiteral annotations).
+                 */
+                if (p->data.parameter.type && p->data.parameter.type->kind == CTSC_SK_TypeLiteral) {
+                    push_property_signatures_from_type_literal(w, p->data.parameter.type);
+                }
+            }
+            /*
+             * Return-type TypeLiteral: oracle walks into the method's type
+             * node too, so `fetch(): { id: number; name: string }` contributes
+             * PropertySignature entries for `id` and `name` between the
+             * method's parameters and the next method signature. Mirrors
+             * ts.forEachChild descent in oracle-checker-types.ts.
+             */
+            if (md->type && md->type->kind == CTSC_SK_TypeLiteral) {
+                push_property_signatures_from_type_literal(w, md->type);
             }
         } else if (m->kind == CTSC_SK_SetAccessor) {
             /*
