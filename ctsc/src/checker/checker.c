@@ -3800,6 +3800,24 @@ static void visit_variable_declaration_list(Walk* w, const CtscNode* list) {
         if (vd->type && vd->type->kind == CTSC_SK_TypeLiteral) {
             push_property_signatures_from_type_literal(w, vd->type);
         }
+        /*
+         * TypeReference with TypeLiteral type arguments: the oracle walks
+         * children via ts.forEachChild, which visits each type argument of
+         * a TypeReference and then recurses into TypeLiteral members. Emit
+         * one PropertySignature entry per inner member (fixture
+         * checker/generic_constraints/04_class_generic_constraint.ts:
+         * `declare const c: Container<{ id: number; name: string }>`).
+         */
+        if (vd->type && vd->type->kind == CTSC_SK_TypeReference
+            && vd->type->data.typeReference.has_type_arguments) {
+            const CtscNodeArray* tas = &vd->type->data.typeReference.type_arguments;
+            for (size_t ai = 0; ai < tas->len; ++ai) {
+                const CtscNode* ta = tas->items[ai];
+                if (ta && ta->kind == CTSC_SK_TypeLiteral) {
+                    push_property_signatures_from_type_literal(w, ta);
+                }
+            }
+        }
         if (vd->type && vd->initializer) {
             CtscType* ann = type_of_type_node(w, &w->r->registry, w->source_utf16, w->source_utf16_len, vd->type, 0);
             CtscType* init_t = type_of_expression(w, &w->r->registry, vd->initializer);
@@ -4497,10 +4515,148 @@ static bool parameter_type_is_declared_type_parameter(const CtscNode* fn_decl, c
 }
 
 /*
- * Generic call return instantiation: when the function body's inferred return
- * type is a type parameter (e.g. `return x` with `x: A`), map that parameter
- * to either explicit type arguments (`first<number, string>(...)`) or the
- * corresponding argument type (`first(1, "x")` → `1`).
+ * Look up the TypeParameter declaration node whose name matches `param`'s
+ * TypeReference annotation. Mirrors checker.ts getTypeParameterFromName path
+ * used inside resolveCall when narrowing an argument against its type
+ * parameter's constraint. Returns NULL when `param` is not annotated with a
+ * TypeReference, or no type parameter with that name is declared on the
+ * signature.
+ */
+static const CtscNode* type_parameter_for_parameter(const CtscNode* fn_decl, const CtscNode* param) {
+    if (!fn_decl || fn_decl->kind != CTSC_SK_FunctionDeclaration) return NULL;
+    if (!param || param->kind != CTSC_SK_Parameter) return NULL;
+    const CtscNode* pty = param->data.parameter.type;
+    if (!pty || pty->kind != CTSC_SK_TypeReference) return NULL;
+    const CtscTypeReferenceData* tr = &pty->data.typeReference;
+    if (!tr->typeName || tr->typeName->kind != CTSC_SK_Identifier) return NULL;
+    const CtscIdentifierData* pid = &tr->typeName->data.identifier;
+    const CtscNodeArray* tps = &fn_decl->data.functionDeclaration.type_parameters;
+    for (size_t ti = 0; ti < tps->len; ++ti) {
+        const CtscNode* tp = tps->items[ti];
+        if (!tp || tp->kind != CTSC_SK_TypeParameter) continue;
+        const CtscNode* tnm = tp->data.typeParameter.name;
+        if (!tnm || tnm->kind != CTSC_SK_Identifier) continue;
+        const CtscIdentifierData* tid = &tnm->data.identifier;
+        if (utf16_type_text_equal(pid->text, pid->text_len, tid->text, tid->text_len)) return tp;
+    }
+    return NULL;
+}
+
+/*
+ * Build an inference map: for each type parameter declared on `fn_decl`, record
+ * the type inferred from either an explicit `<T0, ...>` type argument list or
+ * the argument passed for a parameter annotated directly with that type
+ * parameter (`x: K`). Entries are NULL when no inference is available.
+ *
+ * Mirrors checker.ts inferTypeArguments (~35827+): for the subset we handle
+ * (direct TypeReference parameters), each type parameter is inferred from its
+ * matching argument. Unconstrained parameters get the widened literal type
+ * (mirrors isLiteralType widening in getInferredType ~36000); constrained
+ * parameters keep the narrow literal so `<K extends string>(k: K)` with
+ * `pair("name", ...)` infers `K = "name"`.
+ */
+static void collect_generic_call_inferences(Walk* w, CtscTypeRegistry* reg, const CtscNode* fn_decl,
+                                             const CtscCallExpressionData* ce, CtscType** out_infer,
+                                             size_t out_infer_cap) {
+    for (size_t i = 0; i < out_infer_cap; ++i) out_infer[i] = NULL;
+    if (!w || !reg || !fn_decl || fn_decl->kind != CTSC_SK_FunctionDeclaration || !ce) return;
+    const CtscFunctionDeclarationData* fd = &fn_decl->data.functionDeclaration;
+    if (fd->type_parameters.len == 0) return;
+
+    /* Explicit type arguments win over inference (checker.ts
+     * resolveUntypedCall path when typeArguments is set). */
+    if (ce->has_type_arguments && ce->type_arguments.len == fd->type_parameters.len) {
+        for (size_t ti = 0; ti < fd->type_parameters.len && ti < out_infer_cap; ++ti) {
+            CtscType* explicit_t = type_of_type_node(w, reg, w->source_utf16, w->source_utf16_len,
+                                                     ce->type_arguments.items[ti], 0);
+            if (explicit_t) out_infer[ti] = widen_nullish_when_not_strict_null(reg, explicit_t);
+        }
+        return;
+    }
+
+    /* Parameter-based inference: match argument type to each parameter
+     * whose annotation is a TypeReference naming a type parameter. */
+    for (size_t i = 0; i < fd->parameters.len && i < ce->arguments.len; ++i) {
+        const CtscNode* param = fd->parameters.items[i];
+        if (!param || param->kind != CTSC_SK_Parameter) continue;
+        const CtscNode* pty = param->data.parameter.type;
+        if (!pty || pty->kind != CTSC_SK_TypeReference) continue;
+        const CtscTypeReferenceData* tr = &pty->data.typeReference;
+        if (!tr->typeName || tr->typeName->kind != CTSC_SK_Identifier) continue;
+        const CtscIdentifierData* pid = &tr->typeName->data.identifier;
+        for (size_t ti = 0; ti < fd->type_parameters.len && ti < out_infer_cap; ++ti) {
+            const CtscNode* tp = fd->type_parameters.items[ti];
+            if (!tp || tp->kind != CTSC_SK_TypeParameter) continue;
+            const CtscNode* tnm = tp->data.typeParameter.name;
+            if (!tnm || tnm->kind != CTSC_SK_Identifier) continue;
+            const CtscIdentifierData* tid = &tnm->data.identifier;
+            if (!utf16_type_text_equal(pid->text, pid->text_len, tid->text, tid->text_len)) continue;
+            if (out_infer[ti]) break; /* already inferred from an earlier parameter */
+            CtscType* arg_t = type_of_expression(w, reg, ce->arguments.items[i]);
+            if (!arg_t) break;
+            /* Unconstrained type parameters widen literal arguments (checker.ts
+             * getInferredType with no constraint applies getWidenedLiteralType);
+             * constrained ones (e.g. `K extends string`) keep the narrow literal
+             * since the literal type satisfies the constraint. */
+            bool has_constraint = tp->data.typeParameter.constraint != NULL;
+            CtscType* inferred = has_constraint ? arg_t : ctsc_type_widen(reg, arg_t);
+            out_infer[ti] = widen_nullish_when_not_strict_null(reg, inferred);
+            break;
+        }
+    }
+}
+
+/*
+ * Substitute any `CTSC_TYPE_REFERENCE` whose name matches one of `fn_decl`'s
+ * type parameters with the corresponding entry in `infer` (NULL entries leave
+ * the reference as-is). Returns the substituted type. Currently only rewrites
+ * the top level of an OBJECT_LITERAL (each property's value_type) — sufficient
+ * for a TypeLiteral return annotation like `{ k: K; v: V }`. Nested generics
+ * in property types fall back to the pre-substitution type reference.
+ */
+static CtscType* substitute_type_parameters_in_type(CtscTypeRegistry* reg, const CtscNode* fn_decl,
+                                                    CtscType* t, CtscType* const* infer, size_t infer_len) {
+    if (!reg || !t || !fn_decl || fn_decl->kind != CTSC_SK_FunctionDeclaration) return t;
+    const CtscFunctionDeclarationData* fd = &fn_decl->data.functionDeclaration;
+    if (t->kind == CTSC_TYPE_REFERENCE && t->reference_type_args_len == 0) {
+        for (size_t ti = 0; ti < fd->type_parameters.len && ti < infer_len; ++ti) {
+            const CtscNode* tp = fd->type_parameters.items[ti];
+            if (!tp || tp->kind != CTSC_SK_TypeParameter) continue;
+            const CtscNode* tnm = tp->data.typeParameter.name;
+            if (!tnm || tnm->kind != CTSC_SK_Identifier) continue;
+            const CtscIdentifierData* tid = &tnm->data.identifier;
+            if (utf16_type_text_equal(t->text, t->text_len, tid->text, tid->text_len)) {
+                return infer[ti] ? infer[ti] : t;
+            }
+        }
+        return t;
+    }
+    if (t->kind == CTSC_TYPE_OBJECT_LITERAL && t->object_properties_len > 0) {
+        CtscObjectProperty* copy = (CtscObjectProperty*)ctsc_arena_alloc(
+            reg->arena, t->object_properties_len * sizeof(CtscObjectProperty));
+        bool any_changed = false;
+        for (size_t i = 0; i < t->object_properties_len; ++i) {
+            copy[i] = t->object_properties[i];
+            CtscType* sub = substitute_type_parameters_in_type(reg, fn_decl, copy[i].value_type, infer, infer_len);
+            if (sub != copy[i].value_type) {
+                copy[i].value_type = sub;
+                any_changed = true;
+            }
+        }
+        if (!any_changed) return t;
+        CtscType* nt = ctsc_type_object_literal(reg, copy, t->object_properties_len);
+        nt->object_string_index_value_type = t->object_string_index_value_type;
+        return nt;
+    }
+    return t;
+}
+
+/*
+ * Generic call return instantiation: when the declared or body-inferred return
+ * type references this signature's type parameters, map those parameters to
+ * explicit type arguments (`first<number, string>(...)`) or the corresponding
+ * argument types (`first(1, "x")` → `1`; `pair("name", 42)` →
+ * `{ k: "name"; v: number; }` via TypeLiteral substitution).
  *
  * Mirrors checker.ts inferTypeArguments / getReturnTypeOfSignature (~35827+,
  * ~37810+).
@@ -4509,8 +4665,24 @@ static CtscType* generic_call_instantiated_return_type(Walk* w, CtscTypeRegistry
                                                       const CtscCallExpressionData* ce) {
     if (!w || !reg || !fn_decl || fn_decl->kind != CTSC_SK_FunctionDeclaration || !ce) return NULL;
     const CtscFunctionDeclarationData* fd = &fn_decl->data.functionDeclaration;
-    if (fd->type_parameters.len < 1 || ce->arguments.len < 1 || fd->parameters.len < 1) return NULL;
+    if (fd->type_parameters.len < 1 || fd->parameters.len < 1) return NULL;
 
+    /*
+     * TypeLiteral return annotation (`: { k: K; v: V }`): substitute inferred
+     * type arguments into each property's value_type. Mirrors
+     * instantiateType on an anonymous object type (checker.ts ~17500+).
+     */
+    if (fd->type && fd->type->kind == CTSC_SK_TypeLiteral) {
+        CtscType* decl_ret = type_of_type_node(w, reg, w->source_utf16, w->source_utf16_len, fd->type, 0);
+        if (!decl_ret || decl_ret->kind != CTSC_TYPE_OBJECT_LITERAL) return NULL;
+        CtscType* infer[16];
+        size_t cap = sizeof(infer) / sizeof(infer[0]);
+        collect_generic_call_inferences(w, reg, fn_decl, ce, infer, cap);
+        size_t used = fd->type_parameters.len < cap ? fd->type_parameters.len : cap;
+        return substitute_type_parameters_in_type(reg, fn_decl, decl_ret, infer, used);
+    }
+
+    if (ce->arguments.len < 1) return NULL;
     CtscType* inferred_ret =
         infer_return_type_for_function_body(w, reg, w->arena, fd->body, fn_decl);
     if (!inferred_ret || inferred_ret->kind != CTSC_TYPE_REFERENCE) return NULL;
@@ -4562,7 +4734,8 @@ static CtscType* generic_call_instantiated_return_type(Walk* w, CtscTypeRegistry
     return NULL;
 }
 
-static void emit_type_parameters_for_signature(CtscBuffer* out, const CtscNodeArray* type_parameters) {
+static void emit_type_parameters_for_signature(CtscBuffer* out, const CtscNodeArray* type_parameters,
+                                                CtscTypeRegistry* reg, const uint16_t* src, size_t src_len) {
     if (!type_parameters || type_parameters->len == 0) return;
     ctsc_buf_append_char(out, '<');
     for (size_t i = 0; i < type_parameters->len; ++i) {
@@ -4573,6 +4746,15 @@ static void emit_type_parameters_for_signature(CtscBuffer* out, const CtscNodeAr
             if (nm && nm->kind == CTSC_SK_Identifier) {
                 const CtscIdentifierData* id = &nm->data.identifier;
                 append_utf16_ascii_identifier(out, id->text, id->text_len);
+            }
+            /* Mirrors checker.ts typeParameterToDeclarationWithConstraint
+             * (~8340): when a constraint is present, emit ` extends <T>`
+             * after the name. The inner TypeNode is stringified via the
+             * same path as parameter types (signatureToString ~6202). */
+            const CtscNode* cn = tp->data.typeParameter.constraint;
+            if (cn && reg) {
+                ctsc_buf_append_cstr(out, " extends ");
+                append_type_for_signature(out, reg, cn, src, src_len);
             }
         }
     }
@@ -4588,7 +4770,7 @@ static void emit_function_signature_string(CtscBuffer* out, const CtscNodeArray*
      * WriteTypeParametersInQualifiedName: optional `<T, U>` then `(p0: T0, ...)
      * => R` at default flags.
      */
-    emit_type_parameters_for_signature(out, type_parameters);
+    emit_type_parameters_for_signature(out, type_parameters, reg, src, src_len);
     ctsc_buf_append_char(out, '(');
     for (size_t i = 0; i < params->len; ++i) {
         const CtscNode* p = params->items[i];
@@ -4718,7 +4900,7 @@ static void emit_call_signature_decl_string_parts(CtscBuffer* out, CtscTypeRegis
                                                   const CtscNodeArray* parameters,
                                                   const CtscNode* return_type_node,
                                                   const uint16_t* src, size_t src_len) {
-    if (type_parameters) emit_type_parameters_for_signature(out, type_parameters);
+    if (type_parameters) emit_type_parameters_for_signature(out, type_parameters, reg, src, src_len);
     ctsc_buf_append_char(out, '(');
     if (parameters) {
         for (size_t pi = 0; pi < parameters->len; ++pi) {
@@ -4838,12 +5020,50 @@ static void visit_function_declaration(Walk* w, const CtscNode* n) {
     }
 after_name_entry:
 
+    /* Mirrors harness/src/oracle-checker-types.ts visit(): ts.forEachChild
+     * descends into each TypeParameter's constraint, so a TypeLiteral used
+     * as a constraint contributes one PropertySignature entry per member
+     * (fixture checker/generic_constraints/01_extends_length.ts:
+     * `<T extends { length: number }>` yields a PropertySignature `length`).
+     * The oracle's DECL_KINDS_M40 set only picks PropertySignature out of
+     * TypeLiteral bodies, so we reuse the same helper used for direct
+     * TypeLiteral annotations. */
+    for (size_t i = 0; i < f->type_parameters.len; ++i) {
+        const CtscNode* tp = f->type_parameters.items[i];
+        if (!tp || tp->kind != CTSC_SK_TypeParameter) continue;
+        const CtscNode* cn = tp->data.typeParameter.constraint;
+        if (cn && cn->kind == CTSC_SK_TypeLiteral) {
+            push_property_signatures_from_type_literal(w, cn);
+        }
+    }
+
     open_scope_if_container(w, n);
     for (size_t i = 0; i < f->parameters.len; ++i) {
         const CtscNode* p = f->parameters.items[i];
         if (!p || p->kind != CTSC_SK_Parameter) continue;
         push_entry_for_name(w, p, p->data.parameter.name, param_type(w, p));
+        /*
+         * Parameter type annotations that are TypeLiteral yield one
+         * PropertySignature entry per member (oracle walks children via
+         * ts.forEachChild → Parameter → node.type; checker.ts on each
+         * PropertySignature dumps its own type via getTypeOfSymbol).
+         * Same treatment as MethodDeclaration's parameter branch.
+         */
+        if (p->data.parameter.type && p->data.parameter.type->kind == CTSC_SK_TypeLiteral) {
+            push_property_signatures_from_type_literal(w, p->data.parameter.type);
+        }
         if (p->data.parameter.initializer) visit(w, p->data.parameter.initializer);
+    }
+    /*
+     * Return-type TypeLiteral: oracle walks into FunctionDeclaration.type
+     * (parser.ts forEachChildInFunctionDeclaration ~633), so
+     * `function f(): { k: K; v: V }` contributes PropertySignature entries
+     * for `k` and `v`. Mirrors the MethodDeclaration return-type branch in
+     * visit_class_declaration above. Fixture:
+     * checker/generic_constraints/05_two_params_one_constrained.ts.
+     */
+    if (f->type && f->type->kind == CTSC_SK_TypeLiteral) {
+        push_property_signatures_from_type_literal(w, f->type);
     }
     if (f->body) visit(w, f->body);
     close_scope_if_container(w, n);
@@ -5191,6 +5411,35 @@ static void visit_call_expression(Walk* w, const CtscNode* n) {
                         if (!is_assignable_to(w, &w->r->registry, arg_t, param_t)) {
                             emit_ts2345_on_argument(w->r, w->arena, &w->r->registry, arg, arg_t, param_t);
                         }
+                    } else {
+                        /*
+                         * The parameter's declared type is a type parameter T.
+                         * With inference, the instantiated paramType collapses
+                         * to (the base constraint of) T. tsc reports a single
+                         * TS2345 whose target is the constraint's typeToString
+                         * when the argument does not satisfy `T extends C`
+                         * (checker.ts inferTypeArguments +
+                         * getSignatureApplicabilityError ~35827/36181, where
+                         * the inferred T is substituted and the resulting
+                         * paramType is checked via checkTypeRelatedTo).
+                         * Mirror the observable behaviour for the simple case:
+                         * when T has an `extends C` constraint, require the
+                         * argument to be assignable to C. Unconstrained type
+                         * parameters keep their "any argument is fine" shape.
+                         */
+                        const CtscNode* tp = type_parameter_for_parameter(fn_decl, param);
+                        const CtscNode* constraint_node =
+                            tp ? tp->data.typeParameter.constraint : NULL;
+                        if (constraint_node) {
+                            CtscType* constraint_t = type_of_type_node(
+                                w, &w->r->registry, w->source_utf16, w->source_utf16_len,
+                                constraint_node, 0);
+                            CtscType* arg_t = type_of_expression(w, &w->r->registry, arg);
+                            if (!is_assignable_to(w, &w->r->registry, arg_t, constraint_t)) {
+                                emit_ts2345_on_argument(w->r, w->arena, &w->r->registry,
+                                                        arg, arg_t, constraint_t);
+                            }
+                        }
                     }
                 }
             }
@@ -5240,6 +5489,24 @@ static void check_property_access_expression(Walk* w, const CtscNode* n) {
 
 static void visit_class_declaration(Walk* w, const CtscNode* n) {
     const CtscClassDeclarationData* c = &n->data.classDeclaration;
+    /*
+     * Mirrors harness/src/oracle-checker-types.ts visit(): ts.forEachChild on
+     * a ClassDeclaration descends into modifiers / name / typeParameters /
+     * heritageClauses / members. For each TypeParameter with a TypeLiteral
+     * constraint (e.g. `class Container<T extends { id: number }>`), the
+     * inner PropertySignature nodes must appear as entries. Same treatment
+     * we already apply to FunctionDeclaration's type parameters above;
+     * fixture checker/generic_constraints/04_class_generic_constraint.ts
+     * exercises this.
+     */
+    for (size_t i = 0; i < c->type_parameters.len; ++i) {
+        const CtscNode* tp = c->type_parameters.items[i];
+        if (!tp || tp->kind != CTSC_SK_TypeParameter) continue;
+        const CtscNode* cn = tp->data.typeParameter.constraint;
+        if (cn && cn->kind == CTSC_SK_TypeLiteral) {
+            push_property_signatures_from_type_literal(w, cn);
+        }
+    }
     for (size_t i = 0; i < c->members.len; ++i) {
         CtscNode* m = c->members.items[i];
         if (!m) continue;

@@ -166,6 +166,154 @@ int test_checker(void) {
     }
 
     /*
+     * TS2345 when a call argument violates a generic parameter's `extends`
+     * constraint. Mirrors checker.ts inferTypeArguments +
+     * getSignatureApplicabilityError (~35827/36181): the inferred type
+     * argument fails `T extends C`, so the paramType in the applicability
+     * error collapses to C and the argument's (widened) type is reported as
+     * `source`. Fixture: checker/generic_constraints/02_extends_violation.ts.
+     */
+    {
+        const char* src =
+            "// @checker: diag\r\n"
+            "function len<T extends { length: number }>(x: T): number {\r\n"
+            "  return x.length;\r\n"
+            "}\r\n"
+            "const r = len(42);\r\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 1);
+        if (cr->diagnostics_len >= 1) {
+            EXPECT(cr->diagnostics[0].code == 2345);
+            /* start/length match tsc's UTF-16 span on the `42` argument. */
+            EXPECT(cr->diagnostics[0].length == 2);
+            EXPECT(strcmp(cr->diagnostics[0].message,
+                          "Argument of type 'number' is not assignable to parameter of type '{ length: number; }'.") == 0);
+        }
+        ctsc_arena_free(&a);
+    }
+
+    /*
+     * Class generic constraint with a TypeLiteral `{ ... }` type argument.
+     * Mirrors harness/src/oracle-checker-types.ts ts.forEachChild descent
+     * into ClassDeclaration.typeParameters + VariableDeclaration.type →
+     * TypeReference.typeArguments → TypeLiteral members. Fixture:
+     * checker/generic_constraints/04_class_generic_constraint.ts. Verifies:
+     *   - PropertySignature entry from the `extends { id: number }` constraint
+     *   - TypeLiteral type argument `{ id; name }` preserved on the reference
+     *     (c's type stringifies as `Container<{ id: number; name: string; }>`)
+     *   - inner PropertySignature entries from the TypeLiteral type argument
+     */
+    {
+        const char* src =
+            "// @checker: types\n"
+            "class Container<T extends { id: number }> {\n"
+            "  item: T;\n"
+            "}\n"
+            "declare const c: Container<{ id: number; name: string }>;\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        bool saw_constraint_id = false;
+        bool saw_arg_id = false;
+        bool saw_arg_name = false;
+        bool saw_c = false;
+        for (size_t i = 0; i < cr->entries_len; ++i) {
+            const CtscCheckTypeEntry* e = &cr->entries[i];
+            if (!e->decl_kind_name) continue;
+            if (strcmp(e->decl_kind_name, "PropertySignature") == 0
+                && e->name_len == 2 && e->name[0] == 'i' && e->name[1] == 'd') {
+                if (e->pos < 60) saw_constraint_id = true; else saw_arg_id = true;
+            }
+            if (strcmp(e->decl_kind_name, "PropertySignature") == 0
+                && e->name_len == 4 && e->name[0] == 'n' && e->name[1] == 'a'
+                && e->name[2] == 'm' && e->name[3] == 'e') {
+                saw_arg_name = true;
+            }
+            if (strcmp(e->decl_kind_name, "VariableDeclaration") == 0
+                && e->name_len == 1 && e->name[0] == 'c') {
+                saw_c = true;
+                CtscBuffer ts;
+                ctsc_buf_init(&ts);
+                ctsc_type_to_string(e->type, &ts);
+                EXPECT(ts.len == strlen("Container<{ id: number; name: string; }>")
+                       && memcmp(ts.data, "Container<{ id: number; name: string; }>",
+                                 strlen("Container<{ id: number; name: string; }>")) == 0);
+                ctsc_buf_free(&ts);
+            }
+        }
+        EXPECT(saw_constraint_id);
+        EXPECT(saw_arg_id);
+        EXPECT(saw_arg_name);
+        EXPECT(saw_c);
+        ctsc_arena_free(&a);
+    }
+
+    /*
+     * Generic function with a TypeLiteral return annotation `{ k: K; v: V }`
+     * where one type parameter is constrained (`K extends string`) and the
+     * other is unconstrained (`V`). Mirrors
+     * harness/src/oracle-checker-types.ts ts.forEachChild descent into
+     * FunctionDeclaration.type → TypeLiteral members, and checker.ts
+     * inferTypeArguments (~35827) + getReturnTypeOfSignature (~37810)
+     * applied to the VariableDeclaration initializer. Fixture:
+     * checker/generic_constraints/05_two_params_one_constrained.ts. Verifies:
+     *   - PropertySignature entries for `k` and `v` in the return TypeLiteral
+     *   - variable `p`'s type has K substituted with the literal `"name"`
+     *     (constraint-preserved) and V widened to `number` (unconstrained).
+     */
+    {
+        const char* src =
+            "// @checker: types\n"
+            "function pair<K extends string, V>(k: K, v: V): { k: K; v: V } {\n"
+            "  return { k, v };\n"
+            "}\n"
+            "const p = pair(\"name\", 42);\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        bool saw_ret_k = false;
+        bool saw_ret_v = false;
+        bool saw_p = false;
+        for (size_t i = 0; i < cr->entries_len; ++i) {
+            const CtscCheckTypeEntry* e = &cr->entries[i];
+            if (!e->decl_kind_name) continue;
+            if (strcmp(e->decl_kind_name, "PropertySignature") == 0
+                && e->name_len == 1 && e->name[0] == 'k') {
+                saw_ret_k = true;
+            }
+            if (strcmp(e->decl_kind_name, "PropertySignature") == 0
+                && e->name_len == 1 && e->name[0] == 'v') {
+                saw_ret_v = true;
+            }
+            if (strcmp(e->decl_kind_name, "VariableDeclaration") == 0
+                && e->name_len == 1 && e->name[0] == 'p') {
+                saw_p = true;
+                CtscBuffer ts;
+                ctsc_buf_init(&ts);
+                ctsc_type_to_string(e->type, &ts);
+                const char* want = "{ k: \"name\"; v: number; }";
+                EXPECT(ts.len == strlen(want) && memcmp(ts.data, want, strlen(want)) == 0);
+                ctsc_buf_free(&ts);
+            }
+        }
+        EXPECT(saw_ret_k);
+        EXPECT(saw_ret_v);
+        EXPECT(saw_p);
+        ctsc_arena_free(&a);
+    }
+
+    /*
      * TS2554 when a call has too few arguments (checker.ts getArgumentArityError
      * ~36458-36477, Diagnostics.Expected_0_arguments_but_got_1). Mirrors
      * fixtures/checker/function_calls/02_too_few_args.ts (CRLF).

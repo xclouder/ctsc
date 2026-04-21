@@ -830,13 +830,17 @@ static void emit_node(CtscJson* j, const CtscNode* n) {
              * (harness/src/oracle-ast.ts) has no explicit case for
              * TypeParameter, so it falls through to the default branch
              * which serialises forEachChild's visits as a single `children`
-             * array. ctsc currently only models `name` (the bare-identifier
-             * form exercised by 107_FunctionPropertyAssignments6_es6.ts);
-             * the remaining fields are skipped until a fixture requires them. */
-            if (n->data.typeParameter.name) {
+             * array. ctsc models `name` and `constraint`; modifiers /
+             * default / expression are skipped until a fixture requires them. */
+            if (n->data.typeParameter.name || n->data.typeParameter.constraint) {
                 ctsc_json_key(j, "children");
                 ctsc_json_begin_arr(j);
-                emit_node(j, n->data.typeParameter.name);
+                if (n->data.typeParameter.name) {
+                    emit_node(j, n->data.typeParameter.name);
+                }
+                if (n->data.typeParameter.constraint) {
+                    emit_node(j, n->data.typeParameter.constraint);
+                }
                 ctsc_json_end_arr(j);
             }
             break;

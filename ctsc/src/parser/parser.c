@@ -155,6 +155,7 @@ static CtscNode* parse_parameter(Parser* p);
 static bool parse_type_parameters(Parser* p, CtscNodeArray* out);
 static CtscNode* parse_type_annotation(Parser* p);
 static CtscNode* parse_type_in_annotation_position(Parser* p, bool allow_multiline);
+static CtscNode* parse_type_literal(Parser* p);
 static void skip_type_in_type_parameter_position(Parser* p);
 static CtscNode* consume_type_via_fallback_scan(Parser* p, bool allow_multiline);
 static void consume_postfix_type_operators(Parser* p);
@@ -566,6 +567,23 @@ static CtscNode* parse_type_node(Parser* p) {
         tr->data.typeReference.has_type_arguments = has_args;
         tr->data.typeReference.type_arguments = type_args;
         return tr;
+    }
+
+    /*
+     * `{` → TypeLiteral. Mirrors parser.ts parseNonArrayType (~4642):
+     *     case SyntaxKind.OpenBraceToken:
+     *         return lookAhead(isStartOfMappedType) ? parseMappedType() : parseTypeLiteral();
+     * ctsc does not yet distinguish MappedType from TypeLiteral; the checker
+     * reuses the same source-span walk either way. Preserving the TypeLiteral
+     * node here keeps the type argument visible to the checker so a generic
+     * class reference like `Container<{ id: number; name: string }>` stringifies
+     * back with its arguments (checker.ts typeToString via
+     * append_type_for_signature) and the oracle's ts.forEachChild descent
+     * finds the inner PropertySignature nodes (fixture
+     * checker/generic_constraints/04_class_generic_constraint.ts).
+     */
+    if (k == CTSC_SK_OpenBraceToken) {
+        return parse_type_literal(p);
     }
 
     /* Fallback for non-identifier type atoms: consume a single "type atom" —
@@ -2282,9 +2300,18 @@ static CtscNode* parse_property_name(Parser* p) {
 /*
  * Mirrors upstream/TypeScript/src/compiler/parser.ts parseTypeParameter (~3955):
  *     TypeParameter: (modifiers)? Identifier (`extends` Type)? (`=` Type)?
- * Modifiers are still skipped; constraint and default are consumed so the
- * scanner reaches the `>` / `,` that closes the type-parameter list (fixture
- * emitter/selfhost-derived/57_generic_constraint.ts: `T extends () => void`).
+ * Modifiers are still skipped. The `extends` constraint is captured as a
+ * real TypeNode only for the simple forms we can reliably delimit at the
+ * type-parameter closing `>`: `{ ... }` TypeLiteral, a bare keyword type
+ * (`string`/`number`/`boolean`/...), or a single identifier TypeReference.
+ * More complex constraints (function types, unions, conditionals; e.g.
+ * `<T extends (...args: any[]) => void>` in 74_export_generic_rest.ts)
+ * fall through to the brace-balanced skip_type_in_type_parameter_position
+ * path which is `>`-terminated; the constraint is left NULL there because
+ * the signature renderer does not yet spell those forms back out. The
+ * checker uses the parsed constraint to emit `<T extends X>` via
+ * typeParameterToDeclarationWithConstraint (checker.ts ~8340). The `=`
+ * default is still brace-balanced until a fixture needs its type node.
  * finishNode end = scanner.getTokenFullStart() after the constraint/default.
  */
 static CtscNode* parse_type_parameter(Parser* p) {
@@ -2293,9 +2320,52 @@ static CtscNode* parse_type_parameter(Parser* p) {
     if (!name) {
         name = make_missing_identifier(p);
     }
+    CtscNode* constraint = NULL;
     if (cur(p) == CTSC_SK_ExtendsKeyword) {
         advance(p);
-        skip_type_in_type_parameter_position(p);
+        if (cur(p) == CTSC_SK_OpenBraceToken) {
+            /* `{ ... }` TypeLiteral is well-delimited at `}`; parse_type_literal
+             * brace-balances and returns at the token after the closing `}`,
+             * which is the `>` / `,` that terminates the type parameter list. */
+            constraint = parse_type_literal(p);
+        } else {
+            /* Speculatively build a simple constraint TypeNode for the cases
+             * the checker's signature renderer can spell back out: a bare
+             * keyword type (`string`/`number`/...) or a single-identifier
+             * TypeReference (`<T extends Named>`). Mirrors the identifier /
+             * keyword branches of upstream parseNonArrayType (~4591-4602,
+             * parser.ts). Commit only when we land on a TypeParameter list
+             * terminator (`>` / `,` / `=`); otherwise revert and fall back
+             * to skip_type_in_type_parameter_position so complex constraints
+             * (function types, unions, etc.) still balance correctly. */
+            CtscScanner saved = p->scanner;
+            size_t saved_diag_count = p->diagnostics->count;
+            CtscSyntaxKind kk = cur(p);
+            CtscNode* t = NULL;
+            if (kk == CTSC_SK_AnyKeyword || kk == CTSC_SK_UnknownKeyword
+                || kk == CTSC_SK_StringKeyword || kk == CTSC_SK_NumberKeyword
+                || kk == CTSC_SK_BooleanKeyword || kk == CTSC_SK_VoidKeyword
+                || kk == CTSC_SK_UndefinedKeyword || kk == CTSC_SK_NeverKeyword
+                || kk == CTSC_SK_ObjectKeyword || kk == CTSC_SK_SymbolKeyword) {
+                int fs = cur_full_start(p);
+                advance(p);
+                int end = cur_full_start(p);
+                t = ctsc_node_new(p->arena, kk, fs, end);
+            } else if (kk == CTSC_SK_Identifier) {
+                t = parse_type_node(p);
+            }
+            CtscSyntaxKind nk = cur(p);
+            bool terminates =
+                (nk == CTSC_SK_GreaterThanToken || nk == CTSC_SK_CommaToken
+                 || nk == CTSC_SK_EqualsToken);
+            if (t && terminates) {
+                constraint = t;
+            } else {
+                p->scanner = saved;
+                ctsc_diag_truncate(p->diagnostics, saved_diag_count);
+                skip_type_in_type_parameter_position(p);
+            }
+        }
     }
     if (cur(p) == CTSC_SK_EqualsToken) {
         advance(p);
@@ -2304,6 +2374,7 @@ static CtscNode* parse_type_parameter(Parser* p) {
     int end = cur_full_start(p);
     CtscNode* tp = ctsc_node_new(p->arena, CTSC_SK_TypeParameter, pos, end);
     tp->data.typeParameter.name = name;
+    tp->data.typeParameter.constraint = constraint;
     return tp;
 }
 

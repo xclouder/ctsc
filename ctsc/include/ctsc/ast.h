@@ -873,13 +873,15 @@ typedef struct {
  * TypeParameter, so it falls through to the default branch which serialises
  * forEachChildInTypeParameter (parser.ts ~510) visits as a single `children`
  * array. forEachChild visits, in order: modifiers, name, constraint, default,
- * expression. ctsc currently models only `name` — modifiers / constraint /
- * default / expression are skipped until a fixture demands them (the only
- * currently-unlocked fixture, 107_FunctionPropertyAssignments6_es6.ts:
- * `{ *<T>() { } }`, has just the bare identifier).
+ * expression. ctsc currently models `name` and `constraint`; modifiers /
+ * default / expression are skipped until a fixture demands them. The
+ * constraint node is needed so the checker's typeToString on a signature
+ * can emit `<T extends { length: number; }>` (checker.ts
+ * typeParameterToDeclarationWithConstraint ~8340).
  */
 typedef struct {
-    CtscNode* name; /* Identifier */
+    CtscNode* name;       /* Identifier */
+    CtscNode* constraint; /* nullable TypeNode following `extends` */
 } CtscTypeParameterData;
 
 /*
