@@ -78,6 +78,7 @@ CtscType* ctsc_type_object_literal(CtscTypeRegistry* reg, CtscObjectProperty* pr
     CtscType* t = ctsc_type_new(reg, CTSC_TYPE_OBJECT_LITERAL);
     t->object_properties = props;
     t->object_properties_len = prop_count;
+    t->object_string_index_value_type = NULL;
     return t;
 }
 

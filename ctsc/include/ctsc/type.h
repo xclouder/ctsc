@@ -111,6 +111,12 @@ struct CtscType {
     /* OBJECT_LITERAL */
     CtscObjectProperty* object_properties;
     size_t                object_properties_len;
+    /*
+     * Optional string index signature `[k: string]: T` recovered from a type
+     * literal / interface body span (checker.ts getIndexTypeOfType ~19200+).
+     * When set, element access with a string literal argument yields this type.
+     */
+    CtscType* object_string_index_value_type;
 
     /* TUPLE: element types in source order (arena-backed pointer array). */
     CtscType** tuple_elements;

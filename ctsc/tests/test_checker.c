@@ -720,6 +720,107 @@ int test_checker(void) {
         ctsc_arena_free(&a);
     }
 
+    /*
+     * typeof narrowing + union param in signature string (fixtures/checker/narrowing/01_typeof_string.ts;
+     * checker.ts narrowTypeByTypeFacts / getNarrowedType ~38000+, typeToString on signatures ~6202).
+     */
+    {
+        const char* src = "// @checker: types\n"
+                          "function f(x: string | number) {\n"
+                          "  if (typeof x === \"string\") {\n"
+                          "    const s = x;\n"
+                          "  } else {\n"
+                          "    const n = x;\n"
+                          "  }\n"
+                          "}\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 4);
+        if (cr->entries_len >= 1 && cr->entries[0].type_string && cr->entries[0].type_string_len > 0) {
+            const char* want_f = "(x: string | number) => void";
+            EXPECT(cr->entries[0].type_string_len == strlen(want_f));
+            EXPECT(memcmp(cr->entries[0].type_string, want_f, strlen(want_f)) == 0);
+        }
+        if (cr->entries_len >= 3 && cr->entries[2].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[2].type, &ts);
+            EXPECT(ts.len == 6 && memcmp(ts.data, "string", 6) == 0);
+            ctsc_buf_free(&ts);
+        }
+        if (cr->entries_len >= 4 && cr->entries[3].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[3].type, &ts);
+            EXPECT(ts.len == 6 && memcmp(ts.data, "number", 6) == 0);
+            ctsc_buf_free(&ts);
+        }
+        ctsc_arena_free(&a);
+    }
+
+    /*
+     * typeof === "number" narrowing (fixtures/checker/narrowing/02_typeof_number.ts;
+     * checker.ts narrowTypeByTypeFacts / TypeofEQNumber ~29867).
+     */
+    {
+        const char* src = "// @checker: types\n"
+                          "function f(x: string | number) {\n"
+                          "  if (typeof x === \"number\") {\n"
+                          "    const n = x;\n"
+                          "  }\n"
+                          "}\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 3);
+        if (cr->entries_len >= 3 && cr->entries[2].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[2].type, &ts);
+            EXPECT(ts.len == 6 && memcmp(ts.data, "number", 6) == 0);
+            ctsc_buf_free(&ts);
+        }
+        ctsc_arena_free(&a);
+    }
+
+    /*
+     * typeof === "boolean" narrowing (fixtures/checker/narrowing/03_typeof_boolean.ts;
+     * checker.ts narrowTypeByTypeFacts / TypeofEQBoolean ~29871).
+     */
+    {
+        const char* src = "// @checker: types\n"
+                          "function f(x: string | boolean) {\n"
+                          "  if (typeof x === \"boolean\") {\n"
+                          "    const b = x;\n"
+                          "  }\n"
+                          "}\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 3);
+        if (cr->entries_len >= 3 && cr->entries[2].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[2].type, &ts);
+            EXPECT(ts.len == 7 && memcmp(ts.data, "boolean", 7) == 0);
+            ctsc_buf_free(&ts);
+        }
+        ctsc_arena_free(&a);
+    }
+
     /* FunctionExpression with one typed parameter (fixtures/checker/function_expressions/02_one_param.ts). */
     {
         const char* src = "// @checker: types\nconst f = function (x: number) {\n  return x;\n};\n";
@@ -954,6 +1055,54 @@ int test_checker(void) {
         ctsc_arena_free(&a);
     }
 
+    /* String index signature: Parameter entry + element access type (fixtures/checker/index_signature/01_string_index.ts;
+     * checker.ts getPropertyTypeForIndexType ~19262-19279). */
+    {
+        const char* src = "// @checker: types\r\n"
+                          "interface Dict {\r\n"
+                          "  [key: string]: number;\r\n"
+                          "}\r\n"
+                          "const d: Dict = { a: 1, b: 2 };\r\n"
+                          "const n = d[\"a\"];\r\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 3);
+        const CtscCheckTypeEntry* param = NULL;
+        const CtscCheckTypeEntry* vd_d = NULL;
+        const CtscCheckTypeEntry* vd_n = NULL;
+        for (size_t i = 0; i < cr->entries_len; i++) {
+            if (cr->entries[i].decl_kind_name && strcmp(cr->entries[i].decl_kind_name, "Parameter") == 0)
+                param = &cr->entries[i];
+            if (cr->entries[i].decl_kind_name && strcmp(cr->entries[i].decl_kind_name, "VariableDeclaration") == 0
+                && cr->entries[i].name_len == 1 && cr->entries[i].name && cr->entries[i].name[0] == (uint16_t)'d')
+                vd_d = &cr->entries[i];
+            if (cr->entries[i].decl_kind_name && strcmp(cr->entries[i].decl_kind_name, "VariableDeclaration") == 0
+                && cr->entries[i].name_len == 1 && cr->entries[i].name && cr->entries[i].name[0] == (uint16_t)'n')
+                vd_n = &cr->entries[i];
+        }
+        EXPECT(param != NULL && vd_d != NULL && vd_n != NULL);
+        if (param && param->type) {
+            CtscBuffer t0;
+            ctsc_buf_init(&t0);
+            ctsc_type_to_string(param->type, &t0);
+            EXPECT(t0.len == 6 && memcmp(t0.data, "string", 6) == 0);
+            ctsc_buf_free(&t0);
+        }
+        if (vd_n && vd_n->type) {
+            CtscBuffer t1;
+            ctsc_buf_init(&t1);
+            ctsc_type_to_string(vd_n->type, &t1);
+            EXPECT(t1.len == 6 && memcmp(t1.data, "number", 6) == 0);
+            ctsc_buf_free(&t1);
+        }
+        ctsc_arena_free(&a);
+    }
+
     /* Optional PropertySignature (fixtures/checker/optional/01_optional_field.ts;
      * parser.ts parsePropertyOrMethodSignature ~4268–4282). */
     {
@@ -990,6 +1139,63 @@ int test_checker(void) {
         }
         if (ps) EXPECT(ps->pos == 33 && ps->end == 38);
         if (vd) EXPECT(vd->pos == 58 && vd->end == 60);
+        ctsc_arena_free(&a);
+    }
+
+    /* Readonly PropertySignature + property access type (fixtures/checker/readonly/
+     * 01_readonly_field.ts; parser.ts parsePropertySignature ~4435, checker.ts
+     * getTypeOfPropertyOfType ~11575). */
+    {
+        const char* src = "// @checker: types\r\n"
+                          "interface P {\r\n"
+                          "  readonly x: number;\r\n"
+                          "}\r\n"
+                          "const p: P = { x: 1 };\r\n"
+                          "const n = p.x;\r\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 0);
+        EXPECT(cr->entries_len == 3);
+        const CtscCheckTypeEntry* ps = NULL;
+        const CtscCheckTypeEntry* vd_p = NULL;
+        const CtscCheckTypeEntry* vd_n = NULL;
+        for (size_t i = 0; i < cr->entries_len; i++) {
+            if (cr->entries[i].decl_kind_name
+                && strcmp(cr->entries[i].decl_kind_name, "PropertySignature") == 0)
+                ps = &cr->entries[i];
+            if (cr->entries[i].decl_kind_name
+                && strcmp(cr->entries[i].decl_kind_name, "VariableDeclaration") == 0
+                && cr->entries[i].name_len == 1 && cr->entries[i].name
+                && cr->entries[i].name[0] == (uint16_t)'p')
+                vd_p = &cr->entries[i];
+            if (cr->entries[i].decl_kind_name
+                && strcmp(cr->entries[i].decl_kind_name, "VariableDeclaration") == 0
+                && cr->entries[i].name_len == 1 && cr->entries[i].name
+                && cr->entries[i].name[0] == (uint16_t)'n')
+                vd_n = &cr->entries[i];
+        }
+        EXPECT(ps != NULL && vd_p != NULL && vd_n != NULL);
+        if (ps) EXPECT(ps->pos == 45 && ps->end == 47);
+        if (vd_p) EXPECT(vd_p->pos == 66 && vd_p->end == 68);
+        if (vd_n) EXPECT(vd_n->pos == 90 && vd_n->end == 92);
+        if (ps && ps->type) {
+            CtscBuffer t0;
+            ctsc_buf_init(&t0);
+            ctsc_type_to_string(ps->type, &t0);
+            EXPECT(t0.len == 6 && memcmp(t0.data, "number", 6) == 0);
+            ctsc_buf_free(&t0);
+        }
+        if (vd_n && vd_n->type) {
+            CtscBuffer t1;
+            ctsc_buf_init(&t1);
+            ctsc_type_to_string(vd_n->type, &t1);
+            EXPECT(t1.len == 6 && memcmp(t1.data, "number", 6) == 0);
+            ctsc_buf_free(&t1);
+        }
         ctsc_arena_free(&a);
     }
 
