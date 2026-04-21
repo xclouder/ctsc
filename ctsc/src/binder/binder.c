@@ -435,6 +435,41 @@ static void bind_node(CtscBindResult* r, CtscArena* a,
             if (fs->incrementor) bind_node(r, a, container_scope, for_scope, fs->incrementor);
             break;
         }
+        case CTSC_SK_ForInStatement:
+        case CTSC_SK_ForOfStatement: {
+            /*
+             * binder.ts getContainerFlags (~3876): ForInStatement and
+             * ForOfStatement share the ForStatement container flags
+             * (IsBlockScopedContainer | HasLocals). The VariableDeclarationList
+             * lives in the initializer slot and its declarations are scoped to
+             * the loop. Mirrors bindForInOrForOfStatement (~1552) walking
+             * initializer, expression, body.
+             */
+            CtscScope* for_scope = scope_new(a, node);
+            scopes_push(r, a, for_scope);
+            const CtscForInOrOfStatementData* fs = &node->data.forInOrOfStatement;
+            if (fs->initializer) {
+                if (fs->initializer->kind == CTSC_SK_VariableDeclarationList) {
+                    const CtscNode* list = fs->initializer;
+                    int vflags = list->data.variableDeclarationList.flags;
+                    bool is_block_scoped = (vflags & 0x3) != 0;
+                    CtscSymbolFlags sym_flag = is_block_scoped ? CTSC_SYMBOL_FLAG_BlockScopedVariable
+                                                               : CTSC_SYMBOL_FLAG_FunctionScopedVariable;
+                    CtscScope* target = is_block_scoped ? for_scope : container_scope;
+                    const CtscNodeArray* decls = &list->data.variableDeclarationList.declarations;
+                    for (size_t i = 0; i < decls->len; ++i) {
+                        const CtscNode* d = decls->items[i];
+                        if (!d || d->kind != CTSC_SK_VariableDeclaration) continue;
+                        declare_variable_like_name(a, target, sym_flag, d->data.variableDeclaration.name, d);
+                    }
+                } else {
+                    bind_node(r, a, container_scope, for_scope, fs->initializer);
+                }
+            }
+            if (fs->expression) bind_node(r, a, container_scope, for_scope, fs->expression);
+            if (fs->statement) bind_node(r, a, container_scope, for_scope, fs->statement);
+            break;
+        }
         default:
             /* Other kinds do not introduce scopes or declarations yet. */
             break;

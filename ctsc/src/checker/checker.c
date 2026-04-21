@@ -2918,6 +2918,17 @@ static bool is_assignable_to(Walk* w, CtscTypeRegistry* reg, CtscType* source, C
     if (target->kind == CTSC_TYPE_NEVER) return source->kind == CTSC_TYPE_NEVER;
     if (source->kind == CTSC_TYPE_NULL || source->kind == CTSC_TYPE_UNDEFINED) return true;
     /*
+     * `{}` (empty object type) accepts any non-nullish value (checker.ts
+     * isSimpleTypeRelatedTo ~22170-22220 + isEmptyObjectType handling):
+     * `const x: {} = 1;` / `f(1)` where `f(x: {})` / `f(x: number[])` under
+     * noLib (where `number[]` resolves to `Array<number>` whose `Array` is
+     * unresolvable, collapsing the parameter type to `{}`). null/undefined
+     * sources already returned true above, so here any non-nullish source is
+     * assignable. Mirrors tsc's behaviour on fixture checker/rest_params/
+     * 04_rest_type_mismatch.ts where `sum(1, "two", 3)` is accepted.
+     */
+    if (target->kind == CTSC_TYPE_EMPTY_OBJECT) return true;
+    /*
      * String literal types are only mutually assignable when identical
      * (checker.ts isSimpleTypeRelatedTo ~22230-22240; structural check on
      * literal values, not widened `string`).
@@ -3077,6 +3088,48 @@ static void emit_ts2345_on_argument(CtscCheckResult* r, CtscArena* arena, CtscTy
     d.category = "Error";
     d.start = arg->pos;
     d.length = arg->end - arg->pos;
+    d.message = msg_arena;
+    diag_push(r, arena, d);
+}
+
+/*
+ * "Type 'X' must have a '[Symbol.iterator]()' method that returns an iterator."
+ * Mirrors checker.ts reportTypeNotIterableError (~46169-46185) invoked from
+ * checkIteratedTypeOrElementType when an iterated expression's type has no
+ * `[Symbol.iterator]` signature. Under the harness's noLib configuration the
+ * `Array`, `String` and `Iterable` globals are all unresolved so every
+ * non-any/unknown for-of iterable collapses to this diagnostic. The span is
+ * the iterated expression node (tsc's getStart() = end - identifier length
+ * for a bare Identifier; mirrors check_identifier_reference's TS2304 span).
+ */
+static void emit_ts2488_not_iterable(CtscCheckResult* r, CtscArena* arena, CtscTypeRegistry* reg,
+                                     const CtscNode* expr, CtscType* type) {
+    if (!r || !arena || !reg || !expr) return;
+    if (expr->pos < 0 || expr->end < expr->pos) return;
+    int start, length;
+    if (expr->kind == CTSC_SK_Identifier) {
+        length = (int)expr->data.identifier.text_len;
+        start = expr->end - length;
+    } else {
+        start = expr->pos;
+        length = expr->end - expr->pos;
+    }
+    if (length <= 0) return;
+    CtscBuffer msg;
+    ctsc_buf_init(&msg);
+    ctsc_buf_append_cstr(&msg, "Type '");
+    ctsc_type_to_string(ctsc_type_widen(reg, type), &msg);
+    ctsc_buf_append_cstr(&msg, "' must have a '[Symbol.iterator]()' method that returns an iterator.");
+    char* msg_arena = (char*)ctsc_arena_alloc(arena, msg.len + 1);
+    memcpy(msg_arena, msg.data, msg.len);
+    msg_arena[msg.len] = '\0';
+    ctsc_buf_free(&msg);
+
+    CtscCheckDiagnostic d = {0};
+    d.code = 2488;
+    d.category = "Error";
+    d.start = start;
+    d.length = length;
     d.message = msg_arena;
     diag_push(r, arena, d);
 }
@@ -6048,6 +6101,63 @@ static void visit(Walk* w, const CtscNode* n) {
             if (fs->condition) visit(w, fs->condition);
             if (fs->statement) visit(w, fs->statement);
             if (fs->incrementor) visit(w, fs->incrementor);
+            close_scope_if_container(w, n);
+            return;
+        }
+
+        /*
+         * ForIn / ForOf: the oracle walks via ts.forEachChild, descending into
+         * the initializer (VariableDeclarationList or expression), the iterated
+         * expression, and the loop body. The loop variable declaration must be
+         * emitted as a VariableDeclaration entry (checker.ts
+         * checkForOfStatement / checkForInStatement ~44122-44182). M4.0 does
+         * not model iterator element inference, so a loop variable without an
+         * annotation ends up with `any` - which matches tsc's fallback when
+         * the iterated expression's type is not iterable (no lib).
+         *
+         * For-of additionally runs checkRightHandSideOfForOf →
+         * checkIteratedTypeOrElementType → reportTypeNotIterableError
+         * (checker.ts ~45675-45677, ~46169-46185): under the harness's noLib
+         * setup the iterable's type has no `[Symbol.iterator]` signature, so
+         * tsc emits TS2488 on the iterated expression. Mirror that for
+         * non-iterable scalar/empty-object types; `any` is treated as
+         * iterable (tsc: getIteratedTypeOrElementType short-circuits on any).
+         */
+        case CTSC_SK_ForInStatement: {
+            const CtscForInOrOfStatementData* fs = &n->data.forInOrOfStatement;
+            open_scope_if_container(w, n);
+            if (fs->initializer) {
+                if (fs->initializer->kind == CTSC_SK_VariableDeclarationList) {
+                    visit_variable_declaration_list(w, fs->initializer);
+                } else {
+                    visit(w, fs->initializer);
+                }
+            }
+            if (fs->expression) visit(w, fs->expression);
+            if (fs->statement) visit(w, fs->statement);
+            close_scope_if_container(w, n);
+            return;
+        }
+        case CTSC_SK_ForOfStatement: {
+            const CtscForInOrOfStatementData* fs = &n->data.forInOrOfStatement;
+            open_scope_if_container(w, n);
+            if (fs->initializer) {
+                if (fs->initializer->kind == CTSC_SK_VariableDeclarationList) {
+                    visit_variable_declaration_list(w, fs->initializer);
+                } else {
+                    visit(w, fs->initializer);
+                }
+            }
+            if (fs->expression) {
+                visit(w, fs->expression);
+                CtscType* iter_t = type_of_expression(w, &w->r->registry, fs->expression);
+                if (iter_t
+                    && iter_t->kind != CTSC_TYPE_ANY
+                    && iter_t->kind != CTSC_TYPE_UNKNOWN_T) {
+                    emit_ts2488_not_iterable(w->r, w->arena, &w->r->registry, fs->expression, iter_t);
+                }
+            }
+            if (fs->statement) visit(w, fs->statement);
             close_scope_if_container(w, n);
             return;
         }

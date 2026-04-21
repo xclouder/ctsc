@@ -2156,5 +2156,45 @@ int test_checker(void) {
         ctsc_arena_free(&a);
     }
 
+    /*
+     * TS2488 on a `for..of` iterable when the iterated expression's type has
+     * no `[Symbol.iterator]` (checker.ts checkRightHandSideOfForOf ~45675 →
+     * reportTypeNotIterableError ~46169-46185). Under the harness's noLib
+     * setup a rest parameter `...nums: number[]` collapses to `{}` because
+     * `Array<T>` is unresolved, so `for (const n of nums)` fires TS2488.
+     * Mirrors fixtures/checker/rest_params/04_rest_type_mismatch.ts; the
+     * same call `sum(1, "two", 3)` must not emit TS2345 because every
+     * argument is assignable to `{}` (checker.ts isSimpleTypeRelatedTo's
+     * `{}`-target rule, ~22170-22220).
+     */
+    {
+        const char* src =
+            "// @checker: diag\r\n"
+            "function sum(...nums: number[]): number {\r\n"
+            "  let s = 0;\r\n"
+            "  for (const n of nums) s += n;\r\n"
+            "  return s;\r\n"
+            "}\r\n"
+            "const r = sum(1, \"two\", 3);\r\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->diagnostics_len == 1);
+        if (cr->diagnostics_len >= 1) {
+            EXPECT(cr->diagnostics[0].code == 2488);
+            /* `nums` identifier in `for (const n of nums)`, start=94, length=4
+             * (UTF-16 code units), matching fixtures/checker/rest_params/
+             * 04_rest_type_mismatch.ts (CRLF). */
+            EXPECT(cr->diagnostics[0].start == 94);
+            EXPECT(cr->diagnostics[0].length == 4);
+            EXPECT(strcmp(cr->diagnostics[0].message,
+                          "Type '{}' must have a '[Symbol.iterator]()' method that returns an iterator.") == 0);
+        }
+        ctsc_arena_free(&a);
+    }
+
     return failed;
 }
