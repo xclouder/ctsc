@@ -3031,6 +3031,30 @@ static CtscNode* consume_type_via_fallback_scan(Parser* p, bool allow_multiline)
  * for the `:` case: TypeAnnotation: ":" Type
  */
 static CtscNode* parse_type_in_annotation_position(Parser* p, bool allow_multiline) {
+    /*
+     * Mirrors upstream/TypeScript/src/compiler/parser.ts
+     * parseTypeOperatorOrHigher (~4781) / parseTypeOperator (~4752):
+     *     case SyntaxKind.KeyOfKeyword:
+     *         return parseTypeOperator(operator);
+     * `keyof T` in type position consumes the `keyof` keyword, then recurses
+     * into parseTypeOperatorOrHigher for the operand type. ctsc models the
+     * node as CTSC_SK_TypeOperator with the operand stored in
+     * typeReference.typeName (shared single-child slot). `readonly T` and
+     * `unique symbol` are not yet emitted here — readonly is still consumed
+     * inline by the tuple / array path via consume_postfix_type_operators,
+     * and `unique symbol` has no dedicated fixture yet.
+     */
+    if (cur(p) == CTSC_SK_KeyOfKeyword) {
+        int fs = cur_full_start(p);
+        advance(p); /* keyof */
+        CtscNode* operand = parse_type_in_annotation_position(p, allow_multiline);
+        int end = cur_full_start(p);
+        CtscNode* to = ctsc_node_new(p->arena, CTSC_SK_TypeOperator, fs, end);
+        to->data.typeReference.typeName = operand;
+        to->data.typeReference.has_type_arguments = false;
+        ctsc_node_array_init(&to->data.typeReference.type_arguments);
+        return to;
+    }
     if (cur(p) == CTSC_SK_OpenBraceToken) {
         CtscNode* tl = parse_type_literal(p);
         consume_postfix_type_operators(p);

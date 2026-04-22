@@ -1786,6 +1786,30 @@ static CtscType* type_of_type_node(Walk* w, CtscTypeRegistry* reg, const uint16_
             }
             return type_from_annotation_fallback_span(reg, src, src_len, type_node->pos, type_node->end);
         }
+        case CTSC_SK_TypeOperator: {
+            /*
+             * `keyof T` in type position. Mirrors upstream/TypeScript/src/
+             * compiler/checker.ts getTypeFromTypeOperatorNode (~16940+):
+             *     case SyntaxKind.KeyOfKeyword:
+             *         links.resolvedType = getIndexType(getTypeFromTypeNode(node.type));
+             * ctsc stores the operand TypeNode in typeReference.typeName
+             * (shared single-child slot; parser.c
+             * parse_type_in_annotation_position). The M4.x-keyof slice
+             * preserves the syntactic `keyof X` form via CTSC_TYPE_INDEX
+             * rather than reducing to a string-literal union of property
+             * names (checker.ts getLiteralTypeFromPropertyNames ~16777) —
+             * typeToString for either form yields `keyof <X>` when the
+             * operand is a TypeReference to an interface/alias, which is
+             * exactly what the oracle expects for the keyof_interface
+             * fixture.
+             */
+            const CtscTypeReferenceData* tr = &type_node->data.typeReference;
+            if (!tr->typeName) return reg->t_any;
+            CtscType* inner =
+                type_of_type_node(w, reg, src, src_len, tr->typeName, alias_depth + 1);
+            if (!inner) inner = reg->t_any;
+            return ctsc_type_index(reg, inner);
+        }
         case CTSC_SK_TypeQuery: {
             /*
              * Mirrors upstream/TypeScript/src/compiler/checker.ts

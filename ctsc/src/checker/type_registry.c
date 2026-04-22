@@ -248,6 +248,13 @@ CtscType* ctsc_type_intersection(CtscTypeRegistry* reg, CtscType** members, size
     return t;
 }
 
+CtscType* ctsc_type_index(CtscTypeRegistry* reg, CtscType* target) {
+    if (!reg) return NULL;
+    CtscType* t = ctsc_type_new(reg, CTSC_TYPE_INDEX);
+    t->index_target = target ? target : reg->t_any;
+    return t;
+}
+
 /*
  * Literal → base widening (types.ts getWidenedLiteralType ~35395):
  *   42 → number,  "hi" → string,  true/false → boolean,  42n → bigint.
@@ -494,6 +501,20 @@ void ctsc_type_to_string(const CtscType* t, CtscBuffer* out) {
             } else {
                 ctsc_buf_append_cstr(out, "() => any");
             }
+            return;
+        case CTSC_TYPE_INDEX:
+            /*
+             * Mirrors checker.ts typeToTypeNodeHelper for IndexType: emits
+             * TypeOperatorNode(KeyOfKeyword, operand) which the printer
+             * stringifies as `keyof <operand>` (emitter.ts emitTypeOperator
+             * ~2400+). Precedence: operand types that bind looser than
+             * `keyof` would need parens; the M4.x-keyof slice only stores
+             * TypeReference / primitive operands (never a union / function
+             * type), so delegating straight through is correct for the
+             * current fixture set.
+             */
+            ctsc_buf_append_cstr(out, "keyof ");
+            ctsc_type_to_string(t->index_target, out);
             return;
         default:
             ctsc_buf_append_cstr(out, "any");

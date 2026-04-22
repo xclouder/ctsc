@@ -2342,5 +2342,55 @@ int test_checker(void) {
         ctsc_arena_free(&a);
     }
 
+    /*
+     * `keyof T` type operator preserved through a type alias (fixtures/
+     * checker/keyof/01_keyof_interface.ts). Mirrors upstream/TypeScript/
+     * src/compiler/checker.ts getTypeFromTypeOperatorNode (~16940+)
+     * KeyOfKeyword → getIndexType; typeToString emits `keyof <operand>`
+     * for a non-reduced IndexType (checker.ts typeToTypeNodeHelper
+     * IndexType branch). The alias `type K = keyof Point` forwards the
+     * IndexType to `declare const k: K` without tagging `K` as the alias
+     * name on the result (checker.ts getDeclaredTypeOfTypeAlias does not
+     * attach aliasSymbol on non-structural types), so the entry reads
+     * `keyof Point` instead of `K`.
+     */
+    {
+        const char* src = "// @checker: types\n"
+                          "interface Point {\n"
+                          "  x: number;\n"
+                          "  y: number;\n"
+                          "}\n"
+                          "type K = keyof Point;\n"
+                          "declare const k: K;\n"
+                          "const a = k;\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->entries_len == 4);
+        /* Entries: Point.x, Point.y, k, a. */
+        if (cr->entries_len >= 3 && cr->entries[2].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[2].type, &ts);
+            const char* want = "keyof Point";
+            EXPECT(ts.len == strlen(want));
+            EXPECT(memcmp(ts.data, want, strlen(want)) == 0);
+            ctsc_buf_free(&ts);
+        }
+        if (cr->entries_len >= 4 && cr->entries[3].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[3].type, &ts);
+            const char* want = "keyof Point";
+            EXPECT(ts.len == strlen(want));
+            EXPECT(memcmp(ts.data, want, strlen(want)) == 0);
+            ctsc_buf_free(&ts);
+        }
+        ctsc_arena_free(&a);
+    }
+
     return failed;
 }

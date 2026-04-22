@@ -159,6 +159,21 @@ typedef enum {
     CTSC_SK_TypeKeyword,
     CTSC_SK_UndefinedKeyword,
     CTSC_SK_NeverKeyword,
+    /*
+     * Contextual type-operator keyword. Mirrors ts.SyntaxKind.KeyOfKeyword
+     * (upstream/TypeScript/src/compiler/types.ts), consumed only inside a
+     * type position as the `keyof` prefix of a TypeOperatorNode (parser.ts
+     * parseTypeOperatorOrHigher ~4781 / parseTypeOperator ~4752). Outside
+     * type positions the parser accepts it as an ordinary Identifier via
+     * the contextual-keyword range check in is_binding_identifier_kind /
+     * token_is_identifier_expression (AsKeyword..UnknownKeyword).
+     *
+     * NOTE: placed before UnknownKeyword so the existing contextual-keyword
+     * range checks pick it up without changes. Any new TS keyword kind must
+     * be inserted inside that range to preserve identifier-fallback
+     * semantics (selfhost `keyof` as a variable / property name etc.).
+     */
+    CTSC_SK_KeyOfKeyword,
     CTSC_SK_UnknownKeyword,
 
     /* Node kinds (Phase 2+; agent 扩展时按 tsc ts.SyntaxKind 添加更多) */
@@ -259,6 +274,19 @@ typedef enum {
      * supports only the Identifier form (single-name); dotted exprName and
      * type arguments are not yet modelled — fixtures will add them. */
     CTSC_SK_TypeQuery,
+    /*
+     * Mirrors ts.SyntaxKind.TypeOperator (upstream/TypeScript/src/compiler/
+     * parser.ts parseTypeOperator ~4752, types.ts TypeOperatorNode). A unary
+     * prefix in type position: `keyof T`, `readonly T`, `unique symbol`.
+     * ctsc currently only emits this node for `keyof`; the `readonly`
+     * variant is still consumed inline by the tuple path (see
+     * consume_postfix_type_operators) and `unique symbol` isn't modelled.
+     * The operand TypeNode is stored in typeReference.typeName (reusing the
+     * single-child slot to keep the union-data layout unchanged), and the
+     * operator kind is recorded in typeReference.has_type_arguments=false
+     * plus the enclosing node's kind.
+     */
+    CTSC_SK_TypeOperator,
 
     CTSC_SK__COUNT
 } CtscSyntaxKind;

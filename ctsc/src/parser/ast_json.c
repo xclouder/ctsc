@@ -187,20 +187,24 @@ static void emit_node(CtscJson* j, const CtscNode* n) {
             break;
         }
         case CTSC_SK_TypeReference:
-        case CTSC_SK_TypeQuery: {
+        case CTSC_SK_TypeQuery:
+        case CTSC_SK_TypeOperator: {
             /* Mirrors upstream/TypeScript/src/compiler/parser.ts
              * forEachChildInTypeReference: visits typeName then each
              * typeArgument; forEachChildInTypeQuery (~672) visits exprName
-             * then each typeArgument. The oracle (harness/src/oracle-ast.ts)
-             * has no explicit case for either, so both fall through to the
-             * default branch which serializes forEachChild's visits as a
-             * single `children` array (and only when non-empty). When the
-             * parser's fallback path (non-identifier type atoms) produced a
-             * TypeReference with no typeName, we still emit `{kind,pos,end}`
-             * only — nothing serializes to a `children` array in that case.
-             * TypeQuery reuses the same typeReference data slot (exprName in
-             * typeName, optional typeArguments), matching the forEachChild
-             * order for both node kinds. */
+             * then each typeArgument; forEachChildInTypeOperator (~1150)
+             * visits the single `type` child. The oracle
+             * (harness/src/oracle-ast.ts) has no explicit case for any of
+             * these, so they fall through to the default branch which
+             * serializes forEachChild's visits as a single `children` array
+             * (only when non-empty). When the parser's fallback path
+             * (non-identifier type atoms) produced a TypeReference with no
+             * typeName, we still emit `{kind,pos,end}` only — nothing
+             * serializes to a `children` array in that case. TypeQuery and
+             * TypeOperator reuse the same typeReference data slot (exprName
+             * / operand TypeNode in typeName, optional typeArguments unused
+             * for TypeOperator), matching the forEachChild order for all
+             * three node kinds. */
             size_t child_count = 0;
             if (n->data.typeReference.typeName) child_count++;
             if (n->data.typeReference.has_type_arguments) {

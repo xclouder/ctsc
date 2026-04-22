@@ -109,7 +109,23 @@ typedef enum {
      * expressions on a value of this type can recover the return type
      * (checker.ts getReturnTypeOfSignature path).
      */
-    CTSC_TYPE_FUNCTION
+    CTSC_TYPE_FUNCTION,
+
+    /*
+     * Index type (the result of `keyof T`). Mirrors TypeScript's IndexType
+     * (types.ts IndexType; checker.ts getIndexType ~16800+). Stores the
+     * operand type in `index_target`. typeToString emits `keyof <target>`
+     * (checker.ts typeToString / typeToTypeNodeHelper for IndexType emits
+     * TypeOperatorNode(KeyOfKeyword)).
+     *
+     * M4.x-keyof only surfaces this type through a `keyof <TypeReference>`
+     * annotation (parser.ts parseTypeOperator ~4752); full reduction to a
+     * string-literal union of an object type's property names (checker.ts
+     * getLiteralTypeFromPropertyNames ~16777) is not yet implemented —
+     * formatting preserves the syntactic `keyof X` form, which is what tsc
+     * emits for an un-distributed `keyof` of a generic / interface type.
+     */
+    CTSC_TYPE_INDEX
 } CtscTypeKind;
 
 typedef struct CtscType CtscType;
@@ -227,6 +243,13 @@ struct CtscType {
     const char* function_signature_text;
     size_t      function_signature_text_len;
     const void* function_decl;
+
+    /*
+     * CTSC_TYPE_INDEX only: operand of `keyof`. Mirrors TypeScript's
+     * IndexType.type (types.ts IndexType; checker.ts createIndexType
+     * ~16800+).
+     */
+    CtscType* index_target;
 };
 
 struct CtscArena;
@@ -346,6 +369,14 @@ CtscType* ctsc_type_tuple_with_element_flags_and_labels(CtscTypeRegistry* reg, C
 
 /* Intersection: `members` copied into the arena; count must be >= 1. */
 CtscType* ctsc_type_intersection(CtscTypeRegistry* reg, CtscType** members, size_t member_count);
+
+/*
+ * Index type (`keyof T`). Mirrors TypeScript's getIndexType (checker.ts
+ * ~16800+). M4.x-keyof preserves the syntactic `keyof X` form;
+ * ctsc_type_to_string emits `keyof <target>` by delegating to the target's
+ * typeToString.
+ */
+CtscType* ctsc_type_index(CtscTypeRegistry* reg, CtscType* target);
 
 /* Widening rules (types.ts getWidenedLiteralType): narrow literal -> base. */
 CtscType* ctsc_type_widen(CtscTypeRegistry* reg, const CtscType* t);

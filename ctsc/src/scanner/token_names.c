@@ -148,6 +148,7 @@ static const char* const k_names[CTSC_SK__COUNT] = {
     [CTSC_SK_UndefinedKeyword]                  = "UndefinedKeyword",
     [CTSC_SK_NeverKeyword]                      = "NeverKeyword",
     [CTSC_SK_UnknownKeyword]                    = "UnknownKeyword",
+    [CTSC_SK_KeyOfKeyword]                      = "KeyOfKeyword",
 
     [CTSC_SK_SourceFile]                        = "SourceFile",
     [CTSC_SK_Block]                             = "Block",
@@ -238,6 +239,7 @@ static const char* const k_names[CTSC_SK__COUNT] = {
     [CTSC_SK_CatchClause]                       = "CatchClause",
     [CTSC_SK_LabeledStatement]                  = "LabeledStatement",
     [CTSC_SK_TypeQuery]                         = "TypeQuery",
+    [CTSC_SK_TypeOperator]                      = "TypeOperator",
 };
 
 const char* ctsc_syntax_kind_name(CtscSyntaxKind k) {
@@ -287,6 +289,7 @@ static const Keyword k_keywords[] = {
     { "in",         2, CTSC_SK_InKeyword },
     { "instanceof", 10, CTSC_SK_InstanceOfKeyword },
     { "interface",  9, CTSC_SK_InterfaceKeyword },
+    { "keyof",      5, CTSC_SK_KeyOfKeyword },
     { "let",        3, CTSC_SK_LetKeyword },
     { "module",     6, CTSC_SK_ModuleKeyword },
     { "namespace",  9, CTSC_SK_NamespaceKeyword },
