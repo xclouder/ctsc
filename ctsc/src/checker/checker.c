@@ -464,6 +464,48 @@ static void append_type_for_signature(CtscBuffer* out, CtscTypeRegistry* reg, co
             ctsc_type_to_string(t, out);
             return;
         }
+        case CTSC_SK_TypeOperator: {
+            /*
+             * `keyof X` in type position. Mirrors checker.ts typeToString on
+             * IndexType (types.ts IndexType; typeToTypeNodeHelper for
+             * IndexType emits TypeOperatorNode(KeyOfKeyword)). ctsc stores
+             * the operand TypeNode in typeReference.typeName (parser.ts
+             * parseTypeOperator ~4752). Only the `keyof` operator is
+             * modelled here — `readonly` / `unique` would need extra state.
+             */
+            const CtscTypeReferenceData* tr = &type_node->data.typeReference;
+            ctsc_buf_append_cstr(out, "keyof ");
+            if (tr->typeName) {
+                append_type_for_signature(out, reg, tr->typeName, src, src_len);
+            } else {
+                ctsc_buf_append_cstr(out, "any");
+            }
+            return;
+        }
+        case CTSC_SK_IndexedAccessType: {
+            /*
+             * `T[K]` in type position. Mirrors checker.ts typeToString on
+             * IndexedAccessType (types.ts IndexedAccessType;
+             * typeToTypeNodeHelper ~7490+ emits IndexedAccessTypeNode). The
+             * object type is stored in typeReference.typeName and the index
+             * type in type_arguments[0] (parser.c wrap_postfix_indexed_access
+             * ~3002).
+             */
+            const CtscTypeReferenceData* tr = &type_node->data.typeReference;
+            if (tr->typeName) {
+                append_type_for_signature(out, reg, tr->typeName, src, src_len);
+            } else {
+                ctsc_buf_append_cstr(out, "any");
+            }
+            ctsc_buf_append_char(out, '[');
+            if (tr->has_type_arguments && tr->type_arguments.len > 0) {
+                append_type_for_signature(out, reg, tr->type_arguments.items[0], src, src_len);
+            } else {
+                ctsc_buf_append_cstr(out, "any");
+            }
+            ctsc_buf_append_char(out, ']');
+            return;
+        }
         default:
             ctsc_buf_append_cstr(out, "any");
             return;
@@ -1605,6 +1647,17 @@ static CtscType* instantiate_type_params_in_type(Walk* w, CtscTypeRegistry* reg,
  * → value-symbol type). Defined further down alongside the expression-level
  * symbol lookups. */
 static CtscType* type_of_symbol_value(Walk* w, CtscSymbol* sym);
+/* Forward declaration for the IndexedAccessType branch in type_of_type_node
+ * (checker.ts getIndexedAccessType ~19637 → getPropertyTypeForIndexType ~19262).
+ * Defined further down alongside the property-access machinery. */
+static CtscType* type_of_property_of_object_type(Walk* w, CtscTypeRegistry* reg, CtscType* object_type,
+                                                 const uint16_t* prop_name, size_t prop_len);
+/* Forward declaration for the IndexedAccessType branch when indexType is a
+ * `keyof U` (CTSC_TYPE_INDEX): we materialise U's object shape to enumerate
+ * its property names. Mirrors checker.ts getLiteralTypeFromProperties ~16777
+ * reached from getIndexType ~18984 on a non-generic object type. Defined
+ * further down next to resolve_interface_declaration_to_object_literal. */
+static CtscType* resolve_type_reference_to_object_literal(Walk* w, CtscTypeRegistry* reg, CtscType* ref);
 
 /*
  * Maps TypeNode → CtscType for the M4.0 subset. Unknown types collapse to
@@ -1809,6 +1862,128 @@ static CtscType* type_of_type_node(Walk* w, CtscTypeRegistry* reg, const uint16_
                 type_of_type_node(w, reg, src, src_len, tr->typeName, alias_depth + 1);
             if (!inner) inner = reg->t_any;
             return ctsc_type_index(reg, inner);
+        }
+        case CTSC_SK_IndexedAccessType: {
+            /*
+             * `T[K]` in type position. Mirrors upstream/TypeScript/src/
+             * compiler/checker.ts getTypeFromIndexedAccessTypeNode (~19722):
+             *     const objectType = getTypeFromTypeNode(node.objectType);
+             *     const indexType  = getTypeFromTypeNode(node.indexType);
+             *     links.resolvedType = getIndexedAccessType(objectType, indexType, ...);
+             *
+             * getIndexedAccessType (~19637) resolves the property's declared
+             * type via getPropertyTypeForIndexType (~19262). When the index
+             * type is a union of string-literals (`T["a" | "b"]`), tsc
+             * distributes per-constituent and returns a union of the looked-up
+             * property types (~19695-19717: iterate indexType.types, push
+             * propType, return getUnionType(propTypes, UnionReduction.Literal,
+             * aliasSymbol, aliasTypeArguments)). ctsc's existing
+             * type_of_property_of_object_type covers the per-member lookup,
+             * so we forward to it for every string-literal constituent and
+             * rebuild a CTSC_TYPE_UNION. Unknown shapes fall back to `any`
+             * for now — follow-up fixtures (keyof-driven index, numeric
+             * index on arrays) will extend this.
+             */
+            const CtscTypeReferenceData* tr = &type_node->data.typeReference;
+            if (!tr->typeName || !tr->has_type_arguments || tr->type_arguments.len < 1) {
+                return reg->t_any;
+            }
+            CtscType* obj_ty = type_of_type_node(w, reg, src, src_len, tr->typeName, alias_depth + 1);
+            CtscType* idx_ty =
+                type_of_type_node(w, reg, src, src_len, tr->type_arguments.items[0], alias_depth + 1);
+            if (!obj_ty || !idx_ty || !w) return reg->t_any;
+            if (idx_ty->kind == CTSC_TYPE_STRING_LITERAL) {
+                CtscType* pt =
+                    type_of_property_of_object_type(w, reg, obj_ty, idx_ty->text, idx_ty->text_len);
+                if (pt) return pt;
+                return reg->t_any;
+            }
+            if (idx_ty->kind == CTSC_TYPE_UNION) {
+                CtscType* parts[32];
+                size_t np = 0;
+                for (size_t i = 0; i < idx_ty->union_members_len && np < 32; ++i) {
+                    CtscType* m = idx_ty->union_members[i];
+                    if (!m || m->kind != CTSC_TYPE_STRING_LITERAL) return reg->t_any;
+                    CtscType* pt =
+                        type_of_property_of_object_type(w, reg, obj_ty, m->text, m->text_len);
+                    if (!pt) return reg->t_any;
+                    bool dup = false;
+                    for (size_t j = 0; j < np; ++j) {
+                        if (parts[j] == pt) { dup = true; break; }
+                    }
+                    if (!dup) parts[np++] = pt;
+                }
+                if (np == 0) return reg->t_any;
+                if (np == 1) return parts[0];
+                CtscType* u = ctsc_type_new(reg, CTSC_TYPE_UNION);
+                u->union_members = (CtscType**)ctsc_arena_alloc(reg->arena, np * sizeof(CtscType*));
+                memcpy(u->union_members, parts, np * sizeof(CtscType*));
+                u->union_members_len = np;
+                sort_intrinsic_union_members(u);
+                return u;
+            }
+            if (idx_ty->kind == CTSC_TYPE_INDEX) {
+                /*
+                 * `T[keyof U]`. Mirrors checker.ts getIndexedAccessType ~19637
+                 * when `indexType` is an IndexType: tsc first reduces
+                 * `keyof U` via getIndexType (~18984). For a non-generic
+                 * object type U this yields a string-literal union of U's
+                 * property names via getLiteralTypeFromProperties (~16777);
+                 * the IndexedAccessType branch at ~19695-19717 then
+                 * distributes per-constituent, calling
+                 * getPropertyTypeForIndexType for each name and returning
+                 * getUnionType(propTypes, UnionReduction.Literal,
+                 * aliasSymbol, aliasTypeArguments).
+                 *
+                 * ctsc preserves the syntactic `keyof X` form as
+                 * CTSC_TYPE_INDEX (see type.h ~114-126), so we stage the
+                 * distribution here: resolve U's object shape, iterate its
+                 * property names, look each one up on `obj_ty` via the
+                 * existing per-property machinery, and build a union. The
+                 * caller's alias-tagging (type_of_type_node TypeReference
+                 * branch ~1678-1687) then attaches the `type V = ...` alias
+                 * symbol so typeToString prints `V` instead of expanding
+                 * the union — matching tsc's getUnionType(..., aliasSymbol)
+                 * behaviour on line 19717.
+                 */
+                CtscType* keyof_target = idx_ty->index_target;
+                if (!keyof_target) return reg->t_any;
+                CtscType* names_source = keyof_target;
+                if (names_source->kind == CTSC_TYPE_REFERENCE) {
+                    CtscType* lit = resolve_type_reference_to_object_literal(w, reg, names_source);
+                    if (lit) names_source = lit;
+                }
+                if (names_source->kind != CTSC_TYPE_OBJECT_LITERAL
+                    || names_source->object_properties_len == 0) {
+                    return reg->t_any;
+                }
+                CtscType* parts[32];
+                size_t np = 0;
+                for (size_t i = 0;
+                     i < names_source->object_properties_len && np < 32;
+                     ++i) {
+                    const CtscObjectProperty* p = &names_source->object_properties[i];
+                    if (!p->name || p->name_len == 0) return reg->t_any;
+                    CtscType* pt =
+                        type_of_property_of_object_type(w, reg, obj_ty, p->name, p->name_len);
+                    if (!pt) return reg->t_any;
+                    bool dup = false;
+                    for (size_t j = 0; j < np; ++j) {
+                        if (parts[j] == pt) { dup = true; break; }
+                    }
+                    if (!dup) parts[np++] = pt;
+                }
+                if (np == 0) return reg->t_any;
+                if (np == 1) return parts[0];
+                CtscType* u = ctsc_type_new(reg, CTSC_TYPE_UNION);
+                u->union_members =
+                    (CtscType**)ctsc_arena_alloc(reg->arena, np * sizeof(CtscType*));
+                memcpy(u->union_members, parts, np * sizeof(CtscType*));
+                u->union_members_len = np;
+                sort_intrinsic_union_members(u);
+                return u;
+            }
+            return reg->t_any;
         }
         case CTSC_SK_TypeQuery: {
             /*
@@ -5230,6 +5405,99 @@ static bool type_depends_on_fn_type_parameters(const CtscNode* fn_decl, CtscType
 }
 
 /*
+ * Resolve a TypeNode that directly names a type parameter of `fn_decl` to the
+ * corresponding inferred `CtscType` from the inference map. Mirrors the
+ * identifier-TypeReference branch of checker.ts instantiateType's
+ * TypeReference path (~18030+). Returns NULL when the TypeNode is not a
+ * single-Identifier TypeReference naming one of this signature's type
+ * parameters.
+ */
+static CtscType* instantiation_lookup_type_parameter_by_type_ref(const CtscNode* fn_decl,
+                                                                 const CtscNode* type_node,
+                                                                 CtscType* const* infer, size_t infer_len) {
+    if (!fn_decl || fn_decl->kind != CTSC_SK_FunctionDeclaration) return NULL;
+    if (!type_node || type_node->kind != CTSC_SK_TypeReference) return NULL;
+    const CtscTypeReferenceData* tr = &type_node->data.typeReference;
+    if (tr->has_type_arguments && tr->type_arguments.len > 0) return NULL;
+    if (!tr->typeName || tr->typeName->kind != CTSC_SK_Identifier) return NULL;
+    const CtscIdentifierData* id = &tr->typeName->data.identifier;
+    const CtscNodeArray* tps = &fn_decl->data.functionDeclaration.type_parameters;
+    for (size_t ti = 0; ti < tps->len && ti < infer_len; ++ti) {
+        const CtscNode* tp = tps->items[ti];
+        if (!tp || tp->kind != CTSC_SK_TypeParameter) continue;
+        const CtscNode* tnm = tp->data.typeParameter.name;
+        if (!tnm || tnm->kind != CTSC_SK_Identifier) continue;
+        const CtscIdentifierData* tid = &tnm->data.identifier;
+        if (utf16_type_text_equal(id->text, id->text_len, tid->text, tid->text_len)) {
+            return infer[ti];
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Instantiate an IndexedAccessType return annotation (`T[K]`) at a generic
+ * call site. Mirrors checker.ts getIndexedAccessType (~19637): substitute the
+ * object type and index type with their inferred concrete types and resolve
+ * the property.
+ *
+ * Currently handles the `T` / `K` shape exercised by fixture
+ * checker/indexed_access/04_indexed_generic.ts — both operands are plain
+ * type-parameter references, and the inferred index is a string literal or a
+ * union of string literals so we can forward to the existing per-property
+ * machinery. More complex forms (non-type-parameter operand, numeric index,
+ * `keyof T` index) are left to future fixtures.
+ */
+static CtscType* instantiate_indexed_access_return_type(Walk* w, CtscTypeRegistry* reg, const CtscNode* fn_decl,
+                                                         const CtscNode* ret_node, CtscType* const* infer,
+                                                         size_t infer_len) {
+    if (!w || !reg || !fn_decl || !ret_node || ret_node->kind != CTSC_SK_IndexedAccessType) return NULL;
+    const CtscTypeReferenceData* tr = &ret_node->data.typeReference;
+    if (!tr->typeName || !tr->has_type_arguments || tr->type_arguments.len < 1) return NULL;
+
+    CtscType* obj_ty = instantiation_lookup_type_parameter_by_type_ref(fn_decl, tr->typeName, infer, infer_len);
+    if (!obj_ty) {
+        obj_ty = type_of_type_node(w, reg, w->source_utf16, w->source_utf16_len, tr->typeName, 0);
+    }
+    if (!obj_ty) return NULL;
+
+    CtscNode* idx_node = tr->type_arguments.items[0];
+    CtscType* idx_ty = instantiation_lookup_type_parameter_by_type_ref(fn_decl, idx_node, infer, infer_len);
+    if (!idx_ty) {
+        idx_ty = type_of_type_node(w, reg, w->source_utf16, w->source_utf16_len, idx_node, 0);
+    }
+    if (!idx_ty) return NULL;
+
+    if (idx_ty->kind == CTSC_TYPE_STRING_LITERAL) {
+        CtscType* pt = type_of_property_of_object_type(w, reg, obj_ty, idx_ty->text, idx_ty->text_len);
+        return pt;
+    }
+    if (idx_ty->kind == CTSC_TYPE_UNION) {
+        CtscType* parts[32];
+        size_t np = 0;
+        for (size_t i = 0; i < idx_ty->union_members_len && np < 32; ++i) {
+            CtscType* m = idx_ty->union_members[i];
+            if (!m || m->kind != CTSC_TYPE_STRING_LITERAL) return NULL;
+            CtscType* pt = type_of_property_of_object_type(w, reg, obj_ty, m->text, m->text_len);
+            if (!pt) return NULL;
+            bool dup = false;
+            for (size_t j = 0; j < np; ++j) {
+                if (parts[j] == pt) { dup = true; break; }
+            }
+            if (!dup) parts[np++] = pt;
+        }
+        if (np == 0) return NULL;
+        if (np == 1) return parts[0];
+        CtscType* u = ctsc_type_new(reg, CTSC_TYPE_UNION);
+        u->union_members = (CtscType**)ctsc_arena_alloc(reg->arena, np * sizeof(CtscType*));
+        memcpy(u->union_members, parts, np * sizeof(CtscType*));
+        u->union_members_len = np;
+        return u;
+    }
+    return NULL;
+}
+
+/*
  * Generic call return instantiation: when the declared or body-inferred return
  * type references this signature's type parameters, map those parameters to
  * explicit type arguments (`first<number, string>(...)`) or the corresponding
@@ -5244,6 +5512,24 @@ static CtscType* generic_call_instantiated_return_type(Walk* w, CtscTypeRegistry
     if (!w || !reg || !fn_decl || fn_decl->kind != CTSC_SK_FunctionDeclaration || !ce) return NULL;
     const CtscFunctionDeclarationData* fd = &fn_decl->data.functionDeclaration;
     if (fd->type_parameters.len < 1) return NULL;
+
+    /*
+     * IndexedAccessType return annotation (`: T[K]`): look up the inferred
+     * object type's property keyed by the inferred index type. Mirrors
+     * checker.ts getIndexedAccessType (~19637) applied to a generic signature
+     * return. Keep this branch before the generic declared-return path so we
+     * do not fall through to `t_any` from the unmodelled type-parameter
+     * indexed access node.
+     */
+    if (fd->type && fd->type->kind == CTSC_SK_IndexedAccessType) {
+        CtscType* infer[16];
+        size_t cap = sizeof(infer) / sizeof(infer[0]);
+        collect_generic_call_inferences_ex(w, reg, fn_decl, ce, infer, cap,
+                                            /*widen_unconstrained_literals*/ false);
+        size_t used = fd->type_parameters.len < cap ? fd->type_parameters.len : cap;
+        CtscType* r = instantiate_indexed_access_return_type(w, reg, fn_decl, fd->type, infer, used);
+        if (r) return r;
+    }
 
     /*
      * TypeLiteral return annotation (`: { k: K; v: V }`): substitute inferred

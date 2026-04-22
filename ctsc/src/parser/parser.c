@@ -2331,6 +2331,28 @@ static CtscNode* try_parse_simple_type_parameter_type_node(Parser* p) {
         advance(p);
         int end = cur_full_start(p);
         t = ctsc_node_new(p->arena, kk, fs, end);
+    } else if (kk == CTSC_SK_KeyOfKeyword) {
+        /*
+         * `keyof <simple>` constraint form (e.g. `<K extends keyof T>`).
+         * Mirrors parser.ts parseTypeOperatorOrHigher (~4781) /
+         * parseTypeOperator (~4752): consume `keyof` then recurse into a
+         * simple operand so the constraint is well-delimited at `>` / `,`
+         * / `=`. The operand is again a simple renderable type node
+         * (keyword / single-identifier TypeReference / literal) so
+         * append_type_for_signature can spell the constraint back out as
+         * `keyof X`.
+         */
+        int fs = cur_full_start(p);
+        advance(p); /* keyof */
+        CtscNode* operand = try_parse_simple_type_parameter_type_node(p);
+        if (operand) {
+            int end = cur_full_start(p);
+            CtscNode* to = ctsc_node_new(p->arena, CTSC_SK_TypeOperator, fs, end);
+            to->data.typeReference.typeName = operand;
+            to->data.typeReference.has_type_arguments = false;
+            ctsc_node_array_init(&to->data.typeReference.type_arguments);
+            t = to;
+        }
     } else if (kk == CTSC_SK_Identifier
                || kk == CTSC_SK_StringLiteral
                || kk == CTSC_SK_NumericLiteral
@@ -2969,6 +2991,76 @@ static void consume_postfix_type_operators(Parser* p) {
     }
 }
 
+/*
+ * Mirrors upstream/TypeScript/src/compiler/parser.ts parsePostfixTypeOrHigher
+ * (~4716) for the case where the postfix `[...]` carries an index type:
+ *
+ *     case SyntaxKind.OpenBracketToken:
+ *         nextToken();
+ *         if (isStartOfType()) {
+ *             const indexType = parseType();
+ *             parseExpected(CloseBracketToken);
+ *             type = finishNode(factory.createIndexedAccessTypeNode(type, indexType), pos);
+ *         } else {
+ *             parseExpected(CloseBracketToken);
+ *             type = finishNode(factory.createArrayTypeNode(type), pos);
+ *         }
+ *         break;
+ *
+ * ctsc does not yet model ArrayTypeNode as a distinct node (the trailing
+ * `[]` is recovered from the source span in type_node_has_postfix_empty_array),
+ * so the `[]` branch just extends the base node's end position like before.
+ * For a non-empty `[K]` we wrap the base TypeNode in a
+ * CTSC_SK_IndexedAccessType node: the object type is stored in
+ * `typeReference.typeName`, the index type in `typeReference.type_arguments[0]`,
+ * `has_type_arguments = true`. checker.ts
+ * getTypeFromIndexedAccessTypeNode (~19722) consumes both to compute
+ * getIndexedAccessType (~19637). The wrapping is idempotent and chains
+ * naturally for `T[K][L]`.
+ *
+ * `base` must already have been parsed; on entry `cur(p)` may or may not be
+ * `[`. Returns the (possibly-wrapped) TypeNode.
+ */
+static CtscNode* wrap_postfix_indexed_access(Parser* p, CtscNode* base) {
+    while (!p->scanner.current.has_preceding_line_break
+           && cur(p) == CTSC_SK_OpenBracketToken) {
+        int bracket_pos = cur_full_start(p);
+        CtscScanner saved = p->scanner;
+        size_t saved_diag_count = p->diagnostics->count;
+        advance(p); /* `[` */
+        if (cur(p) == CTSC_SK_CloseBracketToken) {
+            advance(p);
+            if (base) base->end = cur_full_start(p);
+            continue;
+        }
+        if (!token_can_start_type(cur(p))) {
+            p->scanner = saved;
+            ctsc_diag_truncate(p->diagnostics, saved_diag_count);
+            break;
+        }
+        CtscNode* index_ty = parse_type_in_annotation_position(p, true);
+        if (cur(p) != CTSC_SK_CloseBracketToken) {
+            p->scanner = saved;
+            ctsc_diag_truncate(p->diagnostics, saved_diag_count);
+            break;
+        }
+        advance(p); /* `]` */
+        int end = cur_full_start(p);
+        if (!base || !index_ty) {
+            if (base) base->end = end;
+            continue;
+        }
+        CtscNode* ia = ctsc_node_new(p->arena, CTSC_SK_IndexedAccessType, base->pos, end);
+        ia->data.typeReference.typeName = base;
+        ia->data.typeReference.has_type_arguments = true;
+        ctsc_node_array_init(&ia->data.typeReference.type_arguments);
+        ctsc_node_array_push(&ia->data.typeReference.type_arguments, p->arena, index_ty);
+        base = ia;
+        (void)bracket_pos;
+    }
+    return base;
+}
+
 /* Stop-set scan for types that are not modelled as full TypeNodes yet.
  * Leading `{ ... }` unions call this after each `|` when the RHS is not an
  * object type literal (mirrors parser.ts parseUnionType ~4876). */
@@ -3108,13 +3200,29 @@ static CtscNode* parse_type_in_annotation_position(Parser* p, bool allow_multili
          * behaviour that upstream-derived parser fixtures were baselined on. */
         CtscSyntaxKind after = cur(p);
         if (entity_name != NULL && after != CTSC_SK_DotToken && after != CTSC_SK_LessThanToken) {
-            consume_postfix_type_operators(p);
-            int end = cur_full_start(p);
-            CtscNode* tq = ctsc_node_new(p->arena, CTSC_SK_TypeQuery, fs, end);
+            /*
+             * Build the TypeQuery first, with its end positioned at the
+             * token that follows the exprName (mirrors parser.ts
+             * parseTypeQuery ~3946 finishing the node before
+             * parsePostfixTypeOrHigher wraps it). Then feed it through
+             * wrap_postfix_indexed_access so a following `[K]` produces a
+             * proper CTSC_SK_IndexedAccessType whose objectType is the
+             * TypeQuery — matching upstream's AST shape for
+             * `typeof arr[number]` (IndexedAccessType(TypeQuery(arr),
+             * NumberKeyword)) at checker/indexed_access/
+             * 05_indexed_array_number.ts. An empty `[]` still just
+             * extends the base's end span, preserving the legacy
+             * behaviour that parser/from-upstream/107_parserTypeQuery7.ts
+             * (`var v: typeof A[]`) was baselined on.
+             */
+            int tq_end = cur_full_start(p);
+            CtscNode* tq = ctsc_node_new(p->arena, CTSC_SK_TypeQuery, fs, tq_end);
             tq->data.typeReference.typeName = entity_name;
             tq->data.typeReference.has_type_arguments = false;
             ctsc_node_array_init(&tq->data.typeReference.type_arguments);
-            return tq;
+            CtscNode* wrapped = wrap_postfix_indexed_access(p, tq);
+            if (wrapped) wrapped->end = cur_full_start(p);
+            return wrapped ? wrapped : tq;
         }
         p->scanner = saved;
         ctsc_diag_truncate(p->diagnostics, saved_diag_count);
@@ -3305,7 +3413,13 @@ static CtscNode* parse_type_in_annotation_position(Parser* p, bool allow_multili
         size_t saved_diag_count = p->diagnostics->count;
         CtscNode* tr = parse_type_node(p);
         if (tr) {
-            consume_postfix_type_operators(p);
+            /*
+             * Postfix `[` ... `]` chain: either an empty `[]` (ArrayType —
+             * ctsc still treats this by extending the base node's end span)
+             * or a non-empty `[K]` (IndexedAccessType — wrapped below).
+             * Mirrors parser.ts parsePostfixTypeOrHigher ~4716.
+             */
+            tr = wrap_postfix_indexed_access(p, tr);
             tr->end = cur_full_start(p);
             CtscSyntaxKind nk = cur(p);
             bool terminates =

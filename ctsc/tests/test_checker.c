@@ -2392,5 +2392,217 @@ int test_checker(void) {
         ctsc_arena_free(&a);
     }
 
+    /*
+     * Indexed access type `T["x"]` resolves to the property type of T
+     * (fixtures/checker/indexed_access/01_indexed_interface.ts). Mirrors
+     * upstream/TypeScript/src/compiler/checker.ts getTypeFromIndexedAccessTypeNode
+     * (~19722) → getIndexedAccessType (~19637) → getPropertyTypeForIndexType
+     * (~19262): for a string-literal index whose text names a property of
+     * the object type, return that property's declared type. The alias
+     * `type X = Point["x"]` forwards the resolved `number` through to
+     * `declare const v: X`, so entry `v` reads `number` instead of
+     * `Point` (which was the pre-fix regression).
+     */
+    {
+        const char* src = "// @checker: types\n"
+                          "interface Point {\n"
+                          "  x: number;\n"
+                          "  y: number;\n"
+                          "}\n"
+                          "type X = Point[\"x\"];\n"
+                          "declare const v: X;\n"
+                          "const a = v;\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->entries_len == 4);
+        /* Entries: Point.x, Point.y, v, a. */
+        if (cr->entries_len >= 3 && cr->entries[2].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[2].type, &ts);
+            const char* want = "number";
+            EXPECT(ts.len == strlen(want));
+            EXPECT(memcmp(ts.data, want, strlen(want)) == 0);
+            ctsc_buf_free(&ts);
+        }
+        if (cr->entries_len >= 4 && cr->entries[3].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[3].type, &ts);
+            const char* want = "number";
+            EXPECT(ts.len == strlen(want));
+            EXPECT(memcmp(ts.data, want, strlen(want)) == 0);
+            ctsc_buf_free(&ts);
+        }
+        ctsc_arena_free(&a);
+    }
+
+    /*
+     * Indexed access with a union of string-literal keys distributes per
+     * constituent (fixtures/checker/indexed_access/02_indexed_union_keys.ts).
+     * Mirrors upstream/TypeScript/src/compiler/checker.ts
+     * getIndexedAccessType ~19695-19717: when the index type is a
+     * UnionType (and not Boolean), tsc iterates its `.types`, calls
+     * getPropertyTypeForIndexType for each constituent, and returns
+     * getUnionType(propTypes, UnionReduction.Literal, aliasSymbol, ...).
+     * For `type V = Mix["id" | "name"]`, the resolved type is
+     * `number | string`; tsc typeToString prefers the alias symbol `V` on
+     * `declare const v: V` and `const a = v` (checker.ts typeToTypeNodeWorker
+     * ~6916). ctsc's type_of_type_node alias-tagging path already covers the
+     * alias name; the checker just needs to return a CTSC_TYPE_UNION for
+     * the IndexedAccessType so ctsc_type_to_string emits `V` through the
+     * alias rather than `any`.
+     */
+    {
+        const char* src = "// @checker: types\n"
+                          "interface Mix {\n"
+                          "  id: number;\n"
+                          "  name: string;\n"
+                          "}\n"
+                          "type V = Mix[\"id\" | \"name\"];\n"
+                          "declare const v: V;\n"
+                          "const a = v;\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        EXPECT(cr->entries_len == 4);
+        if (cr->entries_len >= 3 && cr->entries[2].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[2].type, &ts);
+            const char* want = "V";
+            EXPECT(ts.len == strlen(want));
+            EXPECT(memcmp(ts.data, want, strlen(want)) == 0);
+            ctsc_buf_free(&ts);
+        }
+        if (cr->entries_len >= 4 && cr->entries[3].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[3].type, &ts);
+            const char* want = "V";
+            EXPECT(ts.len == strlen(want));
+            EXPECT(memcmp(ts.data, want, strlen(want)) == 0);
+            ctsc_buf_free(&ts);
+        }
+        ctsc_arena_free(&a);
+    }
+
+    /*
+     * Indexed access on a generic parameter (`T[K]`) resolves at the call
+     * site via the inferred type arguments. Mirrors
+     * fixtures/checker/indexed_access/04_indexed_generic.ts and
+     * upstream/TypeScript/src/compiler/checker.ts getIndexedAccessType
+     * (~19637) applied to an instantiated signature return: T is inferred
+     * from the first argument (`{ a: number; b: string }`), K is inferred
+     * from the second argument's string-literal type (`"a"` / `"b"`), and
+     * getPropertyTypeForIndexType returns the property's declared type.
+     *
+     * Checks both the rendered `pick` signature (which exercises the
+     * signature-writer branches for TypeOperator `keyof T` and
+     * IndexedAccessType `T[K]`, checker.ts typeParameterToDeclarationWithConstraint
+     * ~8340 and typeToTypeNodeHelper for IndexedAccessType ~7490+) and the
+     * two call-site return types.
+     */
+    {
+        const char* src = "// @checker: types\n"
+                          "function pick<T, K extends keyof T>(o: T, k: K): T[K] {\n"
+                          "  return o[k];\n"
+                          "}\n"
+                          "const o = { a: 1, b: \"x\" };\n"
+                          "const a = pick(o, \"a\");\n"
+                          "const b = pick(o, \"b\");\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        /* Entries: pick, o-param, k-param, o-var, a-var, b-var. */
+        EXPECT(cr->entries_len == 6);
+        if (cr->entries_len >= 1 && cr->entries[0].type_string
+            && cr->entries[0].type_string_len > 0) {
+            const char* want = "<T, K extends keyof T>(o: T, k: K) => T[K]";
+            EXPECT(cr->entries[0].type_string_len == strlen(want));
+            EXPECT(memcmp(cr->entries[0].type_string, want, strlen(want)) == 0);
+        }
+        if (cr->entries_len >= 5 && cr->entries[4].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[4].type, &ts);
+            const char* want = "number";
+            EXPECT(ts.len == strlen(want));
+            EXPECT(memcmp(ts.data, want, strlen(want)) == 0);
+            ctsc_buf_free(&ts);
+        }
+        if (cr->entries_len >= 6 && cr->entries[5].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[5].type, &ts);
+            const char* want = "string";
+            EXPECT(ts.len == strlen(want));
+            EXPECT(memcmp(ts.data, want, strlen(want)) == 0);
+            ctsc_buf_free(&ts);
+        }
+        ctsc_arena_free(&a);
+    }
+
+    /*
+     * `type E = typeof arr[number]` parses as IndexedAccessType(TypeQuery(arr),
+     * NumberKeyword) per upstream parser.ts parsePostfixTypeOrHigher (~4716)
+     * wrapping the TypeQuery produced by parseTypeQuery (~3946). Under noLib
+     * `number[]` has no Array global, so `typeof arr` widens to `{}`
+     * (checker.ts getWidenedType on the unresolved array reference) and
+     * `{}[number]` falls through checker.ts getPropertyTypeForIndexType
+     * (~19262) to `any` — matching fixtures/checker/indexed_access/
+     * 05_indexed_array_number.ts.
+     *
+     * Before this test, ctsc's parser called consume_postfix_type_operators
+     * on the TypeQuery, silently absorbing `[number]` into the TypeQuery's
+     * end span; the alias `E` resolved to `{}` (the TypeQuery result) and
+     * the downstream `const e: E` and `const x = e` inherited `{}` instead
+     * of `any`. Guard the wrap-in-IndexedAccessType behaviour here.
+     */
+    {
+        const char* src = "// @checker: types\n"
+                          "declare const arr: number[];\n"
+                          "type E = typeof arr[number];\n"
+                          "declare const e: E;\n"
+                          "const x = e;\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 16384);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        /* Entries: arr, e, x. */
+        EXPECT(cr->entries_len == 3);
+        if (cr->entries_len >= 2 && cr->entries[1].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[1].type, &ts);
+            const char* want = "any";
+            EXPECT(ts.len == strlen(want));
+            EXPECT(memcmp(ts.data, want, strlen(want)) == 0);
+            ctsc_buf_free(&ts);
+        }
+        if (cr->entries_len >= 3 && cr->entries[2].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[2].type, &ts);
+            const char* want = "any";
+            EXPECT(ts.len == strlen(want));
+            EXPECT(memcmp(ts.data, want, strlen(want)) == 0);
+            ctsc_buf_free(&ts);
+        }
+        ctsc_arena_free(&a);
+    }
+
     return failed;
 }

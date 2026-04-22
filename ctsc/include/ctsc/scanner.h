@@ -287,6 +287,23 @@ typedef enum {
      * plus the enclosing node's kind.
      */
     CTSC_SK_TypeOperator,
+    /*
+     * Mirrors ts.SyntaxKind.IndexedAccessType (upstream/TypeScript/src/
+     * compiler/types.ts IndexedAccessTypeNode; parser.ts
+     * parsePostfixTypeOrHigher ~4716 wraps the base type when `[` is
+     * followed by a non-empty type instead of `]`). checker.ts
+     * getTypeFromIndexedAccessTypeNode ~19722:
+     *     const objectType = getTypeFromTypeNode(node.objectType);
+     *     const indexType = getTypeFromTypeNode(node.indexType);
+     *     links.resolvedType = getIndexedAccessType(objectType, indexType, ...);
+     *
+     * ctsc stores the two operands inside the shared
+     * CtscTypeReferenceData slot (no dedicated struct yet): `typeName`
+     * is the objectType TypeNode, `type_arguments[0]` is the indexType
+     * TypeNode, and `has_type_arguments = true`. This keeps the union
+     * data layout unchanged while the M4.x indexed-access slice lands.
+     */
+    CTSC_SK_IndexedAccessType,
 
     CTSC_SK__COUNT
 } CtscSyntaxKind;

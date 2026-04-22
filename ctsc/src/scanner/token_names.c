@@ -240,6 +240,7 @@ static const char* const k_names[CTSC_SK__COUNT] = {
     [CTSC_SK_LabeledStatement]                  = "LabeledStatement",
     [CTSC_SK_TypeQuery]                         = "TypeQuery",
     [CTSC_SK_TypeOperator]                      = "TypeOperator",
+    [CTSC_SK_IndexedAccessType]                 = "IndexedAccessType",
 };
 
 const char* ctsc_syntax_kind_name(CtscSyntaxKind k) {

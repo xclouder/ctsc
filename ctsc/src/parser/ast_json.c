@@ -188,7 +188,8 @@ static void emit_node(CtscJson* j, const CtscNode* n) {
         }
         case CTSC_SK_TypeReference:
         case CTSC_SK_TypeQuery:
-        case CTSC_SK_TypeOperator: {
+        case CTSC_SK_TypeOperator:
+        case CTSC_SK_IndexedAccessType: {
             /* Mirrors upstream/TypeScript/src/compiler/parser.ts
              * forEachChildInTypeReference: visits typeName then each
              * typeArgument; forEachChildInTypeQuery (~672) visits exprName
@@ -204,7 +205,10 @@ static void emit_node(CtscJson* j, const CtscNode* n) {
              * TypeOperator reuse the same typeReference data slot (exprName
              * / operand TypeNode in typeName, optional typeArguments unused
              * for TypeOperator), matching the forEachChild order for all
-             * three node kinds. */
+             * three node kinds. IndexedAccessType reuses the same slot:
+             * typeName=objectType, type_arguments[0]=indexType (parser.ts
+             * forEachChildInIndexedAccessType visits objectType then
+             * indexType). */
             size_t child_count = 0;
             if (n->data.typeReference.typeName) child_count++;
             if (n->data.typeReference.has_type_arguments) {
