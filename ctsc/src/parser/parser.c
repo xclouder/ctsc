@@ -781,8 +781,64 @@ static bool try_parse_type_argument_list(Parser* p, CtscNodeArray* out_args) {
     if (cur(p) == CTSC_SK_GreaterThanToken) return false;
     CtscNodeArray args; ctsc_node_array_init(&args);
     for (;;) {
+        int arg_start = cur_full_start(p);
         CtscNode* t = parse_type_node(p);
         if (!t) return false;
+        /*
+         * UnionType in type-argument position (parser.ts parseUnionType ~4876
+         * reached via parseType → parseUnionTypeOrHigher from
+         * parseTypeArgumentsOfTypeReference). parse_type_node parses only a
+         * single "atom" (NonArrayType); it does not fold `| ...`. Without
+         * this branch a union like `Pick2<Big, "a" | "b">` would abort the
+         * speculative list here (the `|` is neither `,` nor `>`), causing
+         * the outer parseTypeReference to drop typeName and type_arguments
+         * and the checker to resolve the whole reference to `any`. We
+         * coalesce the `| RHS …` tail by scanning a brace/bracket/paren/
+         * angle-balanced span up to the next top-level `,` or `>` and wrap
+         * the union as an opaque CTSC_SK_TypeReference (no typeName); the
+         * checker's type_from_annotation_fallback_span (checker.c ~1156,
+         * splitting on top-level `|`) reconstructs the UnionType from that
+         * span on demand. Mirrors fixtures/checker/mapped/03_mapped_pick.ts
+         * and fixtures/checker/conditional/03_cond_generic_pick.ts.
+         */
+        if (cur(p) == CTSC_SK_BarToken) {
+            int brace_depth = 0, bracket_depth = 0, paren_depth = 0, angle_depth = 0;
+            while (cur(p) != CTSC_SK_EndOfFileToken) {
+                CtscSyntaxKind k = cur(p);
+                if (k == CTSC_SK_Unknown) break;
+                if (brace_depth == 0 && bracket_depth == 0 && paren_depth == 0 && angle_depth == 0) {
+                    if (k == CTSC_SK_CommaToken
+                        || k == CTSC_SK_GreaterThanToken
+                        || k == CTSC_SK_GreaterThanGreaterThanToken
+                        || k == CTSC_SK_GreaterThanGreaterThanGreaterThanToken
+                        || k == CTSC_SK_GreaterThanEqualsToken
+                        || k == CTSC_SK_GreaterThanGreaterThanEqualsToken
+                        || k == CTSC_SK_GreaterThanGreaterThanGreaterThanEqualsToken
+                        || k == CTSC_SK_CloseParenToken
+                        || k == CTSC_SK_CloseBracketToken
+                        || k == CTSC_SK_CloseBraceToken
+                        || k == CTSC_SK_SemicolonToken
+                        || k == CTSC_SK_EqualsToken) {
+                        break;
+                    }
+                }
+                if (k == CTSC_SK_OpenBraceToken) brace_depth++;
+                else if (k == CTSC_SK_CloseBraceToken) { if (brace_depth == 0) break; brace_depth--; }
+                else if (k == CTSC_SK_OpenBracketToken) bracket_depth++;
+                else if (k == CTSC_SK_CloseBracketToken) { if (bracket_depth == 0) break; bracket_depth--; }
+                else if (k == CTSC_SK_OpenParenToken) paren_depth++;
+                else if (k == CTSC_SK_CloseParenToken) { if (paren_depth == 0) break; paren_depth--; }
+                else if (k == CTSC_SK_LessThanToken) angle_depth++;
+                else if (k == CTSC_SK_GreaterThanToken && angle_depth > 0) angle_depth--;
+                advance(p);
+            }
+            int arg_end = cur_full_start(p);
+            CtscNode* u = ctsc_node_new(p->arena, CTSC_SK_TypeReference, arg_start, arg_end);
+            u->data.typeReference.typeName = NULL;
+            u->data.typeReference.has_type_arguments = false;
+            ctsc_node_array_init(&u->data.typeReference.type_arguments);
+            t = u;
+        }
         ctsc_node_array_push(&args, p->arena, t);
         if (cur(p) == CTSC_SK_GreaterThanToken) break;
         if (cur(p) != CTSC_SK_CommaToken) return false;

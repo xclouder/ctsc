@@ -255,6 +255,13 @@ CtscType* ctsc_type_index(CtscTypeRegistry* reg, CtscType* target) {
     return t;
 }
 
+CtscType* ctsc_type_mapped(CtscTypeRegistry* reg, bool is_homomorphic) {
+    if (!reg) return NULL;
+    CtscType* t = ctsc_type_new(reg, CTSC_TYPE_MAPPED);
+    if (t) t->mapped_is_homomorphic = is_homomorphic;
+    return t;
+}
+
 /*
  * Literal → base widening (types.ts getWidenedLiteralType ~35395):
  *   42 → number,  "hi" → string,  true/false → boolean,  42n → bigint.
@@ -351,6 +358,28 @@ static void append_utf16_ascii_identifier_prop_name(CtscBuffer* out, const uint1
     }
 }
 
+/*
+ * Emit a tagged alias name with its optional aliasTypeArguments (mirrors
+ * upstream checker.ts typeToTypeNodeWorker ~6916-6923: when a type carries
+ * `aliasSymbol` and !shouldExpandType, the printer emits
+ * `symbolToTypeNode(aliasSymbol, ..., mapToTypeNodes(aliasTypeArguments))`,
+ * yielding `Name<Arg1, Arg2>`). Callers gate on
+ * `alias_symbol_name_len > 0`; this helper handles the `<...>` suffix so
+ * every aliased-type branch prints identical bytes for a generic
+ * instantiation like `Partial2<User>`.
+ */
+static void emit_alias_ref(const CtscType* t, CtscBuffer* out) {
+    append_utf16_ascii_identifier_prop_name(out, t->alias_symbol_name, t->alias_symbol_name_len);
+    if (t->alias_type_args_len > 0 && t->alias_type_args) {
+        ctsc_buf_append_char(out, '<');
+        for (size_t i = 0; i < t->alias_type_args_len; ++i) {
+            if (i > 0) ctsc_buf_append_cstr(out, ", ");
+            ctsc_type_to_string(t->alias_type_args[i], out);
+        }
+        ctsc_buf_append_char(out, '>');
+    }
+}
+
 void ctsc_type_to_string(const CtscType* t, CtscBuffer* out) {
     if (!t) { ctsc_buf_append_cstr(out, "any"); return; }
     switch (t->kind) {
@@ -382,7 +411,7 @@ void ctsc_type_to_string(const CtscType* t, CtscBuffer* out) {
         }
         case CTSC_TYPE_UNION: {
             if (t->alias_symbol_name && t->alias_symbol_name_len > 0) {
-                append_utf16_ascii_identifier_prop_name(out, t->alias_symbol_name, t->alias_symbol_name_len);
+                emit_alias_ref(t, out);
                 return;
             }
             for (size_t i = 0; i < t->union_members_len; ++i) {
@@ -400,7 +429,7 @@ void ctsc_type_to_string(const CtscType* t, CtscBuffer* out) {
         }
         case CTSC_TYPE_OBJECT_LITERAL: {
             if (t->alias_symbol_name && t->alias_symbol_name_len > 0) {
-                append_utf16_ascii_identifier_prop_name(out, t->alias_symbol_name, t->alias_symbol_name_len);
+                emit_alias_ref(t, out);
                 return;
             }
             ctsc_buf_append_cstr(out, "{ ");
@@ -515,6 +544,23 @@ void ctsc_type_to_string(const CtscType* t, CtscBuffer* out) {
              */
             ctsc_buf_append_cstr(out, "keyof ");
             ctsc_type_to_string(t->index_target, out);
+            return;
+        case CTSC_TYPE_MAPPED:
+            /*
+             * Mirrors checker.ts typeToTypeNodeWorker ~6916: when a mapped
+             * type carries an aliasSymbol and !shouldExpandType, the printer
+             * emits the alias identifier rather than re-constructing a
+             * MappedTypeNode. The M4.x-mapped slice always reaches this
+             * kind through a TypeAliasDeclaration → parseMappedType body, so
+             * the alias branch is the expected path. `{}` is a conservative
+             * fallback for an un-aliased mapped type (no curriculum fixture
+             * currently triggers this branch).
+             */
+            if (t->alias_symbol_name && t->alias_symbol_name_len > 0) {
+                emit_alias_ref(t, out);
+            } else {
+                ctsc_buf_append_cstr(out, "{}");
+            }
             return;
         default:
             ctsc_buf_append_cstr(out, "any");

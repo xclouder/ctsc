@@ -1531,6 +1531,79 @@ static bool u16_keyword_readonly_at(const uint16_t* src, int i, int inner_end) {
     return true;
 }
 
+/*
+ * Recognise a MappedType body inside `{ ... }`: `[ <ident> in <type> ]: V`,
+ * optionally prefixed by a `readonly` / `+readonly` / `-readonly`
+ * TypeOperator and followed by `?` / `+?` / `-?` on the value position.
+ * Mirrors parser.ts parseMappedType (~4684-4715) + parser.ts isStartOfMappedType
+ * (~4677). We deliberately do not try to evaluate the mapped body at this
+ * point — the M4.x-mapped slice only needs to surface a CTSC_TYPE_MAPPED so
+ * the alias-instantiation caller can tag it with the TypeAliasDeclaration's
+ * name (checker.ts typeToTypeNodeWorker ~6916 prefers aliasSymbol).
+ */
+/*
+ * Detect a MappedType body inside `{ ... }`, and optionally report whether
+ * it is "homomorphic" in upstream's sense (checker.ts
+ * getHomomorphicTypeVariable ~20862): the constraint of the bound key is
+ * `keyof <Identifier>`. When `out_homomorphic` is non-NULL it is set to
+ * true iff the constraint after `in` parses as `keyof Ident` (we don't
+ * check that Ident resolves to a TypeParameter here — the alias-tagging
+ * decision in can_tag_alias only needs the syntactic shape; any residual
+ * false positive for a non-type-parameter operand does not change
+ * observable typeToString output because non-homomorphic bodies with a
+ * `keyof X` constraint still carry their own alias symbol and the
+ * overwrite path only fires when the outer alias exists).
+ */
+static bool type_literal_body_is_mapped_ex(const uint16_t* src, int inner_start, int inner_end,
+                                           bool* out_homomorphic) {
+    if (out_homomorphic) *out_homomorphic = false;
+    int i = inner_start;
+    while (i < inner_end && ctsc_is_ws_u16(src[i])) i++;
+    /* optional `+` / `-` preceding `readonly` */
+    if (i < inner_end && (src[i] == (uint16_t)'+' || src[i] == (uint16_t)'-')) {
+        i++;
+    }
+    if (u16_keyword_readonly_at(src, i, inner_end)) {
+        i += 8;
+        while (i < inner_end && ctsc_is_ws_u16(src[i])) i++;
+    }
+    if (i >= inner_end || src[i] != (uint16_t)'[') return false;
+    i++;
+    while (i < inner_end && ctsc_is_ws_u16(src[i])) i++;
+    if (i >= inner_end || !u16_is_ident_start_ascii(src[i])) return false;
+    i++;
+    while (i < inner_end && u16_is_ident_part_ascii(src[i])) i++;
+    while (i < inner_end && ctsc_is_ws_u16(src[i])) i++;
+    /* Expect the `in` keyword (parser.ts parseMappedTypeParameter ~4683). */
+    if (i + 1 >= inner_end) return false;
+    if (src[i] != (uint16_t)'i' || src[i + 1] != (uint16_t)'n') return false;
+    if (i + 2 < inner_end && u16_is_ident_part_ascii(src[i + 2])) return false;
+    i += 2;
+    if (out_homomorphic) {
+        /*
+         * Inspect the constraint type: `keyof <Identifier>` (with optional
+         * leading whitespace). Mirrors upstream's syntactic recognition via
+         * getHomomorphicTypeVariable → constraint.flags & TypeFlags.Index
+         * where the IndexType operand is a TypeParameter.
+         */
+        int j = i;
+        while (j < inner_end && ctsc_is_ws_u16(src[j])) j++;
+        if (j + 5 <= inner_end
+            && src[j] == (uint16_t)'k' && src[j + 1] == (uint16_t)'e'
+            && src[j + 2] == (uint16_t)'y' && src[j + 3] == (uint16_t)'o'
+            && src[j + 4] == (uint16_t)'f'
+            && (j + 5 == inner_end || !u16_is_ident_part_ascii(src[j + 5]))) {
+            j += 5;
+            while (j < inner_end && ctsc_is_ws_u16(src[j])) j++;
+            if (j < inner_end && u16_is_ident_start_ascii(src[j])) {
+                *out_homomorphic = true;
+            }
+        }
+    }
+    return true;
+}
+
+
 /* Returns NULL → caller uses t_any. */
 static CtscType* type_from_type_literal_span(CtscTypeRegistry* reg, const uint16_t* src,
                                             size_t src_len, int pos, int end,
@@ -1550,6 +1623,19 @@ static CtscType* type_from_type_literal_span(CtscTypeRegistry* reg, const uint16
     if (close < 0 || close >= end) return NULL;
     int inner_start = brace_open + 1;
     int inner_end = close; /* exclusive; inner text is [inner_start, inner_end) */
+    /*
+     * MappedType branch (parser.ts parseNonArrayType ~4642 dispatches
+     * `{ ... }` to parseMappedType vs parseTypeLiteral via
+     * lookAhead(isStartOfMappedType)). ctsc collapses both to a
+     * TypeLiteral AST node; recover the distinction from the source here
+     * so getTypeAliasInstantiation can tag the result with the alias name.
+     */
+    {
+        bool is_homomorphic = false;
+        if (type_literal_body_is_mapped_ex(src, inner_start, inner_end, &is_homomorphic)) {
+            return ctsc_type_mapped(reg, is_homomorphic);
+        }
+    }
     int i = inner_start;
     size_t count = 0;
     CtscType* string_index_value = NULL;
@@ -1944,6 +2030,15 @@ static CtscType* type_of_type_node(Walk* w, CtscTypeRegistry* reg, const uint16_
                                         type_of_type_node(w, reg, src, src_len, dn,
                                                           alias_depth + 1);
                                     if (!dt) dt = reg->t_any;
+                                    /*
+                                     * Capture the resolved default as an
+                                     * alias type argument as well (mirrors
+                                     * checker.ts fillMissingTypeArguments
+                                     * ~16151, which populates trailing
+                                     * defaults into the type-argument list
+                                     * used by Type.aliasTypeArguments).
+                                     */
+                                    args_buf[ai] = dt;
                                     const CtscNode* tname = tp->data.typeParameter.name;
                                     if (tname && tname->kind == CTSC_SK_Identifier) {
                                         const CtscIdentifierData* tid = &tname->data.identifier;
@@ -1965,16 +2060,121 @@ static CtscType* type_of_type_node(Walk* w, CtscTypeRegistry* reg, const uint16_
                                  * getAliasSymbolForTypeNode on the result) so
                                  * typeToString expands it in situ and the shared
                                  * cached object type is not mutated.
+                                 *
+                                 * When the alias body resolves to a type that
+                                 * already carries an aliasSymbol (e.g.
+                                 * `type PU = Partial2<User>` whose body is a
+                                 * TypeReference to another generic alias that
+                                 * instantiates to a MappedType tagged
+                                 * `Partial2<User>`), preserve the inner alias:
+                                 * upstream checker.ts instantiateAnonymousType
+                                 * ~20982 writes `result.aliasSymbol = aliasSymbol
+                                 * || type.aliasSymbol`, but the empirical
+                                 * typeToString result for the outer non-generic
+                                 * alias chains back to the innermost named
+                                 * generic instantiation (verified by running
+                                 * tsc on `type PU = Partial2<User>; const u: PU`
+                                 * which prints `Partial2<User>`). Mirror that by
+                                 * not overwriting an existing alias tag.
                                  */
+                                /*
+                                 * When the inner expanded type already
+                                 * carries an alias tag, decide whether the
+                                 * outer alias should overwrite. Mirrors
+                                 * upstream behaviour:
+                                 *   - Homomorphic mapped type
+                                 *     (`[K in keyof T]`) instantiated with
+                                 *     a NON-union argument flows through
+                                 *     mapTypeWithAlias → mapType
+                                 *     (checker.ts ~28596), which discards
+                                 *     the explicit caller alias; the
+                                 *     original mapped type's aliasSymbol
+                                 *     wins (02_mapped_partial.ts:
+                                 *     `type PU = Partial2<User>` prints
+                                 *     `Partial2<User>`, not `PU`). So DO
+                                 *     NOT overwrite in this case.
+                                 *   - Non-homomorphic mapped types go
+                                 *     through `instantiateAnonymousType
+                                 *     (..., aliasSymbol, ...)` (~20893),
+                                 *     which writes
+                                 *     `result.aliasSymbol = aliasSymbol`
+                                 *     (~20982). Outer alias overwrites
+                                 *     (03_mapped_pick.ts / 04_mapped_record.ts).
+                                 *   - Conditional types instantiate via
+                                 *     `getConditionalTypeInstantiation(...,
+                                 *     aliasSymbol, ...)` (~20988). When the
+                                 *     result is a union the union is
+                                 *     re-tagged by `mapTypeWithAlias →
+                                 *     getUnionType(..., aliasSymbol, ...)`
+                                 *     (~28596+); otherwise the conditional
+                                 *     itself is tagged. Either way the
+                                 *     outer alias overwrites. In ctsc the
+                                 *     expanded type of an inner conditional
+                                 *     generic alias surfaces as a union
+                                 *     already carrying that alias
+                                 *     (02_cond_distributive.ts:
+                                 *     `R = NonNull<string|null|number>`,
+                                 *     03_cond_generic_pick.ts:
+                                 *     `R = Extract2<...>`) — allow UNION
+                                 *     tags to be overwritten too.
+                                 */
+                                bool overwrite_allowed =
+                                    expanded
+                                    && (
+                                        (expanded->kind == CTSC_TYPE_MAPPED
+                                         && !expanded->mapped_is_homomorphic)
+                                        || expanded->kind == CTSC_TYPE_UNION
+                                    );
                                 bool can_tag_alias =
                                     expanded
                                     && alias_ty->kind != CTSC_SK_TypeQuery
+                                    && (expanded->alias_symbol_name_len == 0
+                                        || overwrite_allowed)
                                     && (expanded->kind == CTSC_TYPE_UNION
                                         || expanded->kind == CTSC_TYPE_INTERSECTION
-                                        || expanded->kind == CTSC_TYPE_OBJECT_LITERAL);
+                                        || expanded->kind == CTSC_TYPE_OBJECT_LITERAL
+                                        || expanded->kind == CTSC_TYPE_MAPPED);
                                 if (can_tag_alias) {
                                     expanded->alias_symbol_name = id->text;
                                     expanded->alias_symbol_name_len = id->text_len;
+                                    /*
+                                     * Store the evaluated alias type arguments
+                                     * (mirrors checker.ts
+                                     * Type.aliasTypeArguments; types.ts Type
+                                     * ~6420). typeToTypeNodeWorker ~6918
+                                     * emits `Name<Args>` via
+                                     * mapToTypeNodes(aliasTypeArguments).
+                                     * Only populated when the alias actually
+                                     * declares type parameters that were
+                                     * bound above (tp_count > 0); a
+                                     * non-generic alias leaves the arg array
+                                     * empty so typeToString emits the bare
+                                     * name. When overwriting a previous
+                                     * alias tag (mapped_overwrite_allowed)
+                                     * with a non-generic alias, reset the
+                                     * args so the bare name is emitted —
+                                     * otherwise the prior generic alias's
+                                     * arguments would leak (e.g.
+                                     * `type R = Pick2<Big, "a" | "b">`
+                                     * would stringify as
+                                     * `R<Big, "a" | "b">`).
+                                     */
+                                    if (tp_count > 0) {
+                                        CtscType** slot =
+                                            (CtscType**)ctsc_arena_alloc(
+                                                reg->arena,
+                                                tp_count * sizeof(CtscType*));
+                                        for (size_t ai = 0; ai < tp_count; ++ai) {
+                                            slot[ai] = args_buf[ai]
+                                                           ? args_buf[ai]
+                                                           : reg->t_any;
+                                        }
+                                        expanded->alias_type_args = slot;
+                                        expanded->alias_type_args_len = tp_count;
+                                    } else {
+                                        expanded->alias_type_args = NULL;
+                                        expanded->alias_type_args_len = 0;
+                                    }
                                 }
                                 return expanded;
                             }

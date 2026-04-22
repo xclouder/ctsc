@@ -125,7 +125,25 @@ typedef enum {
      * formatting preserves the syntactic `keyof X` form, which is what tsc
      * emits for an un-distributed `keyof` of a generic / interface type.
      */
-    CTSC_TYPE_INDEX
+    CTSC_TYPE_INDEX,
+
+    /*
+     * Mapped type (`{ [K in X]: V }`, with optional `readonly` / `?`
+     * modifiers and `+` / `-` prefixes). Mirrors TypeScript's MappedType
+     * (types.ts MappedType; checker.ts getTypeFromMappedTypeNode ~16968+
+     * + instantiateMappedType ~19145+). M4.x-mapped only surfaces this
+     * kind through a TypeAliasDeclaration whose body is a MappedTypeNode
+     * (parser.ts parseMappedType ~4684); the alias-instantiation path in
+     * getTypeAliasInstantiation tags the resulting type with
+     * aliasSymbol, so typeToString emits the alias name (tsc prints
+     * `ReadonlyPoint` rather than expanding the mapped body when an alias
+     * is available — mirrors typeToTypeNodeWorker ~6916's
+     * shouldExpandType check). Without an alias, typeToString emits
+     * `{}` as a placeholder: no curriculum fixture currently prints an
+     * un-aliased mapped type, and expanding the body requires full
+     * mapped-type evaluation (M4.x+).
+     */
+    CTSC_TYPE_MAPPED
 } CtscTypeKind;
 
 typedef struct CtscType CtscType;
@@ -215,9 +233,21 @@ struct CtscType {
      * type.aliasSymbol + !shouldExpandType → symbolToTypeNode).
      * Assignability still uses union_members / object_properties; only
      * ctsc_type_to_string prefers this when set.
+     *
+     * `alias_type_args` / `alias_type_args_len` mirror tsc's
+     * Type.aliasTypeArguments (types.ts Type ~6420). When a generic alias
+     * is instantiated (e.g. `Partial2<User>` → mapped type with
+     * aliasSymbol=Partial2, aliasTypeArguments=[User]), ctsc stores the
+     * evaluated argument types here so typeToString emits
+     * `Partial2<User>` rather than the bare alias name. Mirrors
+     * upstream checker.ts typeToTypeNodeWorker ~6918:
+     * `mapToTypeNodes(type.aliasTypeArguments, context)` +
+     * symbolToTypeNode(aliasSymbol, ..., typeArgumentNodes).
      */
     const uint16_t* alias_symbol_name;
     size_t          alias_symbol_name_len;
+    CtscType**      alias_type_args;
+    size_t          alias_type_args_len;
 
     /* CTSC_TYPE_ENUM_MEMBER_LITERAL only: `enum_parent`.`enum_member` */
     const uint16_t* enum_parent_name;
@@ -250,6 +280,28 @@ struct CtscType {
      * ~16800+).
      */
     CtscType* index_target;
+
+    /*
+     * CTSC_TYPE_MAPPED only. True when the mapped-type body is
+     * "homomorphic" in upstream's sense — i.e. its constraint is
+     * `keyof <TypeParameter>`, so checker.ts getHomomorphicTypeVariable
+     * (~20862) returns a TypeParameter. Homomorphic mapped types flow
+     * through mapTypeWithAlias (checker.ts ~28596) during instantiation:
+     * the explicit `aliasSymbol`/`aliasTypeArguments` passed to
+     * instantiateMappedType are only used when the type variable
+     * instantiates to a union; for a non-union argument mapType is called
+     * without an alias, so instantiateAnonymousType (~20982) falls back to
+     * the original mapped type's aliasSymbol (e.g. `Partial2<User>` keeps
+     * the inner `Partial2` alias when the outer alias `PU = Partial2<User>`
+     * is evaluated). Non-homomorphic mapped types always go through
+     * `instantiateAnonymousType(type, mapper, aliasSymbol, …)` with the
+     * caller-supplied alias, so the outer alias DOES overwrite the inner
+     * one (e.g. `R = Pick2<Big, "a" | "b">` stringifies as `R`, not as
+     * `Pick2<Big, "a" | "b">`). ctsc's alias-tagging path
+     * (checker.c `can_tag_alias`) uses this flag to decide whether an
+     * existing alias tag should be preserved or replaced.
+     */
+    bool mapped_is_homomorphic;
 };
 
 struct CtscArena;
@@ -377,6 +429,15 @@ CtscType* ctsc_type_intersection(CtscTypeRegistry* reg, CtscType** members, size
  * typeToString.
  */
 CtscType* ctsc_type_index(CtscTypeRegistry* reg, CtscType* target);
+
+/*
+ * Mapped type (`{ [K in X]: V }`). Mirrors TypeScript's MappedType
+ * (checker.ts getTypeFromMappedTypeNode ~16968+). The resulting type is a
+ * fresh non-shared CtscType so callers may set `alias_symbol_name`
+ * (checker.ts typeToTypeNodeWorker ~6916 aliasSymbol + !shouldExpandType
+ * shortcut); without an alias, typeToString emits `{}` as a placeholder.
+ */
+CtscType* ctsc_type_mapped(CtscTypeRegistry* reg, bool is_homomorphic);
 
 /* Widening rules (types.ts getWidenedLiteralType): narrow literal -> base. */
 CtscType* ctsc_type_widen(CtscTypeRegistry* reg, const CtscType* t);

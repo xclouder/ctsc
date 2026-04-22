@@ -2604,5 +2604,158 @@ int test_checker(void) {
         ctsc_arena_free(&a);
     }
 
+    /*
+     * Mapped type alias body (`type R = { readonly [K in keyof T]: T[K] }`)
+     * should resolve to the alias name in typeToString. Mirrors upstream
+     * checker.ts typeToTypeNodeWorker ~6916: when a type carries an
+     * aliasSymbol and !shouldExpandType, the printer emits the alias name
+     * rather than re-constructing a MappedTypeNode. Parity fixture:
+     * fixtures/checker/mapped/01_mapped_readonly.ts.
+     */
+    {
+        const char* src = "// @checker: types\n"
+                          "interface Point { x: number; y: number; }\n"
+                          "type ReadonlyPoint = { readonly [K in keyof Point]: Point[K] };\n"
+                          "declare const p: ReadonlyPoint;\n"
+                          "const a = p;\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 32768);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        /* Entries: x, y, p, a. */
+        EXPECT(cr->entries_len == 4);
+        if (cr->entries_len >= 3 && cr->entries[2].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[2].type, &ts);
+            const char* want = "ReadonlyPoint";
+            EXPECT(ts.len == strlen(want));
+            EXPECT(memcmp(ts.data, want, strlen(want)) == 0);
+            ctsc_buf_free(&ts);
+        }
+        if (cr->entries_len >= 4 && cr->entries[3].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[3].type, &ts);
+            const char* want = "ReadonlyPoint";
+            EXPECT(ts.len == strlen(want));
+            EXPECT(memcmp(ts.data, want, strlen(want)) == 0);
+            ctsc_buf_free(&ts);
+        }
+        ctsc_arena_free(&a);
+    }
+
+    /*
+     * Generic mapped type alias instantiation, chained through a second
+     * non-generic alias. Mirrors fixture
+     * fixtures/checker/mapped/02_mapped_partial.ts and the tsc oracle
+     * output `Partial2<User>` for both `u` and `a`. Upstream reference:
+     * checker.ts getTypeAliasInstantiation ~17027 (creates the Partial2
+     * instantiation tagged with aliasSymbol=Partial2, aliasTypeArguments
+     * =[User]) + typeToTypeNodeWorker ~6916-6923 (emits
+     * `Name<TypeArgs>` via mapToTypeNodes(aliasTypeArguments)). The
+     * outer non-generic `PU = Partial2<User>` does NOT overwrite the
+     * inner alias — verified empirically against tsc 5.6.3, and mirrored
+     * here by the `expanded->alias_symbol_name_len == 0` guard in
+     * checker.c's TypeReference branch.
+     */
+    {
+        const char* src = "// @checker: types\n"
+                          "interface User { name: string; age: number; }\n"
+                          "type Partial2<T> = { [K in keyof T]?: T[K] };\n"
+                          "type PU = Partial2<User>;\n"
+                          "declare const u: PU;\n"
+                          "const a = u;\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 32768);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        /* Entries: name, age, u, a. */
+        EXPECT(cr->entries_len == 4);
+        if (cr->entries_len >= 3 && cr->entries[2].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[2].type, &ts);
+            const char* want = "Partial2<User>";
+            EXPECT(ts.len == strlen(want));
+            EXPECT(memcmp(ts.data, want, strlen(want)) == 0);
+            ctsc_buf_free(&ts);
+        }
+        if (cr->entries_len >= 4 && cr->entries[3].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[3].type, &ts);
+            const char* want = "Partial2<User>";
+            EXPECT(ts.len == strlen(want));
+            EXPECT(memcmp(ts.data, want, strlen(want)) == 0);
+            ctsc_buf_free(&ts);
+        }
+        ctsc_arena_free(&a);
+    }
+
+    /*
+     * Non-homomorphic generic mapped type alias chained through a second
+     * alias with a union type argument. Mirrors fixture
+     * fixtures/checker/mapped/03_mapped_pick.ts and the tsc oracle output
+     * `R` for both `r` and `x`. Unlike the homomorphic `Partial2<User>`
+     * case above (where `mapTypeWithAlias` discards the caller alias when
+     * the type variable instantiates to a non-union, so the inner
+     * aliasSymbol wins), a non-homomorphic mapped type
+     * (`Pick2<T, K extends keyof T> = { [P in K]: T[P] }`) goes through
+     * `instantiateAnonymousType(type, mapper, aliasSymbol, ...)` in
+     * checker.ts ~20893, writing
+     * `result.aliasSymbol = aliasSymbol || type.aliasSymbol` (~20982), so
+     * the outer alias DOES overwrite. Exercises two parts of the fix:
+     *   1) parser.c try_parse_type_argument_list now accepts a UnionType
+     *      (`"a" | "b"`) as a type argument by spanning the `| ...` tail
+     *      and wrapping it as an opaque TypeReference; without this the
+     *      whole `Pick2<...>` reference collapses to an un-argumented
+     *      TypeReference and the checker resolves it to `any`.
+     *   2) checker.c `can_tag_alias` now allows the outer alias to
+     *      overwrite an existing alias tag when the inner type is a
+     *      non-homomorphic mapped type, and resets alias_type_args to
+     *      empty when the outer alias is non-generic (otherwise the
+     *      prior generic's arguments would leak into `R<...>`).
+     */
+    {
+        const char* src = "// @checker: types\n"
+                          "interface Big { a: number; b: string; c: boolean; }\n"
+                          "type Pick2<T, K extends keyof T> = { [P in K]: T[P] };\n"
+                          "type R = Pick2<Big, \"a\" | \"b\">;\n"
+                          "declare const r: R;\n"
+                          "const x = r;\n";
+        size_t len = strlen(src);
+        CtscArena a;
+        ctsc_arena_init(&a, 32768);
+        CtscParseResult pr = ctsc_parse(src, len, &a);
+        CtscBindResult* br = ctsc_bind(pr.sourceFile, &a);
+        CtscCheckResult* cr = ctsc_check(pr.sourceFile, br, &a);
+        /* Entries: a, b, c (from Big), r, x. */
+        EXPECT(cr->entries_len == 5);
+        if (cr->entries_len >= 4 && cr->entries[3].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[3].type, &ts);
+            const char* want = "R";
+            EXPECT(ts.len == strlen(want));
+            EXPECT(memcmp(ts.data, want, strlen(want)) == 0);
+            ctsc_buf_free(&ts);
+        }
+        if (cr->entries_len >= 5 && cr->entries[4].type) {
+            CtscBuffer ts;
+            ctsc_buf_init(&ts);
+            ctsc_type_to_string(cr->entries[4].type, &ts);
+            const char* want = "R";
+            EXPECT(ts.len == strlen(want));
+            EXPECT(memcmp(ts.data, want, strlen(want)) == 0);
+            ctsc_buf_free(&ts);
+        }
+        ctsc_arena_free(&a);
+    }
+
     return failed;
 }
