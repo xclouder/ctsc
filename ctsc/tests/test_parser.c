@@ -1149,5 +1149,70 @@ int test_parser(void) {
     EXPECT(s->data.expressionStatement.expression->data.asExpression.type != NULL);
     ctsc_arena_free(&a);
 
+    /*
+     * LiteralType / keyword type in type-argument position. Mirrors upstream
+     * parser.ts parseTypeArgumentsOfTypeReference (~3791) → parseType →
+     * parseLiteralTypeNode (~4528) / parseNonArrayType keyword cases
+     * (~4591-4612). ctsc's try_parse_type_argument_list previously collapsed
+     * NumericLiteral / TrueKeyword / keyword-type arguments into an opaque
+     * CTSC_SK_TypeReference via the stop-set fallback scan, so the checker
+     * could not recover the literal/intrinsic type for a generic alias
+     * instantiation like `Classify<42>` / `Classify<true>` / `Classify<number>`
+     * (checker/conditional/05_cond_nested.ts).
+     */
+    ctsc_arena_init(&a, 4096);
+    src = "type A<T> = T;\ntype B = A<42>;";
+    r = ctsc_parse(src, strlen(src), &a);
+    EXPECT(r.sourceFile->data.sourceFile.statements.len == 2);
+    s = r.sourceFile->data.sourceFile.statements.items[1];
+    EXPECT(s->kind == CTSC_SK_TypeAliasDeclaration);
+    {
+        const CtscNode* alias_ty = s->data.typeAliasDeclaration.type;
+        EXPECT(alias_ty != NULL);
+        EXPECT(alias_ty->kind == CTSC_SK_TypeReference);
+        EXPECT(alias_ty->data.typeReference.has_type_arguments);
+        EXPECT(alias_ty->data.typeReference.type_arguments.len == 1);
+        const CtscNode* targ0 = alias_ty->data.typeReference.type_arguments.items[0];
+        EXPECT(targ0 != NULL);
+        EXPECT(targ0->kind == CTSC_SK_NumericLiteral);
+    }
+    ctsc_arena_free(&a);
+
+    ctsc_arena_init(&a, 4096);
+    src = "type A<T> = T;\ntype B = A<true>;";
+    r = ctsc_parse(src, strlen(src), &a);
+    EXPECT(r.sourceFile->data.sourceFile.statements.len == 2);
+    s = r.sourceFile->data.sourceFile.statements.items[1];
+    EXPECT(s->kind == CTSC_SK_TypeAliasDeclaration);
+    {
+        const CtscNode* alias_ty = s->data.typeAliasDeclaration.type;
+        EXPECT(alias_ty != NULL);
+        EXPECT(alias_ty->kind == CTSC_SK_TypeReference);
+        EXPECT(alias_ty->data.typeReference.has_type_arguments);
+        EXPECT(alias_ty->data.typeReference.type_arguments.len == 1);
+        const CtscNode* targ0 = alias_ty->data.typeReference.type_arguments.items[0];
+        EXPECT(targ0 != NULL);
+        EXPECT(targ0->kind == CTSC_SK_TrueKeyword);
+    }
+    ctsc_arena_free(&a);
+
+    ctsc_arena_init(&a, 4096);
+    src = "type A<T> = T;\ntype B = A<number>;";
+    r = ctsc_parse(src, strlen(src), &a);
+    EXPECT(r.sourceFile->data.sourceFile.statements.len == 2);
+    s = r.sourceFile->data.sourceFile.statements.items[1];
+    EXPECT(s->kind == CTSC_SK_TypeAliasDeclaration);
+    {
+        const CtscNode* alias_ty = s->data.typeAliasDeclaration.type;
+        EXPECT(alias_ty != NULL);
+        EXPECT(alias_ty->kind == CTSC_SK_TypeReference);
+        EXPECT(alias_ty->data.typeReference.has_type_arguments);
+        EXPECT(alias_ty->data.typeReference.type_arguments.len == 1);
+        const CtscNode* targ0 = alias_ty->data.typeReference.type_arguments.items[0];
+        EXPECT(targ0 != NULL);
+        EXPECT(targ0->kind == CTSC_SK_NumberKeyword);
+    }
+    ctsc_arena_free(&a);
+
     return failed;
 }

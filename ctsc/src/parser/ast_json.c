@@ -1189,6 +1189,30 @@ static void emit_node(CtscJson* j, const CtscNode* n) {
             }
             break;
         }
+        case CTSC_SK_ConditionalType: {
+            /* Mirrors upstream/TypeScript/src/compiler/parser.ts
+             * forEachChildInConditionalType: visits checkType, extendsType,
+             * trueType, falseType in that order. The oracle
+             * (harness/src/oracle-ast.ts) has no explicit case for
+             * ConditionalType and falls through to the default branch,
+             * which serialises forEachChild as a single `children` array. */
+            const CtscConditionalTypeData* c = &n->data.conditionalType;
+            size_t child_count = 0;
+            if (c->check_type)   child_count++;
+            if (c->extends_type) child_count++;
+            if (c->true_type)    child_count++;
+            if (c->false_type)   child_count++;
+            if (child_count > 0) {
+                ctsc_json_key(j, "children");
+                ctsc_json_begin_arr(j);
+                if (c->check_type)   emit_node(j, c->check_type);
+                if (c->extends_type) emit_node(j, c->extends_type);
+                if (c->true_type)    emit_node(j, c->true_type);
+                if (c->false_type)   emit_node(j, c->false_type);
+                ctsc_json_end_arr(j);
+            }
+            break;
+        }
         default:
             break;
     }

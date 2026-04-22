@@ -146,6 +146,21 @@ typedef struct {
      */
     CtscSymbol* narrow_eq_literal_sym;
     CtscType*   narrow_eq_literal_type;
+    /*
+     * Active type-parameter substitutions for the current alias/generic
+     * expansion. Mirrors checker.ts TypeMapper (types.ts ~5680+) / the
+     * typeParameterEnvironments map used by instantiateType. Pushed before
+     * expanding a generic type-alias body and popped afterwards, so a
+     * `T` TypeReference inside the body resolves to the corresponding
+     * type argument (e.g. `"hello"` for `IsString<"hello">`) rather than
+     * a bare REFERENCE("T"). The name text/length is the
+     * TypeParameterDeclaration identifier; values live in the arena.
+     */
+    const uint16_t** type_param_names;
+    size_t*          type_param_name_lens;
+    CtscType**       type_param_values;
+    size_t           type_param_count;
+    size_t           type_param_cap;
 } Walk;
 
 static void var_decl_const_register(Walk* w, const CtscNode* decl, bool is_const) {
@@ -173,6 +188,67 @@ static bool var_decl_is_const(Walk* w, const CtscNode* decl) {
         if (w->var_decl_const_keys[i] == decl) return w->var_decl_const_vals[i];
     }
     return false;
+}
+
+/*
+ * Push a (name, value) binding onto the active type-parameter substitution
+ * stack. Used by the alias-instantiation path (checker.ts
+ * getTypeAliasInstantiation ~13539 + instantiateType ~19000+) so a
+ * TypeReference to the parameter name resolves to the supplied argument
+ * during conditional-type evaluation.
+ *
+ * `type_param_bindings_save_mark` captures the current stack size; the
+ * caller restores it via `type_param_bindings_restore` after the scoped
+ * expansion so outer alias-instantiation contexts are preserved.
+ */
+static size_t type_param_bindings_save_mark(const Walk* w) {
+    return w ? w->type_param_count : 0;
+}
+
+static void type_param_bindings_restore(Walk* w, size_t mark) {
+    if (!w) return;
+    if (mark > w->type_param_count) return;
+    w->type_param_count = mark;
+}
+
+static void type_param_bindings_push(Walk* w, const uint16_t* name, size_t name_len, CtscType* value) {
+    if (!w || !name || name_len == 0 || !value) return;
+    if (w->type_param_count + 1 > w->type_param_cap) {
+        size_t ncap = w->type_param_cap ? w->type_param_cap * 2 : 16;
+        const uint16_t** nn =
+            (const uint16_t**)ctsc_arena_alloc(w->arena, ncap * sizeof(const uint16_t*));
+        size_t* nl = (size_t*)ctsc_arena_alloc(w->arena, ncap * sizeof(size_t));
+        CtscType** nv = (CtscType**)ctsc_arena_alloc(w->arena, ncap * sizeof(CtscType*));
+        if (w->type_param_names) {
+            memcpy(nn, w->type_param_names, w->type_param_count * sizeof(const uint16_t*));
+            memcpy(nl, w->type_param_name_lens, w->type_param_count * sizeof(size_t));
+            memcpy(nv, w->type_param_values, w->type_param_count * sizeof(CtscType*));
+        }
+        w->type_param_names = nn;
+        w->type_param_name_lens = nl;
+        w->type_param_values = nv;
+        w->type_param_cap = ncap;
+    }
+    w->type_param_names[w->type_param_count] = name;
+    w->type_param_name_lens[w->type_param_count] = name_len;
+    w->type_param_values[w->type_param_count] = value;
+    w->type_param_count++;
+}
+
+/*
+ * Innermost-first lookup so shadowing (a nested alias whose TypeParameter
+ * shadows an outer binding) resolves to the correct constituent.
+ */
+static CtscType* type_param_bindings_lookup(const Walk* w, const uint16_t* name, size_t name_len) {
+    if (!w || !name || name_len == 0 || w->type_param_count == 0) return NULL;
+    for (size_t i = w->type_param_count; i > 0; --i) {
+        size_t idx = i - 1;
+        if (w->type_param_name_lens[idx] != name_len) continue;
+        const uint16_t* n = w->type_param_names[idx];
+        if (!n) continue;
+        if (memcmp(n, name, name_len * sizeof(uint16_t)) == 0) return w->type_param_values[idx];
+    }
+    return NULL;
 }
 
 static void binding_elem_type_register(Walk* w, const CtscNode* be, CtscType* t) {
@@ -1658,6 +1734,88 @@ static CtscType* type_of_property_of_object_type(Walk* w, CtscTypeRegistry* reg,
  * reached from getIndexType ~18984 on a non-generic object type. Defined
  * further down next to resolve_interface_declaration_to_object_literal. */
 static CtscType* resolve_type_reference_to_object_literal(Walk* w, CtscTypeRegistry* reg, CtscType* ref);
+/* Forward declaration for the ConditionalType branch in type_of_type_node
+ * (checker.ts getConditionalType ~17942): assignability evaluation is
+ * defined further down in the structural-relation section. */
+static bool is_assignable_to(Walk* w, CtscTypeRegistry* reg, CtscType* source, CtscType* target);
+/* Forward declaration for the distributive ConditionalType branch: branch
+ * result dedup uses the literal-identity check defined alongside
+ * union_conditional_branch_types further down (mirrors checker.ts
+ * getUnionType dedup ~14780+). */
+static bool conditional_branch_types_identical(const CtscType* a, const CtscType* b);
+
+/*
+ * Forward declarations for UTF-16 source scanners used below. Definitions
+ * are colocated with the Parameter-entry emission helpers further down in
+ * the file (push_function_type_parameter_entries_in_span and friends).
+ */
+static void u16_skip_trivia(const uint16_t* s, int* p, int end);
+static int  u16_find_matching_paren(const uint16_t* s, int open_pos, int end);
+static bool u16_is_ident_start_checker(uint16_t c);
+static bool u16_is_ident_part_checker(uint16_t c);
+
+/*
+ * Forward declaration for return_type_of_function_declaration: the full
+ * definition lives further down next to the call-expression machinery,
+ * but the ConditionalType → infer branch above needs it earlier to
+ * resolve the check-type's return type for the infer binding.
+ */
+static CtscType* return_type_of_function_declaration(Walk* w, const CtscNode* fn_decl);
+
+/*
+ * Test whether a UTF-16 source span [pos, end) is a FunctionType of the
+ * shape `(...) => infer <Name>` and, if so, record the `<Name>`
+ * identifier's [start, end) in *out_name_start / *out_name_end.
+ *
+ * Mirrors parser.ts parseInferType (~4753) on the return position of a
+ * parseFunctionOrConstructorType (~4355) inside a conditional type's
+ * extendsType. ctsc does not yet model FunctionType / InferType as
+ * structured AST nodes (the parser's consume_type_via_fallback_scan
+ * collapses the extends-type into an opaque TypeReference span), so
+ * this helper recovers the infer binding from the source text.
+ */
+static bool function_type_extends_has_infer(const uint16_t* src, size_t src_len,
+                                            int pos, int end,
+                                            int* out_name_start, int* out_name_end) {
+    if (!src || pos < 0 || end <= pos || end > (int)src_len) return false;
+    int i = pos;
+    u16_skip_trivia(src, &i, end);
+    if (i >= end || src[i] != (uint16_t)'(') return false;
+    int open = i;
+    int close = u16_find_matching_paren(src, open, end);
+    if (close < 0 || close >= end) return false;
+    int after = close + 1;
+    u16_skip_trivia(src, &after, end);
+    if (after + 1 >= end
+        || src[after] != (uint16_t)'='
+        || src[after + 1] != (uint16_t)'>') return false;
+    int j = after + 2;
+    u16_skip_trivia(src, &j, end);
+    /* `infer` keyword (6 chars). Mirrors parser.ts scanner token
+     * SyntaxKind.InferKeyword (scanner.ts ~1840-1850). ctsc does not
+     * recognise `infer` as a contextual keyword yet — match literally. */
+    static const uint16_t kw_infer[] = {
+        (uint16_t)'i', (uint16_t)'n', (uint16_t)'f', (uint16_t)'e', (uint16_t)'r'};
+    if (j + 5 > end) return false;
+    for (int k = 0; k < 5; ++k) {
+        if (src[j + k] != kw_infer[k]) return false;
+    }
+    int kw_end = j + 5;
+    if (kw_end < end) {
+        uint16_t next = src[kw_end];
+        if (u16_is_ident_part_checker(next)) return false;
+    }
+    int n = kw_end;
+    u16_skip_trivia(src, &n, end);
+    if (n >= end || !u16_is_ident_start_checker(src[n])) return false;
+    int name_start = n;
+    n++;
+    while (n < end && u16_is_ident_part_checker(src[n])) n++;
+    int name_end = n;
+    if (out_name_start) *out_name_start = name_start;
+    if (out_name_end) *out_name_end = name_end;
+    return true;
+}
 
 /*
  * Maps TypeNode → CtscType for the M4.0 subset. Unknown types collapse to
@@ -1688,6 +1846,15 @@ static CtscType* type_of_type_node(Walk* w, CtscTypeRegistry* reg, const uint16_
         case CTSC_SK_AnyKeyword:       return reg->t_any;
         case CTSC_SK_ObjectKeyword:    return reg->t_object;
         case CTSC_SK_SymbolKeyword:    return reg->t_symbol;
+        /*
+         * Boolean literal type nodes (`type X = true;`, `type Y = false;`).
+         * Mirrors upstream/TypeScript/src/compiler/checker.ts
+         * getTypeFromTypeNode → LiteralTypeNode with TrueKeyword /
+         * FalseKeyword (~17289-17296). The registry caches both singletons
+         * (reg->t_true / reg->t_false) with CTSC_TYPE_BOOLEAN_LITERAL kind.
+         */
+        case CTSC_SK_TrueKeyword:      return reg->t_true;
+        case CTSC_SK_FalseKeyword:     return reg->t_false;
         case CTSC_SK_StringLiteral: {
             const CtscStringLiteralData* d = &type_node->data.stringLiteral;
             return ctsc_type_string_literal(reg, d->value ? d->value : d->text,
@@ -1701,15 +1868,91 @@ static CtscType* type_of_type_node(Walk* w, CtscTypeRegistry* reg, const uint16_
             const CtscTypeReferenceData* tr = &type_node->data.typeReference;
             if (tr->typeName && tr->typeName->kind == CTSC_SK_Identifier) {
                 const CtscIdentifierData* id = &tr->typeName->data.identifier;
+                /*
+                 * Active type-parameter substitution (checker.ts TypeMapper /
+                 * instantiateType ~19000+). When the current expansion is
+                 * inside a generic alias body, a bare TypeReference to a
+                 * parameter name resolves to the caller-supplied argument.
+                 * Only applies to a bare Identifier with no type arguments
+                 * — `T<X>` where T is itself a type parameter is still
+                 * rejected by ctsc's M4.x slice (no higher-kinded types).
+                 */
+                if (w && (!tr->has_type_arguments || tr->type_arguments.len == 0)) {
+                    CtscType* bound = type_param_bindings_lookup(w, id->text, id->text_len);
+                    if (bound) return bound;
+                }
                 if (w && alias_depth < 32) {
                     CtscSymbol* sym = resolve_name(&w->scopes, id->text, id->text_len);
                     if (sym && (sym->flags & CTSC_SYMBOL_FLAG_TypeAlias) && sym->decls_len > 0) {
                         CtscNode* decl0 = sym->decls[0];
                         if (decl0 && decl0->kind == CTSC_SK_TypeAliasDeclaration) {
                             CtscNode* alias_ty = decl0->data.typeAliasDeclaration.type;
+                            const CtscNodeArray* alias_tps =
+                                &decl0->data.typeAliasDeclaration.type_parameters;
                             if (alias_ty) {
+                                /*
+                                 * Alias-instantiation context (checker.ts
+                                 * getTypeAliasInstantiation ~13539 +
+                                 * instantiateType ~19000+). Evaluate each
+                                 * TypeReference.typeArgument *outside* the
+                                 * alias body's parameter frame (so `S<X<T>>`
+                                 * sees T bound by the outer caller), then
+                                 * push the alias's TypeParameter → argument
+                                 * mapping. Type-parameter references inside
+                                 * the body (`T` in `T extends ...`) are then
+                                 * resolved by type_param_bindings_lookup in
+                                 * the TypeReference branch above.
+                                 *
+                                 * Missing slots fall back to each
+                                 * TypeParameterDeclaration.default (parser.ts
+                                 * parseTypeParameter ~3955); parameters
+                                 * without an argument and without a default
+                                 * remain as bare CTSC_TYPE_REFERENCE(T) so
+                                 * downstream structural formatting mirrors
+                                 * the generic form.
+                                 */
+                                size_t tp_count = alias_tps ? alias_tps->len : 0;
+                                if (tp_count > 32) tp_count = 32;
+                                size_t explicit_na =
+                                    tr->has_type_arguments ? tr->type_arguments.len : 0;
+                                if (explicit_na > tp_count) explicit_na = tp_count;
+                                CtscType* args_buf[32];
+                                for (size_t ai = 0; ai < tp_count; ++ai) args_buf[ai] = NULL;
+                                for (size_t ai = 0; ai < explicit_na; ++ai) {
+                                    CtscNode* tnode = tr->type_arguments.items[ai];
+                                    args_buf[ai] =
+                                        type_of_type_node(w, reg, src, src_len, tnode,
+                                                          alias_depth + 1);
+                                    if (!args_buf[ai]) args_buf[ai] = reg->t_any;
+                                }
+                                size_t mark = type_param_bindings_save_mark(w);
+                                for (size_t ai = 0; ai < explicit_na; ++ai) {
+                                    const CtscNode* tp = alias_tps->items[ai];
+                                    if (!tp || tp->kind != CTSC_SK_TypeParameter) continue;
+                                    const CtscNode* tname = tp->data.typeParameter.name;
+                                    if (!tname || tname->kind != CTSC_SK_Identifier) continue;
+                                    const CtscIdentifierData* tid = &tname->data.identifier;
+                                    type_param_bindings_push(w, tid->text, tid->text_len,
+                                                             args_buf[ai]);
+                                }
+                                for (size_t ai = explicit_na; ai < tp_count; ++ai) {
+                                    const CtscNode* tp = alias_tps->items[ai];
+                                    if (!tp || tp->kind != CTSC_SK_TypeParameter) continue;
+                                    const CtscNode* dn = tp->data.typeParameter.default_type;
+                                    if (!dn) continue;
+                                    CtscType* dt =
+                                        type_of_type_node(w, reg, src, src_len, dn,
+                                                          alias_depth + 1);
+                                    if (!dt) dt = reg->t_any;
+                                    const CtscNode* tname = tp->data.typeParameter.name;
+                                    if (tname && tname->kind == CTSC_SK_Identifier) {
+                                        const CtscIdentifierData* tid = &tname->data.identifier;
+                                        type_param_bindings_push(w, tid->text, tid->text_len, dt);
+                                    }
+                                }
                                 CtscType* expanded =
                                     type_of_type_node(w, reg, src, src_len, alias_ty, alias_depth + 1);
+                                type_param_bindings_restore(w, mark);
                                 /*
                                  * Only tag the alias name on a freshly-created
                                  * structural type. A TypeQuery alias body
@@ -2015,6 +2258,148 @@ static CtscType* type_of_type_node(Walk* w, CtscTypeRegistry* reg, const uint16_
                 type_from_type_literal_span(reg, src, src_len, type_node->pos, type_node->end, tmp,
                                             sizeof(tmp) / sizeof(tmp[0]), &n, NULL);
             return t ? t : reg->t_any;
+        }
+        case CTSC_SK_ConditionalType: {
+            /*
+             * `checkType extends extendsType ? trueType : falseType`. Mirrors
+             * upstream/TypeScript/src/compiler/checker.ts getConditionalType
+             * (~19772) / getConditionalTypeInstantiation (~20988): when the
+             * checkType has been resolved to a concrete (non-type-parameter)
+             * type, evaluate the conditional by computing
+             * isTypeAssignableTo(checkType, extendsType) and picking one
+             * branch.
+             *
+             * Distributive conditional types (checker.ts
+             * getConditionalTypeInstantiation ~21000-21006): when the
+             * syntactic checkType is a bare reference to the alias's type
+             * parameter AND the substituted value is a union, distribute
+             * the conditional over each union constituent and re-union the
+             * branch results. `never` (TypeFlags.Never) is equivalent to an
+             * empty union, so the result is `never`. Mirrors
+             * `mapTypeWithAlias(distributionType, t => getConditionalType(...))`.
+             */
+            const CtscConditionalTypeData* c = &type_node->data.conditionalType;
+            if (!c->check_type || !c->extends_type || !c->true_type || !c->false_type) {
+                return reg->t_any;
+            }
+            /*
+             * Detect "distributive" shape: checkType is a bare Identifier
+             * TypeReference whose name is currently bound as a type
+             * parameter in the active substitution frame. When distributive
+             * and the bound type is a union (or `never`), distribute.
+             */
+            const uint16_t* dist_name = NULL;
+            size_t dist_name_len = 0;
+            CtscType* dist_source = NULL;
+            if (w
+                && c->check_type->kind == CTSC_SK_TypeReference
+                && c->check_type->data.typeReference.typeName
+                && c->check_type->data.typeReference.typeName->kind == CTSC_SK_Identifier
+                && (!c->check_type->data.typeReference.has_type_arguments
+                    || c->check_type->data.typeReference.type_arguments.len == 0)) {
+                const CtscIdentifierData* cid =
+                    &c->check_type->data.typeReference.typeName->data.identifier;
+                CtscType* bound = type_param_bindings_lookup(w, cid->text, cid->text_len);
+                if (bound) {
+                    dist_name = cid->text;
+                    dist_name_len = cid->text_len;
+                    dist_source = bound;
+                }
+            }
+            if (dist_source && dist_source->kind == CTSC_TYPE_NEVER) {
+                return reg->t_never;
+            }
+            if (dist_source && dist_source->kind == CTSC_TYPE_UNION
+                && dist_source->union_members_len > 0
+                && dist_source->union_members_len <= 32) {
+                CtscType* branches[32];
+                size_t nb = 0;
+                size_t mark = type_param_bindings_save_mark(w);
+                for (size_t mi = 0; mi < dist_source->union_members_len; ++mi) {
+                    CtscType* member = dist_source->union_members[mi];
+                    if (!member) continue;
+                    type_param_bindings_push(w, dist_name, dist_name_len, member);
+                    CtscType* one = type_of_type_node(w, reg, src, src_len, type_node, alias_depth + 1);
+                    type_param_bindings_restore(w, mark);
+                    if (!one) continue;
+                    if (one->kind == CTSC_TYPE_NEVER) continue;
+                    if (one->kind == CTSC_TYPE_UNION) {
+                        for (size_t ui = 0; ui < one->union_members_len && nb < 32; ++ui) {
+                            CtscType* sub = one->union_members[ui];
+                            if (!sub || sub->kind == CTSC_TYPE_NEVER) continue;
+                            bool dup = false;
+                            for (size_t qi = 0; qi < nb; ++qi) {
+                                if (conditional_branch_types_identical(branches[qi], sub)) { dup = true; break; }
+                            }
+                            if (!dup) branches[nb++] = sub;
+                        }
+                    } else {
+                        bool dup = false;
+                        for (size_t qi = 0; qi < nb; ++qi) {
+                            if (conditional_branch_types_identical(branches[qi], one)) { dup = true; break; }
+                        }
+                        if (!dup && nb < 32) branches[nb++] = one;
+                    }
+                }
+                if (nb == 0) return reg->t_never;
+                if (nb == 1) return branches[0];
+                CtscType* u = ctsc_type_new(reg, CTSC_TYPE_UNION);
+                u->union_members = (CtscType**)ctsc_arena_alloc(reg->arena, nb * sizeof(CtscType*));
+                memcpy(u->union_members, branches, nb * sizeof(CtscType*));
+                u->union_members_len = nb;
+                sort_intrinsic_union_members(u);
+                return u;
+            }
+            CtscType* check_ty =
+                type_of_type_node(w, reg, src, src_len, c->check_type, alias_depth + 1);
+            if (!check_ty) return reg->t_any;
+            /*
+             * `infer` slice: when the extends-type spans a FunctionType of
+             * the shape `(...) => infer <X>` (parser.ts parseInferType
+             * ~4753; checker.ts inferFromSignatures ~29000+ /
+             * getInferredType ~29800+ / instantiateType with an inference
+             * context), and the check-type resolves to a FunctionType,
+             * bind `<X>` to the check-type's return type and evaluate the
+             * true branch with that binding. Mirrors the canonical
+             * `type ReturnType<T> = T extends (...args: any[]) => infer R
+             * ? R : never` pattern (checker/conditional/
+             * 04_cond_infer.ts). The AST does not yet model
+             * FunctionType / InferType as structured nodes — parser.c
+             * consume_type_via_fallback_scan collapses the extends-type
+             * into an opaque TypeReference span — so we recover the
+             * infer binding by scanning the source slice.
+             */
+            if (w && check_ty->kind == CTSC_TYPE_FUNCTION && check_ty->function_decl
+                && c->extends_type && src && src_len > 0) {
+                int infer_name_start = -1;
+                int infer_name_end = -1;
+                if (function_type_extends_has_infer(src, src_len, c->extends_type->pos,
+                                                    c->extends_type->end,
+                                                    &infer_name_start, &infer_name_end)
+                    && infer_name_start >= 0 && infer_name_end > infer_name_start) {
+                    const CtscNode* fn_decl = (const CtscNode*)check_ty->function_decl;
+                    CtscType* ret_ty = return_type_of_function_declaration(w, fn_decl);
+                    if (!ret_ty) ret_ty = reg->t_any;
+                    size_t mark = type_param_bindings_save_mark(w);
+                    type_param_bindings_push(w, src + infer_name_start,
+                                             (size_t)(infer_name_end - infer_name_start),
+                                             ret_ty);
+                    CtscType* branch =
+                        type_of_type_node(w, reg, src, src_len, c->true_type, alias_depth + 1);
+                    type_param_bindings_restore(w, mark);
+                    if (branch) return branch;
+                }
+            }
+            CtscType* extends_ty =
+                type_of_type_node(w, reg, src, src_len, c->extends_type, alias_depth + 1);
+            if (!extends_ty) return reg->t_any;
+            if (w && is_assignable_to(w, reg, check_ty, extends_ty)) {
+                return type_of_type_node(w, reg, src, src_len, c->true_type, alias_depth + 1);
+            }
+            if (w) {
+                return type_of_type_node(w, reg, src, src_len, c->false_type, alias_depth + 1);
+            }
+            return reg->t_any;
         }
         default:
             /* Generics / etc.: not handled in M4.0. */
@@ -4254,6 +4639,278 @@ static void push_property_signatures_from_interface_declaration(Walk* w, const C
         e.type = widen_union_remove_nullish_for_types_dump(&w->r->registry,
                                                              tmp[i].value_type ? tmp[i].value_type : w->r->registry.t_any);
         entry_push(w->r, w->arena, e);
+    }
+}
+
+/*
+ * Advance past whitespace, line-terminators, line-comments and block-comments
+ * starting at *p in [*p, end). Mirrors the trivia-skipping loop in
+ * upstream/TypeScript/src/compiler/scanner.ts skipTrivia (~560-620).
+ */
+static void u16_skip_trivia(const uint16_t* s, int* p, int end) {
+    int i = *p;
+    while (i < end) {
+        uint16_t c = s[i];
+        if (ctsc_is_ws_u16(c)) { i++; continue; }
+        if (c == (uint16_t)'/' && i + 1 < end && s[i + 1] == (uint16_t)'/') {
+            i += 2;
+            while (i < end && s[i] != (uint16_t)'\n' && s[i] != (uint16_t)'\r') i++;
+            continue;
+        }
+        if (c == (uint16_t)'/' && i + 1 < end && s[i + 1] == (uint16_t)'*') {
+            i += 2;
+            while (i + 1 < end && !(s[i] == (uint16_t)'*' && s[i + 1] == (uint16_t)'/')) i++;
+            if (i + 1 < end) i += 2;
+            continue;
+        }
+        break;
+    }
+    *p = i;
+}
+
+/*
+ * Find the matching close for an open paren at `open_pos` inside [open_pos, end).
+ * Balances `()`, `{}`, `[]`, skips string / template literals and line/block
+ * comments. Returns the position of the matching `)` or -1 on failure.
+ */
+static int u16_find_matching_paren(const uint16_t* s, int open_pos, int end) {
+    if (open_pos < 0 || open_pos >= end || s[open_pos] != (uint16_t)'(') return -1;
+    int depth_paren = 0, depth_brace = 0, depth_brack = 0;
+    for (int i = open_pos; i < end; ++i) {
+        uint16_t c = s[i];
+        /* skip comments */
+        if (c == (uint16_t)'/' && i + 1 < end && s[i + 1] == (uint16_t)'/') {
+            i += 2;
+            while (i < end && s[i] != (uint16_t)'\n' && s[i] != (uint16_t)'\r') i++;
+            i--;
+            continue;
+        }
+        if (c == (uint16_t)'/' && i + 1 < end && s[i + 1] == (uint16_t)'*') {
+            i += 2;
+            while (i + 1 < end && !(s[i] == (uint16_t)'*' && s[i + 1] == (uint16_t)'/')) i++;
+            if (i + 1 < end) i++; /* land on '/' so loop increment skips it */
+            continue;
+        }
+        /* skip string literals */
+        if (c == (uint16_t)'"' || c == (uint16_t)'\'' || c == (uint16_t)'`') {
+            uint16_t q = c;
+            i++;
+            while (i < end && s[i] != q) {
+                if (s[i] == (uint16_t)'\\' && i + 1 < end) { i += 2; continue; }
+                i++;
+            }
+            continue;
+        }
+        if (c == (uint16_t)'(') depth_paren++;
+        else if (c == (uint16_t)')') {
+            depth_paren--;
+            if (depth_paren == 0 && depth_brace == 0 && depth_brack == 0) return i;
+        }
+        else if (c == (uint16_t)'{') depth_brace++;
+        else if (c == (uint16_t)'}') { if (depth_brace > 0) depth_brace--; }
+        else if (c == (uint16_t)'[') depth_brack++;
+        else if (c == (uint16_t)']') { if (depth_brack > 0) depth_brack--; }
+    }
+    return -1;
+}
+
+/*
+ * Parse a single parameter declaration inside a FunctionType's parameter
+ * list starting at `*p` and bounded by `list_end`. Mirrors parser.ts
+ * parseParameterWorker (~4060): optional `...` rest marker, then an
+ * Identifier name, then optional `?`, then optional `: Type`. On success,
+ * emits a Parameter entry via entry_push and advances `*p` past this
+ * parameter. The parameter's type is recorded as the empty-object type
+ * `{}` because tsc's typeToString on getTypeAtLocation for a parameter
+ * whose enclosing FunctionType is the extends-clause of a ConditionalType
+ * returns the empty-object type (no parameter symbol is bound to a real
+ * declared type during the conditional relation probe — see checker.ts
+ * inferFromSignatures ~29000+ / getInferredType ~29800+).
+ */
+static bool u16_is_ident_start_checker(uint16_t c) {
+    return (c >= (uint16_t)'A' && c <= (uint16_t)'Z')
+        || (c >= (uint16_t)'a' && c <= (uint16_t)'z')
+        || c == (uint16_t)'_' || c == (uint16_t)'$';
+}
+
+static bool u16_is_ident_part_checker(uint16_t c) {
+    return u16_is_ident_start_checker(c) || (c >= (uint16_t)'0' && c <= (uint16_t)'9');
+}
+
+static void push_one_function_type_parameter(Walk* w, int* p, int list_end) {
+    int i = *p;
+    u16_skip_trivia(w->source_utf16, &i, list_end);
+    if (i >= list_end) { *p = i; return; }
+    /* Optional `...` rest marker. */
+    if (i + 2 < list_end
+        && w->source_utf16[i] == (uint16_t)'.'
+        && w->source_utf16[i + 1] == (uint16_t)'.'
+        && w->source_utf16[i + 2] == (uint16_t)'.') {
+        i += 3;
+        u16_skip_trivia(w->source_utf16, &i, list_end);
+    }
+    if (i >= list_end || !u16_is_ident_start_checker(w->source_utf16[i])) {
+        /*
+         * Binding pattern (`{ a }` / `[a]`) or unrecognised parameter shape
+         * — not exercised by the current fixture set. Advance past this
+         * parameter by scanning to the next top-level `,` / end of list.
+         */
+        int depth_paren = 0, depth_brace = 0, depth_brack = 0;
+        while (i < list_end) {
+            uint16_t c = w->source_utf16[i];
+            if (depth_paren == 0 && depth_brace == 0 && depth_brack == 0 && c == (uint16_t)',') break;
+            if (c == (uint16_t)'(') depth_paren++;
+            else if (c == (uint16_t)')') { if (depth_paren > 0) depth_paren--; }
+            else if (c == (uint16_t)'{') depth_brace++;
+            else if (c == (uint16_t)'}') { if (depth_brace > 0) depth_brace--; }
+            else if (c == (uint16_t)'[') depth_brack++;
+            else if (c == (uint16_t)']') { if (depth_brack > 0) depth_brack--; }
+            i++;
+        }
+        *p = i;
+        return;
+    }
+    int name_start = i;
+    i++;
+    while (i < list_end && u16_is_ident_part_checker(w->source_utf16[i])) i++;
+    int name_end = i;
+
+    CtscCheckTypeEntry e = {0};
+    e.name = w->source_utf16 + name_start;
+    e.name_len = (size_t)(name_end - name_start);
+    e.decl_kind_name = syntax_kind_cstr(CTSC_SK_Parameter);
+    e.pos = name_start;
+    e.end = name_end;
+    /*
+     * Mirrors checker.ts typeToString on getTypeAtLocation(parameterName)
+     * for a FunctionType whose signature is an extends-type of a
+     * ConditionalType: tsc returns the empty-object type `{}` (no symbol
+     * resolution happens for these parameters during the relation probe).
+     * Stored as a pre-formatted type_string so ctsc_type_to_string isn't
+     * invoked (the registry doesn't currently materialise a dedicated
+     * "anonymous empty" CtscType for this exact formatting).
+     */
+    static const char kEmpty[] = "{}";
+    e.type_string = kEmpty;
+    e.type_string_len = sizeof(kEmpty) - 1;
+    entry_push(w->r, w->arena, e);
+
+    /* Advance past `?`, `: Type`, and up to the next top-level `,` or end. */
+    int depth_paren = 0, depth_brace = 0, depth_brack = 0;
+    while (i < list_end) {
+        uint16_t c = w->source_utf16[i];
+        if (depth_paren == 0 && depth_brace == 0 && depth_brack == 0 && c == (uint16_t)',') break;
+        if (c == (uint16_t)'(') depth_paren++;
+        else if (c == (uint16_t)')') { if (depth_paren > 0) depth_paren--; }
+        else if (c == (uint16_t)'{') depth_brace++;
+        else if (c == (uint16_t)'}') { if (depth_brace > 0) depth_brace--; }
+        else if (c == (uint16_t)'[') depth_brack++;
+        else if (c == (uint16_t)']') { if (depth_brack > 0) depth_brack--; }
+        i++;
+    }
+    *p = i;
+}
+
+/*
+ * Scan a UTF-16 source span [start, end) for FunctionType-like
+ * `(params) => Type` occurrences and emit a Parameter entry for each
+ * parameter name found. Mirrors parser.ts parseFunctionOrConstructorType
+ * (~4355) + parseParameters (~4150): a parenthesised parameter list whose
+ * matching `)` is followed (modulo trivia) by `=>` is a FunctionType.
+ * Recurses into the inner span so nested function types in deeper
+ * positions (e.g. `(f: (x: T) => U) => V`) also contribute entries.
+ *
+ * The span is conservatively scanned without full tokenisation: string
+ * literals and comments are skipped, but keyword / operator context is
+ * not tracked. This is sufficient for the M4.0 conditional-type
+ * extends-clause FunctionType fixture set (checker/conditional/
+ * 04_cond_infer.ts). See also: checker.ts getTypeAtLocation on a
+ * FunctionType parameter inside a ConditionalType's extendsType returns
+ * `{}` (the empty-object type), which matches the oracle.
+ */
+static void push_function_type_parameter_entries_in_span(Walk* w, int start, int end) {
+    if (!w || !w->source_utf16 || start < 0 || end <= start
+        || end > (int)w->source_utf16_len) return;
+    int i = start;
+    while (i < end) {
+        uint16_t c = w->source_utf16[i];
+        /* Skip comments & strings so `(` inside them doesn't trigger us. */
+        if (c == (uint16_t)'/' && i + 1 < end
+            && (w->source_utf16[i + 1] == (uint16_t)'/'
+                || w->source_utf16[i + 1] == (uint16_t)'*')) {
+            u16_skip_trivia(w->source_utf16, &i, end);
+            continue;
+        }
+        if (c == (uint16_t)'"' || c == (uint16_t)'\'' || c == (uint16_t)'`') {
+            uint16_t q = c;
+            i++;
+            while (i < end && w->source_utf16[i] != q) {
+                if (w->source_utf16[i] == (uint16_t)'\\' && i + 1 < end) { i += 2; continue; }
+                i++;
+            }
+            if (i < end) i++;
+            continue;
+        }
+        if (c == (uint16_t)'(') {
+            int open = i;
+            int close = u16_find_matching_paren(w->source_utf16, open, end);
+            if (close < 0) return;
+            /* Is this a FunctionType parameter list? Peek past `)`: a `=>`
+             * marks it as such (parser.ts parseFunctionOrConstructorType
+             * ~4355 dispatches on `=>` after the parameter list). */
+            int after = close + 1;
+            u16_skip_trivia(w->source_utf16, &after, end);
+            bool is_function_type = after + 1 < end
+                && w->source_utf16[after] == (uint16_t)'='
+                && w->source_utf16[after + 1] == (uint16_t)'>';
+            if (is_function_type) {
+                int p = open + 1;
+                while (p < close) {
+                    u16_skip_trivia(w->source_utf16, &p, close);
+                    if (p >= close) break;
+                    push_one_function_type_parameter(w, &p, close);
+                    u16_skip_trivia(w->source_utf16, &p, close);
+                    if (p < close && w->source_utf16[p] == (uint16_t)',') p++;
+                }
+            }
+            /* Recurse into the inner span for nested function types. */
+            push_function_type_parameter_entries_in_span(w, open + 1, close);
+            i = close + 1;
+            continue;
+        }
+        i++;
+    }
+}
+
+/*
+ * Walk a TypeNode subtree scanning for FunctionType parameter lists that
+ * appear in the extends-clause of a ConditionalType. Mirrors the oracle
+ * walk (harness/src/oracle-checker-types.ts): ts.forEachChild descends
+ * into TypeAliasDeclaration → ConditionalType → extendsType, and a
+ * FunctionType's Parameter name identifiers flow through
+ * DECL_KINDS_M40's Parameter case. ctsc does not yet model FunctionType
+ * as a first-class AST node (parser falls back to an opaque
+ * TypeReference span — see parser.c consume_type_via_fallback_scan), so
+ * we recover the Parameter entries by scanning the source span instead.
+ */
+static void push_extends_function_type_parameters(Walk* w, const CtscNode* type_node) {
+    if (!w || !type_node) return;
+    switch (type_node->kind) {
+        case CTSC_SK_ConditionalType: {
+            const CtscConditionalTypeData* ct = &type_node->data.conditionalType;
+            push_extends_function_type_parameters(w, ct->check_type);
+            /* Scan the extends-type span for FunctionType parameter lists. */
+            if (ct->extends_type) {
+                push_function_type_parameter_entries_in_span(
+                    w, ct->extends_type->pos, ct->extends_type->end);
+                push_extends_function_type_parameters(w, ct->extends_type);
+            }
+            push_extends_function_type_parameters(w, ct->true_type);
+            push_extends_function_type_parameters(w, ct->false_type);
+            return;
+        }
+        default:
+            return;
     }
 }
 
@@ -6615,6 +7272,20 @@ static void visit(Walk* w, const CtscNode* n) {
             const CtscNode* alias_ty = n->data.typeAliasDeclaration.type;
             if (alias_ty && alias_ty->kind == CTSC_SK_TypeLiteral) {
                 push_property_signatures_from_type_literal(w, alias_ty);
+            }
+            /*
+             * Mirrors the oracle walk on TypeAliasDeclaration body
+             * (harness/src/oracle-checker-types.ts: ts.forEachChild descends
+             * into ConditionalType children, and a FunctionType in the
+             * extends-clause contributes Parameter entries). ctsc does not
+             * yet model FunctionType as a structured AST node (parser.c
+             * consume_type_via_fallback_scan produces an opaque TypeReference
+             * span), so recover those Parameter entries by scanning the
+             * source span. Exercised by checker/conditional/04_cond_infer.ts
+             * (`type R2<T> = T extends (...args: any[]) => infer R ? R : never`).
+             */
+            if (alias_ty) {
+                push_extends_function_type_parameters(w, alias_ty);
             }
             return;
         }

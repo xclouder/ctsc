@@ -155,6 +155,8 @@ static CtscNode* parse_parameter(Parser* p);
 static bool parse_type_parameters(Parser* p, CtscNodeArray* out);
 static CtscNode* parse_type_annotation(Parser* p);
 static CtscNode* parse_type_in_annotation_position(Parser* p, bool allow_multiline);
+static CtscNode* parse_non_conditional_type_in_annotation_position(Parser* p, bool allow_multiline);
+static CtscNode* maybe_wrap_conditional_type(Parser* p, CtscNode* check_type, bool allow_multiline);
 static CtscNode* parse_type_literal(Parser* p);
 static void skip_type_in_type_parameter_position(Parser* p);
 static CtscNode* consume_type_via_fallback_scan(Parser* p, bool allow_multiline);
@@ -537,8 +539,39 @@ static bool try_parse_type_argument_list(Parser* p, CtscNodeArray* out_args);
 
 static CtscNode* parse_type_node(Parser* p) {
     CtscSyntaxKind k = cur(p);
-    if (!token_can_start_type(k)) return NULL;
+    if (!token_can_start_type(k) && k != CTSC_SK_TypeOfKeyword) return NULL;
     int fs = cur_full_start(p);
+
+    /*
+     * `typeof <Identifier>` as a type-argument (parser.ts parseTypeQuery
+     * ~3946). Emits a CTSC_SK_TypeQuery carrying the exprName in the shared
+     * CtscTypeReferenceData.typeName slot so the checker's TypeQuery case
+     * (getTypeFromTypeQueryNode ~17410) can resolve it against the value
+     * symbol namespace. Only the simple identifier form is supported here;
+     * dotted / generic exprNames fall through to the fallback path, which
+     * preserves the pre-existing opaque span behaviour.
+     */
+    if (k == CTSC_SK_TypeOfKeyword) {
+        CtscScanner saved = p->scanner;
+        size_t saved_diag_count = p->diagnostics->count;
+        advance(p); /* typeof */
+        if (cur(p) == CTSC_SK_Identifier) {
+            CtscNode* entity_name = make_identifier_from_current(p);
+            CtscSyntaxKind after = cur(p);
+            if (after != CTSC_SK_DotToken && after != CTSC_SK_LessThanToken) {
+                int tq_end = cur_full_start(p);
+                CtscNode* tq = ctsc_node_new(p->arena, CTSC_SK_TypeQuery, fs, tq_end);
+                tq->data.typeReference.typeName = entity_name;
+                tq->data.typeReference.has_type_arguments = false;
+                ctsc_node_array_init(&tq->data.typeReference.type_arguments);
+                return tq;
+            }
+        }
+        p->scanner = saved;
+        ctsc_diag_truncate(p->diagnostics, saved_diag_count);
+        k = cur(p);
+        if (!token_can_start_type(k)) return NULL;
+    }
 
     /* Identifier-led type: build a proper CTSC_SK_TypeReference with
      * `typeName` set. Mirrors parser.ts parseTypeReference (~4577):
@@ -584,6 +617,109 @@ static CtscNode* parse_type_node(Parser* p) {
      */
     if (k == CTSC_SK_OpenBraceToken) {
         return parse_type_literal(p);
+    }
+
+    /*
+     * LiteralTypeNode forms in type-argument position. Mirrors upstream
+     * parser.ts parseLiteralTypeNode (~4528) dispatched from parseNonArrayType
+     * (~4619-4628): a NumericLiteral / StringLiteral / BigIntLiteral / True /
+     * False / Null token starts a LiteralType. ctsc models these as the bare
+     * literal-like SyntaxKind (CTSC_SK_NumericLiteral, CTSC_SK_StringLiteral,
+     * CTSC_SK_TrueKeyword, ...) — the same convention used by
+     * parse_non_conditional_type_in_annotation_position (~3378, ~3413, ~3466).
+     * The checker's type_of_type_node maps these to their matching
+     * LiteralType (checker.ts getTypeFromTypeNode ~17289-17310). Without this
+     * branch, `Classify<42>` / `Classify<true>` were collapsed into an opaque
+     * CTSC_SK_TypeReference via the stop-set fallback below, so the generic
+     * alias body saw `any` / a bare named reference and the ConditionalType
+     * evaluator picked the wrong branch (checker/conditional/
+     * 05_cond_nested.ts).
+     */
+    if (k == CTSC_SK_StringLiteral) {
+        CtscNode* n = ctsc_node_new(p->arena, CTSC_SK_StringLiteral, fs, cur_end(p));
+        n->data.stringLiteral.text = p->scanner.current.text;
+        n->data.stringLiteral.text_len = p->scanner.current.text_len;
+        n->data.stringLiteral.value = p->scanner.current.value;
+        n->data.stringLiteral.value_len = p->scanner.current.value_len;
+        n->data.stringLiteral.single_quote =
+            (p->scanner.current.text_len > 0 && p->scanner.current.text[0] == '\'');
+        advance(p);
+        return n;
+    }
+    if (k == CTSC_SK_NumericLiteral) {
+        const uint16_t* tok_text = p->scanner.current.text;
+        size_t tok_text_len = p->scanner.current.text_len;
+        const uint16_t* tok_value = p->scanner.current.value;
+        size_t tok_value_len = p->scanner.current.value_len;
+        bool numeric_invalid = p->scanner.current.numeric_literal_is_invalid;
+        CtscNode* n = ctsc_node_new(p->arena, CTSC_SK_NumericLiteral, fs, cur_end(p));
+        if (tok_value && tok_value_len) {
+            n->data.numericLiteral.text = tok_value;
+            n->data.numericLiteral.text_len = tok_value_len;
+        } else {
+            n->data.numericLiteral.text = tok_text;
+            n->data.numericLiteral.text_len = tok_text_len;
+        }
+        bool has_numeric_sep = false;
+        for (size_t ti = 0; ti < tok_text_len; ti++) {
+            if (tok_text[ti] == '_') { has_numeric_sep = true; break; }
+        }
+        if (numeric_invalid || has_numeric_sep) {
+            n->data.numericLiteral.source_text = NULL;
+            n->data.numericLiteral.source_text_len = 0;
+        } else {
+            n->data.numericLiteral.source_text = tok_text;
+            n->data.numericLiteral.source_text_len = tok_text_len;
+        }
+        advance(p);
+        return n;
+    }
+    if (k == CTSC_SK_BigIntLiteral) {
+        const uint16_t* tok_text = p->scanner.current.text;
+        size_t tok_text_len = p->scanner.current.text_len;
+        CtscNode* n = ctsc_node_new(p->arena, CTSC_SK_BigIntLiteral, fs, cur_end(p));
+        n->data.numericLiteral.text = tok_text;
+        n->data.numericLiteral.text_len = tok_text_len;
+        bool has_numeric_sep = false;
+        for (size_t ti = 0; ti < tok_text_len; ti++) {
+            if (tok_text[ti] == '_') { has_numeric_sep = true; break; }
+        }
+        if (has_numeric_sep) {
+            n->data.numericLiteral.source_text = NULL;
+            n->data.numericLiteral.source_text_len = 0;
+        } else {
+            n->data.numericLiteral.source_text = tok_text;
+            n->data.numericLiteral.source_text_len = tok_text_len;
+        }
+        advance(p);
+        return n;
+    }
+    if (k == CTSC_SK_TrueKeyword || k == CTSC_SK_FalseKeyword
+        || k == CTSC_SK_NullKeyword) {
+        CtscNode* n = ctsc_node_new(p->arena, k, fs, cur_end(p));
+        advance(p);
+        return n;
+    }
+
+    /*
+     * Primitive keyword type nodes in type-argument position (parser.ts
+     * parseNonArrayType ~4591-4602: AnyKeyword / UnknownKeyword /
+     * StringKeyword / NumberKeyword / SymbolKeyword / BooleanKeyword /
+     * UndefinedKeyword / NeverKeyword / ObjectKeyword / VoidKeyword). The
+     * checker's type_of_type_node maps each keyword to its intrinsic
+     * singleton (reg->t_string, reg->t_number, ...). Without this branch
+     * `Classify<number>` would fall through to the stop-set scan and be
+     * collapsed into an opaque TypeReference.
+     */
+    if (k == CTSC_SK_AnyKeyword || k == CTSC_SK_UnknownKeyword
+        || k == CTSC_SK_StringKeyword || k == CTSC_SK_NumberKeyword
+        || k == CTSC_SK_SymbolKeyword
+        || k == CTSC_SK_BooleanKeyword || k == CTSC_SK_UndefinedKeyword
+        || k == CTSC_SK_NeverKeyword || k == CTSC_SK_ObjectKeyword
+        || k == CTSC_SK_VoidKeyword) {
+        CtscNode* n = ctsc_node_new(p->arena, k, fs, cur_end(p));
+        advance(p);
+        return n;
     }
 
     /* Fallback for non-identifier type atoms: consume a single "type atom" —
@@ -3091,6 +3227,22 @@ static CtscNode* consume_type_via_fallback_scan(Parser* p, bool allow_multiline)
                 || (k == CTSC_SK_OpenBraceToken && last_consumed_kind != CTSC_SK_BarToken)) {
                 break;
             }
+            /*
+             * `?` and `:` at the top level of a non-conditional type terminate
+             * the fallback scan so the enclosing ConditionalType's
+             * trueType / falseType are parsed by maybe_wrap_conditional_type
+             * instead of being absorbed into the checkType / extendsType
+             * (parser.ts parseConditionalTypeOrHigher ~5002 — tsc's grammar
+             * forbids a top-level `?:` inside a non-conditional type).
+             * Without this, a union of literal types like
+             * `null | undefined` in an `extends` clause swallows
+             * `? trueType : falseType`, leaving cur != `?` so
+             * maybe_wrap_conditional_type rolls back the whole tail
+             * (checker/conditional/02_cond_distributive.ts exercises this).
+             */
+            if (k == CTSC_SK_QuestionToken || k == CTSC_SK_ColonToken) {
+                break;
+            }
             if (p->scanner.current.has_preceding_line_break && !allow_multiline) break;
         }
         if (k == CTSC_SK_OpenBraceToken) brace_depth++;
@@ -3113,16 +3265,21 @@ static CtscNode* consume_type_via_fallback_scan(Parser* p, bool allow_multiline)
 }
 
 /*
- * Parses a Type after `:` (annotations) or `=` (type aliases). When
- * `allow_multiline` is false, a line break at the top level terminates the
- * type (ASI / variable-declaration parity). When true, multiline union types
- * after `=` are absorbed (mirrors parser.ts parseTypeAliasDeclaration ~8257
- * feeding parseType, selfhost-derived 89_type_alias_erase.ts).
+ * Parses a non-conditional Type after `:` (annotations) or `=` (type
+ * aliases). When `allow_multiline` is false, a line break at the top level
+ * terminates the type (ASI / variable-declaration parity). When true,
+ * multiline union types after `=` are absorbed (mirrors parser.ts
+ * parseTypeAliasDeclaration ~8257 feeding parseType, selfhost-derived
+ * 89_type_alias_erase.ts).
  *
- * Mirrors upstream/TypeScript/src/compiler/parser.ts parseTypeAnnotation (~4961)
- * for the `:` case: TypeAnnotation: ":" Type
+ * Mirrors upstream/TypeScript/src/compiler/parser.ts parseTypeAnnotation
+ * (~4961) for the `:` case: TypeAnnotation: ":" Type. The conditional type
+ * (`T extends U ? A : B`) is applied on top of this by the outer
+ * parse_type_in_annotation_position wrapper (mirrors upstream's
+ * parseConditionalTypeOrHigher ~5002 which wraps
+ * parseNonConditionalType).
  */
-static CtscNode* parse_type_in_annotation_position(Parser* p, bool allow_multiline) {
+static CtscNode* parse_non_conditional_type_in_annotation_position(Parser* p, bool allow_multiline) {
     /*
      * Mirrors upstream/TypeScript/src/compiler/parser.ts
      * parseTypeOperatorOrHigher (~4781) / parseTypeOperator (~4752):
@@ -3139,7 +3296,7 @@ static CtscNode* parse_type_in_annotation_position(Parser* p, bool allow_multili
     if (cur(p) == CTSC_SK_KeyOfKeyword) {
         int fs = cur_full_start(p);
         advance(p); /* keyof */
-        CtscNode* operand = parse_type_in_annotation_position(p, allow_multiline);
+        CtscNode* operand = parse_non_conditional_type_in_annotation_position(p, allow_multiline);
         int end = cur_full_start(p);
         CtscNode* to = ctsc_node_new(p->arena, CTSC_SK_TypeOperator, fs, end);
         to->data.typeReference.typeName = operand;
@@ -3396,6 +3553,40 @@ static CtscNode* parse_type_in_annotation_position(Parser* p, bool allow_multili
             }
         }
     }
+    /*
+     * `true` / `false` literal type nodes (parser.ts parseNonArrayType ~4607
+     * / parseLiteralTypeNode ~4568):
+     *     case SyntaxKind.TrueKeyword:
+     *     case SyntaxKind.FalseKeyword:
+     *         return parseLiteralTypeNode();
+     * ctsc models these as their bare keyword SyntaxKind (TrueKeyword /
+     * FalseKeyword) in type position. The checker maps them to the boolean
+     * literal singletons (reg->t_true / reg->t_false). Without this branch,
+     * the token would fall through to the stop-set scan and be collapsed
+     * into an opaque TypeReference — which a ConditionalType's true/false
+     * branch can't distinguish from `any`.
+     */
+    if (cur(p) == CTSC_SK_TrueKeyword || cur(p) == CTSC_SK_FalseKeyword) {
+        int fs = cur_full_start(p);
+        CtscSyntaxKind tk = cur(p);
+        CtscScanner saved = p->scanner;
+        advance(p);
+        if (cur(p) == CTSC_SK_BarToken) {
+            /* Union (`true | false`) must use the stop-set fallback so `|
+             * ...` is absorbed (parser.ts parseUnionType ~4876). Mirrors
+             * the same treatment applied to other literal/keyword types
+             * above. */
+            p->scanner = saved;
+        } else {
+            consume_postfix_type_operators(p);
+            if (cur(p) == CTSC_SK_BarToken) {
+                p->scanner = saved;
+            } else {
+                int end = cur_full_start(p);
+                return ctsc_node_new(p->arena, tk, fs, end);
+            }
+        }
+    }
     /* Identifier-led TypeReference: mirror upstream parser.ts parseTypeReference
      * (~4577) → parseEntityNameOfTypeReference + parseTypeArgumentsOfTypeReference.
      * parse_type_node already produces a CTSC_SK_TypeReference carrying
@@ -3429,6 +3620,19 @@ static CtscNode* parse_type_in_annotation_position(Parser* p, bool allow_multili
                  || nk == CTSC_SK_CloseBraceToken
                  || nk == CTSC_SK_OpenBraceToken
                  || nk == CTSC_SK_EqualsGreaterThanToken
+                 /*
+                  * `extends` after an Identifier-led type marks the start
+                  * of a ConditionalType (parser.ts parseConditionalTypeOrHigher
+                  * ~5002). `?` and `:` terminate the checkType / trueType
+                  * of an enclosing conditional so the wrapper can consume
+                  * them next. All three tokens were previously absorbed
+                  * by the fallback stop-set scan, which collapsed the
+                  * entire `T extends U ? A : B` expression into an opaque
+                  * TypeReference.
+                  */
+                 || nk == CTSC_SK_ExtendsKeyword
+                 || nk == CTSC_SK_QuestionToken
+                 || nk == CTSC_SK_ColonToken
                  || nk == CTSC_SK_EndOfFileToken)
                 || (p->scanner.current.has_preceding_line_break && !allow_multiline);
             if (terminates) return tr;
@@ -3439,6 +3643,74 @@ static CtscNode* parse_type_in_annotation_position(Parser* p, bool allow_multili
     /* Fallback: consume a minimal "type expression" by scanning a stop set
      * (nested `{`/`[` balanced; see consume_type_via_fallback_scan). */
     return consume_type_via_fallback_scan(p, allow_multiline);
+}
+
+/*
+ * Mirrors upstream/TypeScript/src/compiler/parser.ts
+ * parseConditionalTypeOrHigher (~5002):
+ *     const type = parseNonConditionalType();
+ *     if (!scanner.hasPrecedingLineBreak() && parseOptional(ExtendsKeyword)) {
+ *         const extendsType = disallowConditionalTypesAnd(parseType);
+ *         parseExpected(QuestionToken);
+ *         const trueType = allowConditionalTypesAnd(parseType);
+ *         parseExpected(ColonToken);
+ *         const falseType = allowConditionalTypesAnd(parseType);
+ *         return factory.createConditionalTypeNode(type, extendsType, trueType, falseType);
+ *     }
+ *     return type;
+ *
+ * The `check_type` has already been parsed (by parse_non_conditional_type_
+ * in_annotation_position); this helper attaches a ConditionalType wrapper
+ * when the tail matches. Speculative on failure: restores the scanner so
+ * partial consumption of a malformed `extends …` tail does not corrupt
+ * outer list parsing.
+ */
+static CtscNode* maybe_wrap_conditional_type(Parser* p, CtscNode* check_type, bool allow_multiline) {
+    if (!check_type) return check_type;
+    if (cur(p) != CTSC_SK_ExtendsKeyword) return check_type;
+    CtscScanner saved = p->scanner;
+    size_t saved_diag_count = p->diagnostics->count;
+    int cond_start = check_type->pos;
+    advance(p); /* `extends` */
+    CtscNode* extends_type = parse_non_conditional_type_in_annotation_position(p, allow_multiline);
+    if (!extends_type || cur(p) != CTSC_SK_QuestionToken) {
+        p->scanner = saved;
+        ctsc_diag_truncate(p->diagnostics, saved_diag_count);
+        return check_type;
+    }
+    advance(p); /* `?` */
+    CtscNode* true_type = parse_type_in_annotation_position(p, allow_multiline);
+    if (!true_type || cur(p) != CTSC_SK_ColonToken) {
+        p->scanner = saved;
+        ctsc_diag_truncate(p->diagnostics, saved_diag_count);
+        return check_type;
+    }
+    advance(p); /* `:` */
+    CtscNode* false_type = parse_type_in_annotation_position(p, allow_multiline);
+    if (!false_type) {
+        p->scanner = saved;
+        ctsc_diag_truncate(p->diagnostics, saved_diag_count);
+        return check_type;
+    }
+    int end = false_type->end;
+    CtscNode* n = ctsc_node_new(p->arena, CTSC_SK_ConditionalType, cond_start, end);
+    n->data.conditionalType.check_type   = check_type;
+    n->data.conditionalType.extends_type = extends_type;
+    n->data.conditionalType.true_type    = true_type;
+    n->data.conditionalType.false_type   = false_type;
+    return n;
+}
+
+/*
+ * Outer type-in-annotation entry: mirrors parser.ts parseType (~4985) which
+ * delegates to parseConditionalTypeOrHigher. The check_type is parsed
+ * non-conditionally and then optionally wrapped. Using a separate wrapper
+ * lets inner sub-parsers (e.g. keyof's operand) remain non-conditional per
+ * upstream operator precedence.
+ */
+static CtscNode* parse_type_in_annotation_position(Parser* p, bool allow_multiline) {
+    CtscNode* check_type = parse_non_conditional_type_in_annotation_position(p, allow_multiline);
+    return maybe_wrap_conditional_type(p, check_type, allow_multiline);
 }
 
 /*

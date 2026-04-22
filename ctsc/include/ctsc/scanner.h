@@ -304,6 +304,18 @@ typedef enum {
      * data layout unchanged while the M4.x indexed-access slice lands.
      */
     CTSC_SK_IndexedAccessType,
+    /*
+     * Mirrors ts.SyntaxKind.ConditionalType (upstream/TypeScript/src/compiler/
+     * types.ts ConditionalTypeNode; parser.ts parseConditionalTypeOrHigher
+     * ~5002):
+     *     checkType extends extendsType ? trueType : falseType
+     * Stored with four child TypeNodes in CtscConditionalTypeData
+     * (data.conditionalType). The checker reduces a non-generic
+     * `checkType extends extendsType` to either `trueType` or `falseType`
+     * by invoking the structural assignability relation (checker.ts
+     * getConditionalType ~17942 / isTypeAssignableTo).
+     */
+    CTSC_SK_ConditionalType,
 
     CTSC_SK__COUNT
 } CtscSyntaxKind;

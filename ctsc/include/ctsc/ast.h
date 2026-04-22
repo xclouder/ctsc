@@ -1088,6 +1088,22 @@ typedef struct {
 } CtscTypeAliasDeclarationData;
 
 /*
+ * Mirrors upstream/TypeScript/src/compiler/types.ts ConditionalTypeNode and
+ * parser.ts parseConditionalTypeOrHigher (~5002):
+ *     checkType extends extendsType ? trueType : falseType
+ * forEachChildInConditionalType visits children in this same order. The
+ * checker reduces a non-generic `checkType extends extendsType` via the
+ * structural assignability relation to pick one branch (checker.ts
+ * getConditionalType ~17942).
+ */
+typedef struct {
+    CtscNode* check_type;
+    CtscNode* extends_type;
+    CtscNode* true_type;
+    CtscNode* false_type;
+} CtscConditionalTypeData;
+
+/*
  * Mirrors upstream/TypeScript/src/compiler/parser.ts parseImportDeclaration
  * (~8384) / parseNamedImportsOrExports (~8578) / parseImportOrExportSpecifier
  * (~8604) and types.ts ImportDeclaration / ImportClause / NamedImports /
@@ -1211,6 +1227,7 @@ struct CtscNode {
         CtscTypeAssertionExpressionData typeAssertionExpression;
         CtscAsExpressionData            asExpression;
         CtscTypeAliasDeclarationData    typeAliasDeclaration;
+        CtscConditionalTypeData         conditionalType;
         CtscImportDeclarationData       importDeclaration;
         CtscImportClauseData            importClause;
         CtscNamedImportsData            namedImports;
