@@ -1841,6 +1841,19 @@ static bool u16_is_ident_start_checker(uint16_t c);
 static bool u16_is_ident_part_checker(uint16_t c);
 
 /*
+ * Forward declaration for the fallback-span FunctionType recogniser.
+ * Definition is colocated with the other FunctionType-span helpers further
+ * down. Used from the TypeReference branch of type_of_type_node so an
+ * opaque parser fallback span like `(name: string) => string` is
+ * recovered as a CTSC_TYPE_FUNCTION (checker.ts getTypeFromTypeNode on a
+ * FunctionTypeNode → getTypeOfFuncClassEnumModule ~12840 creating an
+ * anonymous type with one call signature; typeToString of that anonymous
+ * type prints `(params) => returnType`).
+ */
+static CtscType* function_type_from_fallback_span(CtscTypeRegistry* reg, const uint16_t* src, size_t src_len,
+                                                  int pos, int end);
+
+/*
  * Forward declaration for return_type_of_function_declaration: the full
  * definition lives further down next to the call-expression machinery,
  * but the ConditionalType → infer branch above needs it earlier to
@@ -2279,6 +2292,21 @@ static CtscType* type_of_type_node(Walk* w, CtscTypeRegistry* reg, const uint16_
             }
             if (tr->typeName) {
                 return reg->t_any;
+            }
+            /*
+             * Parser fallback spans are produced by parser.c
+             * consume_type_via_fallback_scan for type forms the current
+             * parser does not yet model as first-class nodes — including
+             * FunctionType `(params) => RetType` (parser.ts
+             * parseFunctionOrConstructorType ~4355). Recover that shape
+             * first so a VariableDeclaration annotation like
+             * `const g: (name: string) => string` resolves to a function
+             * type rather than collapsing to `any` through the union /
+             * intersection / primitive fallback.
+             */
+            {
+                CtscType* fn = function_type_from_fallback_span(reg, src, src_len, type_node->pos, type_node->end);
+                if (fn) return fn;
             }
             return type_from_annotation_fallback_span(reg, src, src_len, type_node->pos, type_node->end);
         }
@@ -5012,6 +5040,58 @@ static void push_one_function_type_parameter(Walk* w, int* p, int list_end) {
 }
 
 /*
+ * Detect a FunctionType `(params) => RetType` fallback span and return a
+ * CTSC_TYPE_FUNCTION whose signature text is the trimmed span copied
+ * verbatim as UTF-8. Returns NULL when the trimmed span is not a
+ * top-level FunctionType (e.g. it is a union / intersection / primitive
+ * type and should go through type_from_annotation_fallback_span).
+ *
+ * Mirrors upstream/TypeScript/src/compiler/parser.ts
+ * parseFunctionOrConstructorType (~4355): a parenthesised parameter list
+ * followed (modulo trivia) by `=>` and a return-type span is a function
+ * type. The parameter parser (parseParameters ~4150) is not re-run here
+ * — we only need the signature string for typeToString parity and defer
+ * parameter-entry emission to push_variable_annotation_function_type_entries.
+ *
+ * Canonicalisation note: tsc's typeToString on an anonymous function
+ * signature emits `(p: T, q: U) => R` with a single space after each
+ * `:` / `,` (signatureToString ~6200). ctsc currently copies the
+ * annotation source verbatim, which is correct for the fixtures whose
+ * source is already in canonical form; a later slice will add
+ * whitespace normalisation if a fixture requires it.
+ */
+static CtscType* function_type_from_fallback_span(CtscTypeRegistry* reg, const uint16_t* src, size_t src_len,
+                                                  int pos, int end) {
+    if (!reg || !src || pos < 0 || end < 0 || pos > (int)src_len || end > (int)src_len || pos >= end) {
+        return NULL;
+    }
+    int te = end;
+    int a = u16_span_trim_bounds(src, pos, end, &te);
+    int b = te;
+    if (a >= b) return NULL;
+    if (src[a] != (uint16_t)'(') return NULL;
+    int close = u16_find_matching_paren(src, a, b);
+    if (close < 0 || close >= b) return NULL;
+    int after = close + 1;
+    u16_skip_trivia(src, &after, b);
+    if (after + 1 >= b
+        || src[after] != (uint16_t)'='
+        || src[after + 1] != (uint16_t)'>') return NULL;
+    /* Any non-empty return-type span after `=>` suffices. */
+    int ret_start = after + 2;
+    u16_skip_trivia(src, &ret_start, b);
+    if (ret_start >= b) return NULL;
+
+    /* Copy the trimmed span as the signature text. */
+    CtscBuffer sig;
+    ctsc_buf_init(&sig);
+    append_trimmed_type_span_for_signature(&sig, src, a, b);
+    CtscType* t = ctsc_type_function(reg, sig.data, sig.len, NULL);
+    ctsc_buf_free(&sig);
+    return t;
+}
+
+/*
  * Scan a UTF-16 source span [start, end) for FunctionType-like
  * `(params) => Type` occurrences and emit a Parameter entry for each
  * parameter name found. Mirrors parser.ts parseFunctionOrConstructorType
@@ -5075,6 +5155,177 @@ static void push_function_type_parameter_entries_in_span(Walk* w, int start, int
             }
             /* Recurse into the inner span for nested function types. */
             push_function_type_parameter_entries_in_span(w, open + 1, close);
+            i = close + 1;
+            continue;
+        }
+        i++;
+    }
+}
+
+/*
+ * Emit a Parameter entry for one parameter of a FunctionType whose
+ * parameter list span is `[*p, list_end)`. Unlike
+ * push_one_function_type_parameter, the entry carries the *declared*
+ * parameter type (parsed from the `:` annotation) rather than the
+ * empty-object sentinel. Used from VariableDeclaration / Parameter
+ * contexts where tsc's getTypeAtLocation(paramName) returns the
+ * declared type (checker.ts getTypeOfVariableOrParameterOrPropertyWorker
+ * ~12537).
+ *
+ * Mirrors parser.ts parseParameterWorker (~4060): optional `...` rest,
+ * Identifier name, optional `?`, optional `: Type`. Binding-pattern
+ * parameters are currently skipped — no fixture exercises them yet.
+ */
+static void push_one_function_type_parameter_with_declared_type(Walk* w, int* p, int list_end) {
+    int i = *p;
+    u16_skip_trivia(w->source_utf16, &i, list_end);
+    if (i >= list_end) { *p = i; return; }
+    /* Optional `...` rest marker. */
+    if (i + 2 < list_end
+        && w->source_utf16[i] == (uint16_t)'.'
+        && w->source_utf16[i + 1] == (uint16_t)'.'
+        && w->source_utf16[i + 2] == (uint16_t)'.') {
+        i += 3;
+        u16_skip_trivia(w->source_utf16, &i, list_end);
+    }
+    if (i >= list_end || !u16_is_ident_start_checker(w->source_utf16[i])) {
+        /* Binding-pattern parameter; advance to the next top-level `,`. */
+        int depth_paren = 0, depth_brace = 0, depth_brack = 0;
+        while (i < list_end) {
+            uint16_t c = w->source_utf16[i];
+            if (depth_paren == 0 && depth_brace == 0 && depth_brack == 0 && c == (uint16_t)',') break;
+            if (c == (uint16_t)'(') depth_paren++;
+            else if (c == (uint16_t)')') { if (depth_paren > 0) depth_paren--; }
+            else if (c == (uint16_t)'{') depth_brace++;
+            else if (c == (uint16_t)'}') { if (depth_brace > 0) depth_brace--; }
+            else if (c == (uint16_t)'[') depth_brack++;
+            else if (c == (uint16_t)']') { if (depth_brack > 0) depth_brack--; }
+            i++;
+        }
+        *p = i;
+        return;
+    }
+    int name_start = i;
+    i++;
+    while (i < list_end && u16_is_ident_part_checker(w->source_utf16[i])) i++;
+    int name_end = i;
+
+    /* Optional `?` after the name. */
+    int j = i;
+    u16_skip_trivia(w->source_utf16, &j, list_end);
+    if (j < list_end && w->source_utf16[j] == (uint16_t)'?') {
+        j++;
+        u16_skip_trivia(w->source_utf16, &j, list_end);
+    }
+
+    /* Optional `: Type` annotation. */
+    CtscType* declared = NULL;
+    if (j < list_end && w->source_utf16[j] == (uint16_t)':') {
+        j++;
+        u16_skip_trivia(w->source_utf16, &j, list_end);
+        int type_start = j;
+        int depth_paren = 0, depth_brace = 0, depth_brack = 0, depth_angle = 0;
+        while (j < list_end) {
+            uint16_t c = w->source_utf16[j];
+            if (depth_paren == 0 && depth_brace == 0 && depth_brack == 0 && depth_angle == 0
+                && c == (uint16_t)',') break;
+            if (c == (uint16_t)'(') depth_paren++;
+            else if (c == (uint16_t)')') { if (depth_paren > 0) depth_paren--; }
+            else if (c == (uint16_t)'{') depth_brace++;
+            else if (c == (uint16_t)'}') { if (depth_brace > 0) depth_brace--; }
+            else if (c == (uint16_t)'[') depth_brack++;
+            else if (c == (uint16_t)']') { if (depth_brack > 0) depth_brack--; }
+            else if (c == (uint16_t)'<') depth_angle++;
+            else if (c == (uint16_t)'>') { if (depth_angle > 0) depth_angle--; }
+            j++;
+        }
+        int type_end = j;
+        /* type_from_annotation_fallback_span covers primitives / unions /
+         * intersections / tuples / literal-type references; if the span
+         * is itself a nested FunctionType, function_type_from_fallback_span
+         * returns the right anonymous function type. */
+        CtscType* fn =
+            function_type_from_fallback_span(&w->r->registry, w->source_utf16, w->source_utf16_len,
+                                             type_start, type_end);
+        if (fn) {
+            declared = fn;
+        } else {
+            declared = type_from_annotation_fallback_span(&w->r->registry, w->source_utf16, w->source_utf16_len,
+                                                          type_start, type_end);
+        }
+    } else {
+        declared = w->r->registry.t_any;
+    }
+
+    CtscCheckTypeEntry e = {0};
+    e.name = w->source_utf16 + name_start;
+    e.name_len = (size_t)(name_end - name_start);
+    e.decl_kind_name = syntax_kind_cstr(CTSC_SK_Parameter);
+    e.pos = name_start;
+    e.end = name_end;
+    e.type = declared ? declared : w->r->registry.t_any;
+    entry_push(w->r, w->arena, e);
+
+    *p = j;
+}
+
+/*
+ * Scan a UTF-16 source span [start, end) for FunctionType-like
+ * `(params) => Type` occurrences and emit one Parameter entry per
+ * parameter carrying its *declared* annotation type. Mirrors the
+ * oracle walk (harness/src/oracle-checker-types.ts): ts.forEachChild
+ * descends into a VariableDeclaration's FunctionType annotation,
+ * visits each Parameter node, and its getTypeAtLocation returns the
+ * declared parameter type (checker.ts
+ * getTypeOfVariableOrParameterOrPropertyWorker ~12537).
+ *
+ * This is the VariableDeclaration-context sibling of
+ * push_function_type_parameter_entries_in_span (which emits `{}` for
+ * parameters inside a ConditionalType extends-clause probe).
+ */
+static void push_function_type_parameter_entries_with_declared_types(Walk* w, int start, int end) {
+    if (!w || !w->source_utf16 || start < 0 || end <= start
+        || end > (int)w->source_utf16_len) return;
+    int i = start;
+    while (i < end) {
+        uint16_t c = w->source_utf16[i];
+        if (c == (uint16_t)'/' && i + 1 < end
+            && (w->source_utf16[i + 1] == (uint16_t)'/'
+                || w->source_utf16[i + 1] == (uint16_t)'*')) {
+            u16_skip_trivia(w->source_utf16, &i, end);
+            continue;
+        }
+        if (c == (uint16_t)'"' || c == (uint16_t)'\'' || c == (uint16_t)'`') {
+            uint16_t q = c;
+            i++;
+            while (i < end && w->source_utf16[i] != q) {
+                if (w->source_utf16[i] == (uint16_t)'\\' && i + 1 < end) { i += 2; continue; }
+                i++;
+            }
+            if (i < end) i++;
+            continue;
+        }
+        if (c == (uint16_t)'(') {
+            int open = i;
+            int close = u16_find_matching_paren(w->source_utf16, open, end);
+            if (close < 0) return;
+            int after = close + 1;
+            u16_skip_trivia(w->source_utf16, &after, end);
+            bool is_function_type = after + 1 < end
+                && w->source_utf16[after] == (uint16_t)'='
+                && w->source_utf16[after + 1] == (uint16_t)'>';
+            if (is_function_type) {
+                int p = open + 1;
+                while (p < close) {
+                    u16_skip_trivia(w->source_utf16, &p, close);
+                    if (p >= close) break;
+                    push_one_function_type_parameter_with_declared_type(w, &p, close);
+                    u16_skip_trivia(w->source_utf16, &p, close);
+                    if (p < close && w->source_utf16[p] == (uint16_t)',') p++;
+                }
+            }
+            /* Recurse into the inner span for nested function types. */
+            push_function_type_parameter_entries_with_declared_types(w, open + 1, close);
             i = close + 1;
             continue;
         }
@@ -5238,6 +5489,23 @@ static void visit_variable_declaration_list(Walk* w, const CtscNode* list) {
         }
         if (vd->type && vd->type->kind == CTSC_SK_TypeLiteral) {
             push_property_signatures_from_type_literal(w, vd->type);
+        }
+        /*
+         * FunctionType annotation span (parser fallback TypeReference) —
+         * tsc's ts.forEachChild visits each Parameter node of a
+         * FunctionTypeNode so the oracle emits one Parameter entry per
+         * declared name with its annotation type. The M4.x parser
+         * collapses `(name: string) => string` to an opaque
+         * CTSC_SK_TypeReference span (parser.c
+         * consume_type_via_fallback_scan), so recover the entries from
+         * the source span here. Exercised by
+         * checker/import_export/07_import_default.ts
+         * (`const g: (name: string) => string`).
+         */
+        if (vd->type && vd->type->kind == CTSC_SK_TypeReference
+            && !vd->type->data.typeReference.typeName
+            && !vd->type->data.typeReference.has_type_arguments) {
+            push_function_type_parameter_entries_with_declared_types(w, vd->type->pos, vd->type->end);
         }
         /*
          * TypeReference with TypeLiteral type arguments: the oracle walks
