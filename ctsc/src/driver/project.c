@@ -554,6 +554,11 @@ int ctsc_run_project(const CtscProjectOptions* opts) {
     TsConfig cfg;
     if (load_tsconfig(opts->tsconfig_path, &cfg) != 0) return 1;
 
+    if (opts->out_dir_override && opts->out_dir_override[0]) {
+        path_resolve(cfg.project_dir, opts->out_dir_override, cfg.out_dir, sizeof(cfg.out_dir));
+        normalize_path(cfg.out_dir);
+    }
+
     if (opts->verbose) {
         fprintf(stderr, "[ctsc] tsconfig=%s\n", cfg.tsconfig_path);
         fprintf(stderr, "[ctsc] rootDir=%s\n", cfg.root_dir);

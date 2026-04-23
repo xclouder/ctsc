@@ -18,6 +18,7 @@
 
 typedef struct {
     const char* tsconfig_path;  /* absolute or cwd-relative path to tsconfig.json OR to its directory */
+    const char* out_dir_override; /* optional CLI override for compilerOptions.outDir */
     bool        write_package_json;  /* emit dist/package.json {"type":"module"} when module=ES* */
     bool        verbose;
 } CtscProjectOptions;

@@ -31,9 +31,11 @@ static void print_usage(FILE* f) {
         "  --check           Dump checker semantic diagnostics as JSON\n"
         "  --emit            Emit JavaScript for a single source file (stdout)\n"
         "  --project <path>  Compile a tsconfig-driven project (file or dir)\n"
+        "  -p <path>         Alias of --project\n"
         "\n"
         "Options:\n"
         "  --pretty          Pretty-print JSON\n"
+        "  --outDir <path>   Override tsconfig compilerOptions.outDir (project mode)\n"
         "  -o <path>         Write output to file instead of stdout\n"
         "  --no-package-json Skip writing dist/package.json in --project mode\n"
         "  --verbose         Print progress to stderr\n"
@@ -61,6 +63,7 @@ int main(int argc, char** argv) {
     Cmd cmd = CMD_NONE;
     const char* input = NULL;
     const char* output = NULL;
+    const char* out_dir_override = NULL;
     bool pretty = false;
     bool write_package_json = true;
     bool verbose = false;
@@ -74,10 +77,15 @@ int main(int argc, char** argv) {
         if (strcmp(a, "--dump-types") == 0)    { cmd = CMD_DUMP_TYPES;    continue; }
         if (strcmp(a, "--check") == 0)         { cmd = CMD_CHECK;         continue; }
         if (strcmp(a, "--emit") == 0)          { cmd = CMD_EMIT;          continue; }
-        if (strcmp(a, "--project") == 0) {
+        if (strcmp(a, "--project") == 0 || strcmp(a, "-p") == 0) {
             cmd = CMD_PROJECT;
             if (i + 1 >= argc) { fprintf(stderr, "error: --project requires a path\n"); return 2; }
             input = argv[++i];
+            continue;
+        }
+        if (strcmp(a, "--outDir") == 0) {
+            if (i + 1 >= argc) { fprintf(stderr, "error: --outDir requires a path\n"); return 2; }
+            out_dir_override = argv[++i];
             continue;
         }
         if (strcmp(a, "--pretty") == 0)      { pretty = true;         continue; }
@@ -93,7 +101,7 @@ int main(int argc, char** argv) {
     if (!input)          { fprintf(stderr, "error: missing input file\n"); return 2; }
 
     if (cmd == CMD_PROJECT) {
-        CtscProjectOptions popts = { input, write_package_json, verbose };
+        CtscProjectOptions popts = { input, out_dir_override, write_package_json, verbose };
         return ctsc_run_project(&popts);
     }
 
